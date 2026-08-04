@@ -1,0 +1,19 @@
+# Build output
+/vci
+/dist/
+
+# Go tooling
+*.test
+*.out
+coverage.out
+
+# Local Vci state; tests inject their own root and do not use this path.
+/.vci/
+
+# Scratch plans and agent journals are never repository content.
+/temp/*
+
+# Editor and OS debris
+.DS_Store
+.idea/
+.vscode/
