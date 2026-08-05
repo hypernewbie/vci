@@ -17,6 +17,13 @@ is stale.
 
 ## Scope
 
-This is the local macOS product only. PID start-time probing and external kill
-paths are intentionally not implemented. Future remote work is not part of this
-product; if approved later, it must begin with an explicit direct-SSH contract.
+This is the local macOS worker path. PID start-time probing and external kill
+paths are intentionally not implemented. The direct-SSH dispatch forwards each
+public command to the remote coordinator over ordinary system SSH; it runs
+ordinary `vci build .`, `check`, and `abort` on the remote and returns the
+remote run identity unchanged. The local cancellation path is unchanged: the
+remote coordinator owns its own worker-owned escalation and the local client
+never signals any remote process. Remote staging lives under the remote Vci
+root's `state/tmp/` with a private, pid-suffixed name and trap-based cleanup;
+no staging content crosses the coordinator/client boundary as a wire-format
+record.

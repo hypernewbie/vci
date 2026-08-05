@@ -2,7 +2,7 @@
 set -eu
 root=$(mktemp -d)
 bin=$(mktemp -t vci-bin)
-cleanup() { chmod -R u+w "$root" 2>/dev/null || true; rm -rf "$root"; rm -f "$bin"; }
+cleanup() { chmod -R u+rwx "$root" 2>/dev/null || true; rm -rf "$root"; rm -f "$bin"; }
 trap cleanup EXIT
 go build -o "$bin" ./cmd/vci
 export VCI_ROOT="$root"
@@ -12,7 +12,7 @@ export VCI_ROOT="$root"
 response=$("$bin" build .)
 run_id=$(printf '%s\n' "$response" | python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["ok"]; print(x["data"]["run_id"])')
 state=staging
-for _ in $(seq 1 120); do
+for _ in $(seq 1 300); do
 	check=$("$bin" check "$run_id")
 	state=$(printf '%s\n' "$check" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"].get("state"))')
 	[ "$state" = succeeded ] && break

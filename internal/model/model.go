@@ -71,9 +71,10 @@ func Transition(from, to RunState) error {
 type FailureClass string
 
 const (
-	FailureUsage         FailureClass = "usage"
-	FailureConfiguration FailureClass = "configuration"
-	FailureState         FailureClass = "state"
+	FailureUsage          FailureClass = "usage"
+	FailureConfiguration  FailureClass = "configuration"
+	FailureInfrastructure FailureClass = "infrastructure"
+	FailureState          FailureClass = "state"
 )
 
 type VciError struct {

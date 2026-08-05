@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/hypernewbie/vci/internal/app"
 	"github.com/hypernewbie/vci/internal/config"
+	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/model"
 )
 
@@ -19,6 +22,9 @@ func runSetup(args []string) (any, *model.VciError) {
 	}
 	switch args[0] {
 	case "reap":
+		if errMsg := requireCoordinatorRole(l); errMsg != nil {
+			return nil, errMsg
+		}
 		if len(args) != 1 {
 			return nil, model.NewError("invalid_arguments", model.FailureUsage, "setup reap takes no arguments.", false)
 		}
@@ -36,6 +42,9 @@ func runSetup(args []string) (any, *model.VciError) {
 		}
 		return map[string]any{"initialized": true}, nil
 	case "machine":
+		if errMsg := requireCoordinatorRole(l); errMsg != nil {
+			return nil, errMsg
+		}
 		if len(args) < 3 {
 			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add|remove <name>.", false)
 		}
@@ -59,6 +68,9 @@ func runSetup(args []string) (any, *model.VciError) {
 		}
 		return map[string]any{"machine": args[2], "updated": true}, nil
 	case "project":
+		if errMsg := requireCoordinatorRole(l); errMsg != nil {
+			return nil, errMsg
+		}
 		if len(args) < 3 || args[1] != "add" {
 			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> --command <exe> [--arg <arg>].", false)
 		}
@@ -74,7 +86,7 @@ func runSetup(args []string) (any, *model.VciError) {
 				i++
 			case "--command":
 				if i+1 >= len(args) {
-					return nil, model.NewError("invalid_arguments", model.FailureUsage, "--command requires an executable.", false)
+					return nil, model.NewError("invalid_arguments", model.FailureUsage, "--command requires a name.", false)
 				}
 				executable = args[i+1]
 				i++
@@ -101,3 +113,17 @@ func runSetup(args []string) (any, *model.VciError) {
 }
 
 func validRunID(value string) bool { return strings.HasPrefix(value, "run_") }
+
+// requireCoordinatorRole returns an error when this root does not declare
+// orchestrator = "self", which is the only role permitted to mutate
+// coordinator state through setup.
+func requireCoordinatorRole(l layout.Layout) *model.VciError {
+	if err := app.RequireCoordinatorRole(l); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return model.NewError("setup_not_initialized", model.FailureConfiguration,
+				"Run \"vci setup init\" first.", false)
+		}
+		return model.NewError("setup_not_coordinator", model.FailureConfiguration, err.Error(), false)
+	}
+	return nil
+}

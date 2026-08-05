@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -49,6 +50,17 @@ func dispatch(command string, args []string) (Response, int) {
 		if err != nil {
 			return appFailure(command, err), 2
 		}
+		remoteConfigured, remoteErr := app.RemoteConfigured(l)
+		if remoteErr != nil {
+			return appFailure(command, remoteErr), 2
+		}
+		if remoteConfigured {
+			if raw, remote, remoteErr := app.RemoteCommand(context.Background(), l, command); remoteErr != nil {
+				return appFailure(command, remoteErr), 2
+			} else if remote {
+				return decodeRemoteResponse(command, raw)
+			}
+		}
 		inventory, err := app.ReadInventory(l)
 		if err != nil {
 			return appFailure(command, err), 2
@@ -64,6 +76,17 @@ func dispatch(command string, args []string) (Response, int) {
 		l, err := resolveLayout()
 		if err != nil {
 			return appFailure(command, err), 2
+		}
+		remoteConfigured, remoteErr := app.RemoteConfigured(l)
+		if remoteErr != nil {
+			return appFailure(command, remoteErr), 2
+		}
+		if remoteConfigured {
+			if raw, remote, remoteErr := app.RemoteBuild(context.Background(), l, args[0]); remoteErr != nil {
+				return appFailure(command, remoteErr), 2
+			} else if remote {
+				return decodeRemoteResponse(command, raw)
+			}
 		}
 		prepared, err := app.Prepare(context.Background(), l, args[0])
 		if err != nil {
@@ -81,6 +104,17 @@ func dispatch(command string, args []string) (Response, int) {
 		if err != nil {
 			return appFailure(command, err), 2
 		}
+		remoteConfigured, remoteErr := app.RemoteConfigured(l)
+		if remoteErr != nil {
+			return appFailure(command, remoteErr), 2
+		}
+		if remoteConfigured {
+			if raw, remote, remoteErr := app.RemoteCheck(context.Background(), l, model.RunID(args[0])); remoteErr != nil {
+				return appFailure(command, remoteErr), 2
+			} else if remote {
+				return decodeRemoteResponse(command, raw)
+			}
+		}
 		result, err := app.Check(l, model.RunID(args[0]))
 		if err != nil {
 			return appFailure(command, err), 2
@@ -93,6 +127,17 @@ func dispatch(command string, args []string) (Response, int) {
 		l, err := resolveLayout()
 		if err != nil {
 			return appFailure(command, err), 2
+		}
+		remoteConfigured, remoteErr := app.RemoteConfigured(l)
+		if remoteErr != nil {
+			return appFailure(command, remoteErr), 2
+		}
+		if remoteConfigured {
+			if raw, remote, remoteErr := app.RemoteAbort(context.Background(), l, model.RunID(args[0])); remoteErr != nil {
+				return appFailure(command, remoteErr), 2
+			} else if remote {
+				return decodeRemoteResponse(command, raw)
+			}
 		}
 		result, err := app.Abort(l, model.RunID(args[0]))
 		if err != nil {
@@ -115,6 +160,23 @@ func dispatch(command string, args []string) (Response, int) {
 	default:
 		return Failure(command, model.NewError("unknown_command", model.FailureUsage, fmt.Sprintf("Command %q is not recognized.", command), false)), 2
 	}
+}
+
+func decodeRemoteResponse(command string, raw []byte) (Response, int) {
+	var response Response
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return Failure(command, model.NewError("remote_invalid_response", model.FailureInfrastructure, err.Error(), true)), 2
+	}
+	if response.SchemaVersion != model.SchemaVersion {
+		return Failure(command, model.NewError("remote_schema_mismatch", model.FailureInfrastructure, "remote response schema is unsupported", true)), 2
+	}
+	if response.Command != command || response.Data == nil || (!response.OK && response.Error == nil) || (response.OK && response.Error != nil) {
+		return Failure(command, model.NewError("remote_invalid_response", model.FailureInfrastructure, "remote response has an invalid envelope", true)), 2
+	}
+	if !response.OK {
+		return response, 2
+	}
+	return response, 0
 }
 
 func Main() {

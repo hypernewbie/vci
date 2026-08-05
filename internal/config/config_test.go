@@ -35,7 +35,7 @@ func TestDecodeRejectsUnknownFields(t *testing.T) {
 }
 
 func TestDecodeRejectsRemovedFields(t *testing.T) {
-	for _, field := range []string{"orchestrator = \"self\"", "total_bytes = 200", "max_runs = 10", "ttl_days = 2", "transport = \"local\"", "runtime = \"local\"", "host = \"builder\"", "os = \"darwin\"", "arch = \"arm64\"", "image = \"image\"", "snapshot = \"snapshot\""} {
+	for _, field := range []string{"total_bytes = 200", "max_runs = 10", "ttl_days = 2", "transport = \"local\"", "runtime = \"local\"", "host = \"builder\"", "os = \"darwin\"", "arch = \"arm64\"", "image = \"image\"", "snapshot = \"snapshot\""} {
 		data := valid + "\n" + field + "\n"
 		if _, err := Decode([]byte(data)); err == nil {
 			t.Fatalf("removed field accepted: %s", field)

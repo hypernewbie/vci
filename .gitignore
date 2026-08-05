@@ -13,6 +13,9 @@ coverage.out
 # Scratch plans and agent journals are never repository content.
 /temp/*
 
+# Generated subagent artifacts.
+/.pi-subagents/
+
 # Editor and OS debris
 .DS_Store
 .idea/

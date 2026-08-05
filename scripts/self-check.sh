@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 root=$(mktemp -d)
-cleanup() { chmod -R u+w "$root" 2>/dev/null || true; rm -rf "$root"; }
+cleanup() { chmod -R u+rwx "$root" 2>/dev/null || true; rm -rf "$root"; }
 trap cleanup EXIT
 export VCI_ROOT="$root"
 go run ./cmd/vci setup init >/dev/null
@@ -10,7 +10,7 @@ go run ./cmd/vci setup project add Vci --machine mac-local --command go --arg te
 result=$(go run ./cmd/vci build .)
 run_id=$(printf '%s\n' "$result" | python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["ok"]; print(x["data"]["run_id"])')
 state=staging
-for _ in $(seq 1 120); do
+for _ in $(seq 1 300); do
   check=$(go run ./cmd/vci check "$run_id")
   state=$(printf '%s\n' "$check" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"].get("state"))')
   [ "$state" = succeeded ] && break

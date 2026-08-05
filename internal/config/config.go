@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	"github.com/hypernewbie/vci/internal/layout"
@@ -12,8 +13,18 @@ import (
 
 const SchemaVersion = 1
 
+// OrchestratorSelf selects the local coordinator role. Any other non-empty
+// value is treated as an SSH host passed to the ordinary system `ssh`
+// executable by a client root.
+const OrchestratorSelf = "self"
+
+// Config is the on-disk Vci root configuration. The schema has exactly two
+// roles: a coordinator (Orchestrator == OrchestratorSelf) that owns machine,
+// project, retention, and log-limit policy, and a client (any other value)
+// that holds only the orchestrator selector.
 type Config struct {
 	SchemaVersion int                `toml:"schema_version"`
+	Orchestrator  string             `toml:"orchestrator"`
 	LogLimits     LogLimits          `toml:"log_limits"`
 	Retention     Retention          `toml:"retention"`
 	Machines      map[string]Machine `toml:"machines"`
@@ -29,6 +40,9 @@ type Retention struct {
 	MaxBytes int64 `toml:"max_bytes"`
 }
 
+// Machine is the coordinator-owned inventory entry. Transport endpoints are
+// not part of the machine definition; the orchestrator selector above is the
+// only place a remote target appears.
 type Machine struct{}
 
 type Project struct {
@@ -37,11 +51,21 @@ type Project struct {
 	Environment map[string]string `toml:"environment"`
 }
 
+// DefaultLogLimits and DefaultRetention are the coordinator defaults used
+// when a fresh root is initialized. They are also the implicit values for a
+// client root so that an omitted section decodes as the default without
+// declaring coordinator policy.
+var (
+	DefaultLogLimits = LogLimits{StdoutBytes: 4 << 20, StderrBytes: 4 << 20}
+	DefaultRetention = Retention{MaxBytes: 512 << 20}
+)
+
 func Defaults() Config {
 	return Config{
 		SchemaVersion: SchemaVersion,
-		LogLimits:     LogLimits{StdoutBytes: 4 << 20, StderrBytes: 4 << 20},
-		Retention:     Retention{MaxBytes: 512 << 20},
+		Orchestrator:  OrchestratorSelf,
+		LogLimits:     DefaultLogLimits,
+		Retention:     DefaultRetention,
 		Machines:      map[string]Machine{}, Projects: map[string]Project{},
 	}
 }
@@ -60,6 +84,11 @@ func Decode(data []byte) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
+	if !meta.IsDefined("orchestrator") {
+		// Compatibility for existing local roots that pre-date the
+		// orchestrator selector. Missing means self.
+		cfg.Orchestrator = OrchestratorSelf
+	}
 	if undecoded := meta.Undecoded(); len(undecoded) != 0 {
 		return Config{}, fmt.Errorf("unknown config fields: %s", formatKeys(undecoded))
 	}
@@ -69,10 +98,43 @@ func Decode(data []byte) (Config, error) {
 	return cfg, nil
 }
 
+// Validate enforces role-aware configuration rules. A coordinator root may
+// declare machines, projects, retention, and log limits. A client root may
+// declare only the orchestrator selector; any coordinator-owned field is
+// rejected because it could drift from the coordinator's authoritative
+// state.
 func Validate(cfg Config) error {
 	if cfg.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("unsupported config schema version %d", cfg.SchemaVersion)
 	}
+	if err := ValidateOrchestrator(cfg.Orchestrator); err != nil {
+		return err
+	}
+	if cfg.Orchestrator == OrchestratorSelf {
+		return validateCoordinator(cfg)
+	}
+	return validateClient(cfg)
+}
+
+// ValidateOrchestrator rejects empty, option-like, whitespace, or control-
+// character values. The string is passed to the system `ssh` executable, so
+// it must be safe as a destination argument.
+func ValidateOrchestrator(value string) error {
+	if value == "" {
+		return fmt.Errorf("orchestrator value is empty")
+	}
+	if strings.HasPrefix(value, "-") {
+		return fmt.Errorf("orchestrator value %q looks like an option flag", value)
+	}
+	for _, r := range value {
+		if unicode.IsSpace(r) || r < 0x20 || r == 0x7f {
+			return fmt.Errorf("orchestrator value %q contains whitespace or control characters", value)
+		}
+	}
+	return nil
+}
+
+func validateCoordinator(cfg Config) error {
 	if cfg.LogLimits.StdoutBytes <= 0 || cfg.LogLimits.StderrBytes <= 0 {
 		return fmt.Errorf("log limits are invalid")
 	}
@@ -83,7 +145,6 @@ func Validate(cfg Config) error {
 		if !layout.ValidName(name) {
 			return fmt.Errorf("invalid machine name %q", name)
 		}
-
 	}
 	for name, project := range cfg.Projects {
 		if !layout.ValidName(name) {
@@ -108,6 +169,22 @@ func Validate(cfg Config) error {
 				return fmt.Errorf("project %q references missing machine %q", name, machine)
 			}
 		}
+	}
+	return nil
+}
+
+func validateClient(cfg Config) error {
+	if len(cfg.Machines) != 0 {
+		return fmt.Errorf("client root must not declare machines")
+	}
+	if len(cfg.Projects) != 0 {
+		return fmt.Errorf("client root must not declare projects")
+	}
+	if cfg.Retention != DefaultRetention {
+		return fmt.Errorf("client root must not set retention policy")
+	}
+	if cfg.LogLimits != DefaultLogLimits {
+		return fmt.Errorf("client root must not set log limits")
 	}
 	return nil
 }

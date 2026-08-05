@@ -10,6 +10,20 @@ import (
 
 func load(l layout.Layout) (config.Config, error) { return config.Load(l.ConfigPath()) }
 
+// RequireCoordinatorRole returns an error when the configured root does
+// not declare orchestrator = "self". Used by setup mutation paths so a
+// client root cannot drift the coordinator's authoritative state.
+func RequireCoordinatorRole(l layout.Layout) error {
+	cfg, err := config.Load(l.ConfigPath())
+	if err != nil {
+		return err
+	}
+	if cfg.Orchestrator != config.OrchestratorSelf {
+		return fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
+	}
+	return nil
+}
+
 func AddMachine(l layout.Layout, name string, machine config.Machine) error {
 	if !layout.ValidName(name) {
 		return fmt.Errorf("invalid machine name %q", name)
