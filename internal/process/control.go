@@ -18,8 +18,12 @@ const (
 	CancellationNone        CancellationPhase = ""
 	CancellationRequested   CancellationPhase = "requested"
 	CancellationTerminating CancellationPhase = "terminating"
-	CancellationKilled      CancellationPhase = "killed"
 	CancellationReaped      CancellationPhase = "reaped"
+	// CancellationKilled is the value historical Vci versions
+	// (`006ae53`) wrote for a forcibly-killed run. It is accepted
+	// only on load; current workers must never assign it. The live
+	// transition set remains requested → terminating → reaped.
+	CancellationKilled CancellationPhase = "killed"
 )
 
 type Execution struct {
@@ -58,7 +62,7 @@ func (e Execution) Validate(id model.RunID) error {
 		return fmt.Errorf("execution start time is missing")
 	}
 	switch e.CancellationPhase {
-	case CancellationNone, CancellationRequested, CancellationTerminating, CancellationKilled, CancellationReaped:
+	case CancellationNone, CancellationRequested, CancellationTerminating, CancellationReaped, CancellationKilled:
 	default:
 		return fmt.Errorf("invalid cancellation phase %q", e.CancellationPhase)
 	}

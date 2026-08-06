@@ -33,3 +33,52 @@ func TestExecutionAtomicRoundTrip(t *testing.T) {
 		t.Fatal("mismatched execution accepted")
 	}
 }
+
+// TestExecutionAcceptsLegacyCancellationPhase pins read-compatibility
+// with historical Vci versions (`006ae53`) that wrote
+// `cancellation_phase: "killed"`. The phase is accepted by Validate on
+// load only; current workers must not write it.
+func TestExecutionAcceptsLegacyCancellationPhase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "execution.json")
+	legacy := `{
+  "schema_version": 1,
+  "run_id": "run_test_legacy",
+  "owner": "worker-abcdefgh",
+  "pid": 12,
+  "pgid": 12,
+  "started_at": "2020-01-01T00:00:00Z",
+  "cancellation_phase": "killed"
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ReadExecution(path, model.RunID("run_test_legacy"))
+	if err != nil {
+		t.Fatalf("legacy execution.json with killed phase must decode: %v", err)
+	}
+	if string(loaded.CancellationPhase) != "killed" {
+		t.Fatalf("loaded phase: %q", loaded.CancellationPhase)
+	}
+}
+
+// TestExecutionRejectsUnknownCancellationPhase pins the negative case:
+// values that are neither the live phases nor the legacy value must be
+// rejected by Validate.
+func TestExecutionRejectsUnknownCancellationPhase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "execution.json")
+	bad := `{
+  "schema_version": 1,
+  "run_id": "run_test_bad",
+  "owner": "worker-abcdefgh",
+  "pid": 12,
+  "pgid": 12,
+  "started_at": "2020-01-01T00:00:00Z",
+  "cancellation_phase": "exploded"
+}`
+	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadExecution(path, model.RunID("run_test_bad")); err == nil {
+		t.Fatal("unknown cancellation phase must be rejected")
+	}
+}

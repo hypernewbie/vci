@@ -2,10 +2,14 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,7 +20,9 @@ import (
 	"github.com/hypernewbie/vci/internal/logs"
 	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/process"
+	"github.com/hypernewbie/vci/internal/reaper"
 	"github.com/hypernewbie/vci/internal/source"
+	"github.com/hypernewbie/vci/internal/sourcecache"
 	"github.com/hypernewbie/vci/internal/store"
 )
 
@@ -44,6 +50,185 @@ type runSnapshot struct {
 	LogLimits     config.LogLimits `json:"log_limits"`
 }
 
+// stagingMeta is the Vci-owned identity record the staging shell writes
+// as a sibling of the staged project directory. It carries only the
+// validated cache key fields and is never part of the project tree, so
+// it cannot become build input.
+type stagingMeta struct {
+	FormatVersion string
+	Digest        string
+	Project       string
+}
+
+// reconcileSourceCache is the sole production call path for digest
+// verification, cache lookup, publication, and active claims. It
+// distinguishes three source classes by path containment under this
+// Vci root:
+//
+//   - a completed cache entry tree (state/source-cache/v1/<digest>/<project>):
+//     validate the entry, refresh last-use, and hold an active claim
+//     while the caller captures the tree into the run's independent
+//     source;
+//   - a direct staging tree (state/tmp/vci-source-*/<project>): read
+//     the Vci-owned staging meta, recompute the canonical snapshot
+//     digest from the received bytes, fail as infrastructure on any
+//     mismatch before a run exists, and publish the verified tree
+//     (best effort; a quota rejection or a competing winner is not a
+//     build failure);
+//   - any other path: an ordinary local build with no cache behavior.
+//
+// The returned release function, when non-nil, must be deferred until
+// the cache capture is complete.
+func reconcileSourceCache(ctx context.Context, l layout.Layout, quota int64, repoRoot, projectName string) (func(), error) {
+	// 1. Completed cache entry tree.
+	if digest, ok := cacheEntryDigestAt(l, repoRoot, projectName); ok {
+		cacheRoot := l.SourceCacheDir()
+		hit, _, err := sourcecache.IsHit(cacheRoot, digest, projectName)
+		if err != nil {
+			return nil, fmt.Errorf("source cache check failed: %w", err)
+		}
+		if !hit {
+			return nil, fmt.Errorf("source cache entry %s is not complete", digest)
+		}
+		// Cache-hit validation: the tree must still canonicalize to
+		// its recorded digest before it is captured.
+		if err := source.VerifySnapshot(repoRoot, digest); err != nil {
+			return nil, fmt.Errorf("source cache entry %s failed verification: %w", digest, err)
+		}
+		claimID, err := newClaimID()
+		if err != nil {
+			return nil, fmt.Errorf("source cache claim: %w", err)
+		}
+		if err := sourcecache.AcquireActiveClaim(cacheRoot, digest, projectName, claimID); err != nil {
+			return nil, fmt.Errorf("source cache claim: %w", err)
+		}
+		// A real cache hit refreshes the recorded last-use; the reaper
+		// evicts by this metadata, not by file mtimes.
+		_ = sourcecache.UpdateLastUse(cacheRoot, digest, projectName, time.Now().UTC())
+		return func() { sourcecache.ReleaseActiveClaim(cacheRoot, digest, projectName, claimID) }, nil
+	}
+
+	// 2. Direct staging tree under this root's Vci-owned temporary dir.
+	if metaPath, ok := stagingMetaPathAt(l, repoRoot); ok {
+		meta, err := readStagingMeta(metaPath)
+		if err != nil {
+			return nil, fmt.Errorf("read staging meta: %w", err)
+		}
+		if meta.Project != projectName {
+			return nil, fmt.Errorf("staged project %q does not match repository %q", meta.Project, projectName)
+		}
+		if meta.FormatVersion != sourcecache.FormatVersion {
+			return nil, fmt.Errorf("staging format version %q is not supported", meta.FormatVersion)
+		}
+		// Recompute the canonical snapshot digest from the received
+		// bytes. A mismatch is an infrastructure failure: no complete
+		// entry is created and no run ID is returned.
+		if err := source.VerifySnapshot(repoRoot, meta.Digest); err != nil {
+			return nil, fmt.Errorf("source cache digest mismatch: %w", err)
+		}
+		// Publish the verified tree. The cache is an optimization: an
+		// admission rejection or a competing winner leaves the build
+		// on the direct one-shot path without an entry.
+		if _, pubErr := sourcecache.PublishTree(l.SourceCacheDir(), meta.Digest, meta.Project, repoRoot, quota); pubErr != nil && !errors.Is(pubErr, sourcecache.ErrAdmissionRejected) {
+			_ = pubErr
+		}
+		return nil, nil
+	}
+
+	// 3. Ordinary local build.
+	return nil, nil
+}
+
+// cacheEntryDigestAt returns the digest when repoRoot is exactly the
+// immutable source tree of a Vci-owned cache entry
+// (state/source-cache/v1/<digest>/<project>/<project>). Path comparison
+// resolves symlinks so macOS /tmp-style indirection cannot hide a
+// match.
+func cacheEntryDigestAt(l layout.Layout, repoRoot, projectName string) (string, bool) {
+	cacheRoot, err := filepath.EvalSymlinks(l.SourceCacheDir())
+	if err != nil {
+		return "", false
+	}
+	realRoot, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(cacheRoot, realRoot)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	// The tree sits at v1/<digest>/<project>/<project>; the entry root
+	// is its parent.
+	if len(parts) != 4 || parts[0] != sourcecache.FormatVersion {
+		return "", false
+	}
+	if parts[2] != projectName || parts[3] != projectName || !digestShape.MatchString(parts[1]) {
+		return "", false
+	}
+	return parts[1], true
+}
+
+// stagingMetaPathAt returns the Vci-owned staging meta path when
+// repoRoot is the project directory of a direct staging tree
+// (state/tmp/vci-source-*/<project>).
+func stagingMetaPathAt(l layout.Layout, repoRoot string) (string, bool) {
+	tmpDir, err := filepath.EvalSymlinks(l.TempDir())
+	if err != nil {
+		return "", false
+	}
+	realRoot, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return "", false
+	}
+	parent := filepath.Dir(realRoot)
+	if filepath.Dir(parent) != tmpDir {
+		return "", false
+	}
+	if !strings.HasPrefix(filepath.Base(parent), "vci-source-") {
+		return "", false
+	}
+	meta := filepath.Join(parent, "vci-meta")
+	if _, err := os.Stat(meta); err != nil {
+		return "", false
+	}
+	return meta, true
+}
+
+// readStagingMeta parses and validates the staging meta record written
+// by the staging shell. Only validated fields are accepted.
+func readStagingMeta(path string) (stagingMeta, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return stagingMeta{}, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 3 {
+		return stagingMeta{}, fmt.Errorf("malformed staging meta at %s", path)
+	}
+	meta := stagingMeta{FormatVersion: fields[0], Digest: fields[1], Project: fields[2]}
+	if meta.FormatVersion != sourcecache.FormatVersion {
+		return stagingMeta{}, fmt.Errorf("unsupported staging format version %q", meta.FormatVersion)
+	}
+	if !digestShape.MatchString(meta.Digest) {
+		return stagingMeta{}, fmt.Errorf("staging meta has invalid digest %q", meta.Digest)
+	}
+	if !layout.ValidName(meta.Project) {
+		return stagingMeta{}, fmt.Errorf("staging meta has invalid project %q", meta.Project)
+	}
+	return meta, nil
+}
+
+// newClaimID returns a fresh random claim identifier for an active
+// cache capture.
+func newClaimID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "claim-" + hex.EncodeToString(raw[:]), nil
+}
+
 func Prepare(ctx context.Context, l layout.Layout, sourcePath string) (PreparedRun, error) {
 	if err := l.Ensure(); err != nil {
 		return PreparedRun{}, err
@@ -69,6 +254,23 @@ func Prepare(ctx context.Context, l layout.Layout, sourcePath string) (PreparedR
 		return PreparedRun{}, fmt.Errorf("project %q must have exactly one local machine in the first build slice", projectName)
 	}
 	machineName := project.Machines[0]
+
+	// Coordinator-owned source-cache handling at the public build
+	// boundary. No wire protocol is involved: the direct staging tree
+	// and the cache-hit tree are both Vci-owned paths under this root.
+	// On the cache-hit path, the claim is held only while the entry is
+	// captured into the run's independent source below. The effective
+	// quota applies the documented default when
+	// retention.source_cache_bytes is omitted, so admission is always
+	// bounded.
+	releaseClaim, err := reconcileSourceCache(ctx, l, reaper.SourceCacheQuota(cfg), repo.Root, projectName)
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	if releaseClaim != nil {
+		defer releaseClaim()
+	}
+
 	manifest, blobs, err := source.Build(repo.Root)
 	if err != nil {
 		return PreparedRun{}, err

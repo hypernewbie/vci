@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hypernewbie/vci/internal/source"
 )
 
 func TestBuildOverStagingRejectsTarFailureAfterRemoteResponse(t *testing.T) {
@@ -14,7 +16,9 @@ func TestBuildOverStagingRejectsTarFailureAfterRemoteResponse(t *testing.T) {
 	writeExecutable(t, filepath.Join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"schema_version\":1,\"command\":\"build\",\"ok\":true,\"data\":{}}'\n")
 	t.Setenv("PATH", bin)
 
-	raw, remote, err := buildOverStaging(context.Background(), "coordinator", t.TempDir(), "demo")
+	input := source.SourceInput{Root: t.TempDir(), ProjectName: "demo", Files: []string{"README.md"}}
+	key := safeTestKey("demo", "sha256-0000000000000000000000000000000000000000000000000000000000000000")
+	raw, remote, _, err := buildOverStaging(context.Background(), "coordinator", input, t.TempDir(), key)
 	if !remote || err == nil {
 		t.Fatalf("tar failure must reject the transfer: remote=%v err=%v", remote, err)
 	}

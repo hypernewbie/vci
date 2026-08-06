@@ -18,8 +18,8 @@ import (
 // public vci invocation. It must not add a source receiver, framed
 // transport, rsync-specific state, or any other external tool.
 func TestStagingShellUsesOnlyTarSshVci(t *testing.T) {
-	script := stagingShellScript("demo")
-	mustContain := []string{"set -eu", "mkdir -m 700", "tar -C \"$PROJECT\" -xf -", "cd \"$PROJECT\"", "vci build .", "PROJECT=\"$STAGING/demo\""}
+	script := stagingShellScript(safeTestKey("demo", "sha256-0000000000000000000000000000000000000000000000000000000000000000"))
+	mustContain := []string{"set -eu", "mkdir -m 700", "tar -C \"$PROJECT\" -xpf -", "vci build ."}
 	for _, want := range mustContain {
 		if !strings.Contains(script, want) {
 			t.Fatalf("shell missing required fragment %q; got:\n%s", want, script)
@@ -40,10 +40,10 @@ func TestStagingShellUsesOnlyTarSshVci(t *testing.T) {
 // remote because the staging project directory IS the project
 // root.
 func TestStagingShellPreservesGitMetadata(t *testing.T) {
-	script := stagingShellScript("demo")
+	script := stagingShellScript(safeTestKey("demo", "sha256-0000000000000000000000000000000000000000000000000000000000000000"))
 	// The extract line must be a literal `tar -xf -` with no
 	// excludes, targeting the project subdirectory.
-	if !strings.Contains(script, `tar -C "$PROJECT" -xf -`) {
+	if !strings.Contains(script, `tar -C "$PROJECT" -xpf -`) {
 		t.Fatalf("extract line missing or filtered; got:\n%s", script)
 	}
 	for _, banned := range []string{"--exclude", "--exclude-vcs", "--exclude-vcs-ignores", "--no-recursion"} {
@@ -58,7 +58,7 @@ func TestStagingShellPreservesGitMetadata(t *testing.T) {
 // per-call timeout. Cancellation is owned by the caller context and
 // the real SSH failure.
 func TestRemoteCommandsHaveNoArbitraryTimeout(t *testing.T) {
-	body := stagingShellScript("demo")
+	body := stagingShellScript(safeTestKey("demo", "sha256-0000000000000000000000000000000000000000000000000000000000000000"))
 	if strings.Contains(body, "sleep") || strings.Contains(body, "timeout") {
 		t.Fatalf("staging shell must not embed a timeout; got:\n%s", body)
 	}

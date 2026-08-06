@@ -9,6 +9,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -65,15 +66,20 @@ func TestStagingTrapLeavesExternalSymlinkTargetUnchanged(t *testing.T) {
 		t.Fatalf("phase2 build must register run; got %s", pretty(env))
 	}
 
-	// Wait for the build to terminate (whether success or failure,
-	// the trap has already run).
+	var runData struct {
+		RunID string `json:"run_id"`
+	}
+	if err := json.Unmarshal(env.Data, &runData); err != nil {
+		t.Fatalf("build data decode: %v", err)
+	}
+
+	// Wait for the remote worker run to finish.
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if time.Now().After(deadline) {
 			t.Fatalf("remote worker did not finish in 20s")
 		}
-		data, err := os.ReadFile(sentinel)
-		if err == nil && string(data) == "external-marker\n" {
+		if state := remoteCheckState(t, fixture, runData.RunID); state == "succeeded" || state == "failed" {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)

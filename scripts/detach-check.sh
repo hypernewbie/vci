@@ -12,12 +12,19 @@ export VCI_ROOT="$root"
 response=$("$bin" build .)
 run_id=$(printf '%s\n' "$response" | python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["ok"]; print(x["data"]["run_id"])')
 state=staging
-for _ in $(seq 1 300); do
+# Bounded deadline for the detached `go test ./...` job: the worker
+# compiles and runs the full Go suite, which takes well over 30 seconds
+# on a warm cache. 300 seconds is a fixed, finite bound.
+deadline=$(( $(date +%s) + 300 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
 	check=$("$bin" check "$run_id")
 	state=$(printf '%s\n' "$check" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"].get("state"))')
 	[ "$state" = succeeded ] && break
 	[ "$state" = failed ] && { printf '%s\n' "$check"; exit 1; }
-	sleep 0.1
+	sleep 1
 done
-[ "$state" = succeeded ]
+if [ "$state" != succeeded ]; then
+	printf '%s\n' "Detached Vci run still $state after the 300s deadline." >&2
+	exit 1
+fi
 printf '%s\n' 'Detached Vci run verified.'

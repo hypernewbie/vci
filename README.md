@@ -95,6 +95,46 @@ lives under the remote Vci root's `state/tmp/` with a private,
 mktemp-randomized name prefixed by `vci-source-` and trap-based cleanup; the
 reaper sweeps stale staging directories matching the prefix after a fixed age
 without signalling any process.
+
+Direct-SSH client build inputs are finite local file selections: tracked files
+(HEAD, modified, staged), untracked non-ignored files, executable permission
+modes, symlinks, and minimal repository markers (`.git/HEAD`, `.git/objects`,
+`.git/refs`) are copied over direct tar-over-SSH, while ignored files
+(`.gitignore` entries), locally deleted tracked files, private `.git/config`,
+and `.git/objects` pack history are excluded. The client first materializes a
+private Vci-owned snapshot of the selection, computes the content digest from
+that settled snapshot, and archives exactly that snapshot — a source mutation
+between digest computation and archive production cannot change the bytes the
+coordinator verifies.
+
+Cache reuse is coordinator-local and content-addressed. Cache identity is
+`(format_version, digest, project)` everywhere: each project owns an
+independent entry root
+`state/source-cache/v1/<digest>/<project>/` with its own metadata,
+completion marker, active claims, and source tree (nested at
+`<project>/<project>/` so the tree's final basename is the configured project
+name). Two projects with identical selected content therefore keep separate
+valid entries under the shared digest and cannot invalidate each other. The
+client probes for a verified complete entry; on a hit the public remote
+`vci build .` runs directly from the verified entry with no tar producer
+at all. On a miss the staging shell records the expected key in a Vci-owned
+`vci-meta` sibling file, the public remote `vci build .` recomputes the
+canonical snapshot digest from the received bytes, and publishes only on
+equality — a mismatch is an infrastructure failure that creates no complete
+entry and returns no run ID. Publication is atomic (meta first, source tree,
+`complete` marker last), serialized per key with bounded stale-lock reaping,
+and never removes or overwrites an existing completed entry. The coordinator
+enforces `retention.source_cache_bytes` before every publication admission;
+when the setting is omitted the documented default (500 MB) applies, so a
+default config cannot publish without a bound. Inactive
+least-recently-used entries are evicted first, and an oversize incoming entry
+or insufficient inactive capacity is rejected without over-publishing. Active
+entries are counted in total capacity while a live public build captures
+them, and the reaper removes only exact Vci-owned stale partials and locks. Any
+read or archive failure rejects client submission before returning a remote
+run ID. Unsupported source forms (linked worktrees, filenames containing
+newlines) are rejected locally before network transmission. Local coordinator
+builds retain their existing source-manifest behavior.
 `./scripts/self-check.sh` exercises the complete local path without
 using a hosted Git remote.
 

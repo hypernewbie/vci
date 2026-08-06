@@ -6,21 +6,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/lease"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/sourcecache"
 	"github.com/hypernewbie/vci/internal/store"
 )
 
 type Report struct {
-	Removed         int `json:"removed"`
-	MarkedLost      int `json:"marked_lost"`
-	TransferRemoved int `json:"transfer_removed"`
+	Removed                   int   `json:"removed"`
+	MarkedLost                int   `json:"marked_lost"`
+	TransferRemoved           int   `json:"transfer_removed"`
+	SourceCacheRemoved        int   `json:"source_cache_removed"`
+	SourceCacheScratchRemoved int   `json:"source_cache_scratch_removed"`
+	SourceCacheBytes          int64 `json:"source_cache_bytes"`
+	SourceCacheLimitBytes     int64 `json:"source_cache_limit_bytes"`
+	SourceCacheRejected       int   `json:"source_cache_rejected"`
 }
 
 const (
 	renewalGrace     = 10 * time.Minute
 	transferStaleAge = 30 * time.Minute
+	// DefaultSourceCacheBytes is the documented default quota used
+	// when no coordinator-owned retention setting supplies one.
+	DefaultSourceCacheBytes = 500 * 1024 * 1024
 )
 
 func Run(l layout.Layout, now time.Time) (Report, error) {
@@ -99,12 +109,74 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		report.TransferRemoved = removed
 	}
 
+	if removed, scratch, bytes, total, rejected, err := ReapSourceCache(l.SourceCacheDir(), sourceCacheQuota(l)); err != nil {
+		return report, err
+	} else {
+		report.SourceCacheRemoved = removed
+		report.SourceCacheScratchRemoved = scratch
+		report.SourceCacheBytes = bytes
+		report.SourceCacheLimitBytes = total
+		report.SourceCacheRejected = rejected
+	}
+
 	return report, nil
 }
 
+// SourceCacheQuota returns the effective source-cache quota for a
+// coordinator config: the configured retention.source_cache_bytes when
+// positive, otherwise the documented default. Admission before
+// publication and the reaper share this rule, so a config that omits
+// the setting cannot publish without a bound.
+func SourceCacheQuota(cfg config.Config) int64 {
+	if cfg.Retention.SourceCacheBytes <= 0 {
+		return DefaultSourceCacheBytes
+	}
+	return cfg.Retention.SourceCacheBytes
+}
+
+// sourceCacheQuota returns the configured source-cache quota in
+// bytes, falling back to DefaultSourceCacheBytes when the
+// coordinator-owned setting is zero. Loading the config is best-
+// effort: a malformed config simply gets the documented default.
+func sourceCacheQuota(l layout.Layout) int64 {
+	if l.Root == "" {
+		return DefaultSourceCacheBytes
+	}
+	cfg, err := config.Load(l.ConfigPath())
+	if err != nil {
+		return DefaultSourceCacheBytes
+	}
+	return SourceCacheQuota(cfg)
+}
+
+// cacheScratchAge is how old a cache partial or lock must be before
+// the reaper removes it. Publication holds locks only for the duration
+// of one verified copy, and partials are either published or discarded
+// synchronously, so anything older is abandoned scratch.
+const cacheScratchAge = time.Hour
+
+// ReapSourceCache enforces the configured quota and removes stale
+// Vci-owned cache scratch (partials and locks). The return values give
+// the machine-readable maintenance report: removed entries, removed
+// scratch items, retained bytes (active entries always counted), the
+// configured quota, and how many oversize candidates could not be
+// admitted by eviction.
+func ReapSourceCache(cacheDir string, maxBytes int64) (int, int, int64, int64, int, error) {
+	removed, totalBytes, rejected, err := sourcecache.EnforceQuota(cacheDir, maxBytes)
+	if err != nil {
+		return 0, 0, 0, maxBytes, 0, err
+	}
+	scratchRemoved, err := sourcecache.ReapStaleScratch(cacheDir, time.Now().UTC(), cacheScratchAge)
+	if err != nil {
+		return removed, 0, totalBytes, maxBytes, rejected, err
+	}
+	return removed, scratchRemoved, totalBytes, maxBytes, rejected, nil
+}
+
 // reapTransferDirs removes stale direct-SSH transfer staging directories
-// under the Vci-owned TempDir. It only matches the explicit `vci-source-`
-// or legacy `vci-source.` prefix and never traverses arbitrary TMPDIR content. Stale means the
+// and client materialization snapshots under the Vci-owned TempDir. It
+// only matches the explicit `vci-source-`, legacy `vci-source.`, or
+// `vci-snapshot-` prefixes and never traverses arbitrary TMPDIR content. Stale means the
 // directory has not been modified within transferStaleAge. The reaper
 // never signals any process.
 func reapTransferDirs(tempDir string, now time.Time) (int, error) {
@@ -121,7 +193,7 @@ func reapTransferDirs(tempDir string, now time.Time) (int, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		if !strings.HasPrefix(entry.Name(), "vci-source-") && !strings.HasPrefix(entry.Name(), "vci-source.") {
+		if !strings.HasPrefix(entry.Name(), "vci-source-") && !strings.HasPrefix(entry.Name(), "vci-source.") && !strings.HasPrefix(entry.Name(), "vci-snapshot-") {
 			continue
 		}
 		info, infoErr := entry.Info()

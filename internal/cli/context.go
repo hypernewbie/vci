@@ -28,7 +28,7 @@ func appFailure(command string, err error) Response {
 		code, class, retryable = "stale_ownership", model.FailureState, true
 	case strings.Contains(lower, "already has a result") || strings.Contains(lower, "publish"):
 		code, class = "publication_failed", model.FailureState
-	case strings.Contains(lower, "ssh") || strings.Contains(lower, "tar:") || strings.Contains(lower, "unreachable") || strings.Contains(lower, "connection") || strings.Contains(lower, "invalid json") || strings.Contains(lower, "invalid response"):
+	case strings.Contains(lower, "ssh") || strings.Contains(lower, "tar:") || strings.Contains(lower, "unreachable") || strings.Contains(lower, "connection") || strings.Contains(lower, "invalid json") || strings.Contains(lower, "invalid response") || strings.Contains(lower, "select build input") || strings.Contains(lower, "unsupported source") || strings.Contains(lower, "source cache"):
 		code, class, retryable = "remote_unavailable", model.FailureInfrastructure, true
 	case strings.Contains(lower, "lock"):
 		code, class, retryable = "lock_failed", model.FailureState, true
