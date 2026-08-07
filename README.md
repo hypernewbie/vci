@@ -182,6 +182,48 @@ builds retain their existing source-manifest behavior.
 `./scripts/self-check.sh` exercises the complete local path without
 using a hosted Git remote.
 
+## Hosted Git fallback (explicit, coordinator-only)
+
+`vci build --hosted <project>` is an explicit, second source mode for a
+coordinator-configured pinned Git commit when an agent intentionally has
+no local source path. It is not automatic, not a fallback from a failed
+direct build, and not a submodule/LFS download.
+
+```toml
+[projects.Vidl.hosted_fallback]
+url = "ssh://git@github.com/hypernewbie/vidl.git"
+commit = "<40-or-64-lowercase-hex-object-id>"
+```
+
+```sh
+vci setup project hosted set Vidl --url <url> --commit <object-id>
+vci build --hosted Vidl
+```
+
+The URL is restricted to `https://host/path` or
+`ssh://[user@]host/path`; the commit is a full lowercase 40- or
+64-char hex object ID. Anything else — branch, tag, HEAD, refspec,
+short SHA, mixed case, whitespace, `file://`, query, fragment — is
+rejected at config-load time as `hosted_fallback_invalid` and never
+reaches a checkout. The checkout runs `git init`, `git remote add
+origin <url>`, `git fetch --depth=1 --no-tags origin <commit>`,
+`git checkout --detach FETCH_HEAD`, and `git rev-parse HEAD` with
+`core.hooksPath=/dev/null`, `protocol.file.allow=never`, and
+`protocol.version=2`. Terminal prompts and askpass are forced to
+fail non-interactively. The pinned commit is verified by exact
+equality against `HEAD`; any mismatch surfaces as
+`hosted_source_integrity_failed` and removes the checkout. The
+checkout lives at `state/tmp/vci-hosted-<rand>/<project>`, is
+removed on every exit path, and is swept by the existing temp
+reaper on the `vci-hosted-` prefix. The staged run record gains an
+additive `source_provenance.kind = "hosted_git"` block carrying
+the validated URL and pinned commit; direct/local builds retain
+their existing fields. No checkout path, credential, token, or
+query is ever placed in the snapshot. The hosted path is
+coordinator-only; a client root proxies `vci build --hosted
+<project>` through ordinary `RemoteCommand` over SSH and never
+holds a checkout or a run record.
+
 ## Build and development
 
 Build from source on the supported local macOS target:
@@ -207,9 +249,12 @@ executable. Source is copied into a Vci-owned staging directory on
 the remote using ordinary tar-over-SSH, the public `vci build .`
 runs from that staging directory, and the staging directory is
 removed by a trap and stale-directory reaping. No relay, daemon,
-custom protocol, source receiver, run-ID map,
-remote result replica, scheduled retry, or hosted-Git fallback is
-used. Docker, VMs, hosted remotes, submodule/LFS handling, and
+custom protocol, source receiver, run-ID map, remote result
+replica, or scheduled retry is used. The hosted-Git fallback
+exists as an explicit, coordinator-only, pinned source mode
+(`vci build --hosted <project>`); it is not a fallback from a
+failed direct build, not automatic, and not a submodule/LFS
+download. Docker, VMs, hosted remotes, submodule/LFS handling, and
 permanent workspaces remain out of scope.
 
 Vci is MIT licensed. See `LICENSE`.

@@ -221,5 +221,5 @@ func setupSingleRepo(t *testing.T) string {
 	return root
 }
 
-func testContext() context.Context { return context.Background() }
+func testContext() context.Context  { return context.Background() }
 func processRunner() process.Runner { return process.Native{} }

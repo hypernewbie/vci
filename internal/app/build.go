@@ -310,14 +310,154 @@ func Prepare(ctx context.Context, l layout.Layout, sourcePath string) (PreparedR
 	// orphan claim. Prepare never persists a queued record under the
 	// public build path: the reservation transaction publishes the
 	// record directly in `staging` state.
-	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, manifest.Digest, map[string]any{"schema_version": config.SchemaVersion, "project": projectName, "project_config": project, "log_limits": cfg.LogLimits, "retention": cfg.Retention}, now)
+	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, manifest.Digest, buildDraftSnapshot(projectName, project, cfg), now)
 	if err != nil {
 		return PreparedRun{}, err
 	}
 	var staged store.RunRecord
 	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
-		snapshot := map[string]any{"schema_version": config.SchemaVersion, "project": projectName, "project_config": project, "machine": machineName, "log_limits": cfg.LogLimits, "retention": cfg.Retention}
-		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, snapshot, now)
+		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, buildStagedSnapshot(projectName, project, machineName, cfg, nil), now)
+		if buildErr != nil {
+			return buildErr
+		}
+		if saveErr := runStore.Save(record); saveErr != nil {
+			return saveErr
+		}
+		staged = record
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, scheduler.ErrNoCapacity) {
+			return PreparedRun{}, err
+		}
+		return PreparedRun{}, err
+	}
+	return PreparedRun{Record: staged}, nil
+}
+
+// buildDraftSnapshot composes the public build path's draft config
+// snapshot. Direct/local builds get no source_provenance block; the
+// hosted entrypoint injects one via buildStagedSnapshot. The draft's
+// config digest is discarded; only the run ID is reused.
+func buildDraftSnapshot(projectName string, project config.Project, cfg config.Config) map[string]any {
+	return map[string]any{
+		"schema_version": config.SchemaVersion,
+		"project":        projectName,
+		"project_config": project,
+		"log_limits":     cfg.LogLimits,
+		"retention":      cfg.Retention,
+	}
+}
+
+// buildStagedSnapshot composes the staged config snapshot. The
+// additive `source_provenance` block is the only place a hosted
+// build differs from a direct/local build; its presence is the
+// signal that no local source path was used. When `provenance` is
+// nil, the block is omitted.
+func buildStagedSnapshot(projectName string, project config.Project, machineName string, cfg config.Config, provenance map[string]any) map[string]any {
+	out := map[string]any{
+		"schema_version": config.SchemaVersion,
+		"project":        projectName,
+		"project_config": project,
+		"machine":        machineName,
+		"log_limits":     cfg.LogLimits,
+		"retention":      cfg.Retention,
+	}
+	if provenance != nil {
+		out["source_provenance"] = provenance
+	}
+	return out
+}
+
+// PrepareHosted is the coordinator-only entrypoint for
+// `vci build --hosted <project>`. It validates the configured
+// pinned hosted fallback, performs a single-shot pinned Git
+// checkout of the configured commit into a fresh
+// `l.TempDir()/vci-hosted-<rand>/<project>` root, runs the same
+// source-validation + manifest pipeline as Prepare against the
+// checked-out root, and emits a run record with additive hosted
+// provenance. The checkout is removed on every exit path. The
+// source-cache path is intentionally skipped: hosted checkouts do
+// not participate in source-cache admission (the temp root matches
+// neither the staging nor the cache-entry shape).
+//
+// The returned PreparedRun is identical in shape to Prepare's
+// result; the only difference is the additive source_provenance
+// block in the staged record's ConfigSnapshot.
+func PrepareHosted(ctx context.Context, l layout.Layout, projectName string) (PreparedRun, error) {
+	if err := l.Ensure(); err != nil {
+		return PreparedRun{}, err
+	}
+	cfg, err := config.Load(l.ConfigPath())
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	if cfg.Orchestrator != config.OrchestratorSelf {
+		return PreparedRun{}, fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
+	}
+	if !layout.ValidName(projectName) {
+		return PreparedRun{}, fmt.Errorf("%w: project name %q is invalid", config.ErrHostedFallbackInvalid, projectName)
+	}
+	project, ok := cfg.Projects[projectName]
+	if !ok {
+		return PreparedRun{}, fmt.Errorf("%w: project %q", config.ErrHostedFallbackNotConfigured, projectName)
+	}
+	if len(project.Machines) == 0 {
+		return PreparedRun{}, fmt.Errorf("project %q has no attached machines", projectName)
+	}
+	validated, err := project.HostedFallback.Validate()
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	// Checkout the pinned commit into a fresh coordinator-owned root.
+	// The root is removed on every exit path; the source-validation
+	// pipeline below consumes it before cleanup. A successful
+	// return leaves the manifest/blobs persisted in the blob store
+	// and the checkout removed.
+	checkoutRoot, err := source.Checkout(ctx, process.Native{}, l, projectName, validated)
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	defer func() { _ = source.CleanUnder(checkoutRoot, l.TempDir()) }()
+
+	// Same source-validation pipeline as Prepare: an uninitialized
+	// submodule or an LFS pointer fails before any source manifest
+	// is produced. The attribute-graph + LFS-pointer rules live in
+	// internal/source and run unchanged on the checked-out root.
+	graph, err := source.SelectBuildInput(ctx, checkoutRoot, process.Native{})
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	snapParent, err := os.MkdirTemp(l.TempDir(), source.SnapshotPrefix)
+	if err != nil {
+		return PreparedRun{}, fmt.Errorf("prepare hosted snapshot dir: %w", err)
+	}
+	defer os.RemoveAll(snapParent)
+	if _, err := source.MaterializeSnapshot(graph, snapParent); err != nil {
+		return PreparedRun{}, err
+	}
+	manifest, blobs, err := source.BuildWithValidation(checkoutRoot, graph.LFSFiles)
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	blobStore := source.BlobStore{Layout: l}
+	if err := blobStore.PutManifestAndBlobs(manifest, blobs); err != nil {
+		return PreparedRun{}, err
+	}
+	provenance := map[string]any{
+		"kind":   "hosted_git",
+		"url":    validated.URL,
+		"commit": validated.Commit,
+	}
+	now := time.Now().UTC()
+	runStore := store.Store{Layout: l}
+	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, manifest.Digest, buildDraftSnapshot(projectName, project, cfg), now)
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	var staged store.RunRecord
+	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
+		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, buildStagedSnapshot(projectName, project, machineName, cfg, provenance), now)
 		if buildErr != nil {
 			return buildErr
 		}

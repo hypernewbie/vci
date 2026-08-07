@@ -68,6 +68,11 @@ type Project struct {
 	Machines    []string          `toml:"machines" json:"machines"`
 	Command     []string          `toml:"command" json:"command"`
 	Environment map[string]string `toml:"environment" json:"environment,omitempty"`
+	// HostedFallback is the optional immutable source declaration
+	// for `vci build --hosted <project>`. Either both URL and
+	// Commit are set or the field is treated as absent; partial
+	// declarations are rejected by validation.
+	HostedFallback HostedFallback `toml:"hosted_fallback" json:"hosted_fallback,omitempty"`
 }
 
 // DefaultLogLimits and DefaultRetention are the coordinator defaults used
@@ -183,6 +188,14 @@ func validateCoordinator(cfg Config) error {
 		}
 		if len(project.Command) == 0 || strings.TrimSpace(project.Command[0]) == "" {
 			return fmt.Errorf("project %q has no command", name)
+		}
+		// The hosted fallback is optional; when both fields are
+		// empty this is a no-op. A partial declaration is rejected
+		// up-front so a setup typo cannot ship a broken checkout.
+		if project.HostedFallback.URL != "" || project.HostedFallback.Commit != "" {
+			if _, err := project.HostedFallback.Validate(); err != nil {
+				return fmt.Errorf("project %q hosted fallback: %w", name, err)
+			}
 		}
 		seen := map[string]bool{}
 		for _, machine := range project.Machines {

@@ -13,13 +13,18 @@ import (
 // fakeRunner is a process.Runner that returns a fixed stdout for a
 // given argv shape. Strict-stage tests use it to inject malformed
 // stage records without relying on real Git state.
+//
+// Calls records every Run invocation so hosted-checkout tests can
+// assert the exact command sequence, env, and dir. Existing tests
+// that only inspect argv continue to work — the field is additive.
 type fakeRunner struct {
 	patterns []fakePattern
 	failures []fakeFailure
+	calls    []process.Command
 }
 
 type fakePattern struct {
-	match   func(args []string) bool
+	match  func(args []string) bool
 	stdout string
 }
 
@@ -29,6 +34,7 @@ type fakeFailure struct {
 }
 
 func (f *fakeRunner) Run(ctx context.Context, cmd process.Command) (process.Result, error) {
+	f.calls = append(f.calls, cmd)
 	for _, fail := range f.failures {
 		if fail.match(cmd.Args) {
 			return process.Result{ExitCode: 1}, fmt.Errorf("fake runner: %s", fail.msg)

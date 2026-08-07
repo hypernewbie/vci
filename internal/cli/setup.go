@@ -97,8 +97,11 @@ func runSetup(args []string) (any, *model.VciError) {
 		if errMsg := requireCoordinatorRole(l); errMsg != nil {
 			return nil, errMsg
 		}
-		if len(args) < 3 || args[1] != "add" {
-			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> [--machine <name>...] --command <exe> [--arg <arg>].", false)
+		if len(args) < 3 || (args[1] != "add" && args[1] != "hosted") {
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> [--machine <name>...] --command <exe> [--arg <arg>].\n       setup project hosted set <name> --url <url> --commit <object-id>\n       setup project hosted clear <name>", false)
+		}
+		if args[1] == "hosted" {
+			return runSetupProjectHosted(l, args[2:])
 		}
 		var machines []string
 		executable := ""
@@ -136,6 +139,63 @@ func runSetup(args []string) (any, *model.VciError) {
 		return map[string]any{"project": args[2], "machines": machines, "command": append([]string{executable}, commandArgs...), "updated": true}, nil
 	default:
 		return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown setup operation %q.", args[0]), false)
+	}
+}
+
+// runSetupProjectHosted handles `setup project hosted set|clear <name>`.
+// Both subcommands mutate only a coordinator root via the
+// config.Mutate-backed app helpers. The --url and --commit values are
+// validated through HostedFallback.Validate before any disk write.
+func runSetupProjectHosted(l layout.Layout, args []string) (any, *model.VciError) {
+	if len(args) < 1 {
+		return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project hosted set <name> --url <url> --commit <object-id>\n       setup project hosted clear <name>", false)
+	}
+	switch args[0] {
+	case "set":
+		if len(args) < 2 {
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project hosted set <name> --url <url> --commit <object-id>", false)
+		}
+		name := args[1]
+		url := ""
+		commit := ""
+		for i := 2; i < len(args); i++ {
+			switch args[i] {
+			case "--url":
+				if i+1 >= len(args) {
+					return nil, model.NewError("invalid_arguments", model.FailureUsage, "--url requires a value.", false)
+				}
+				url = args[i+1]
+				i++
+			case "--commit":
+				if i+1 >= len(args) {
+					return nil, model.NewError("invalid_arguments", model.FailureUsage, "--commit requires a value.", false)
+				}
+				commit = args[i+1]
+				i++
+			default:
+				return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown hosted option %q.", args[i]), false)
+			}
+		}
+		if url == "" || commit == "" {
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "hosted set requires --url and --commit.", false)
+		}
+		if err := app.SetHostedFallback(l, name, url, commit); err != nil {
+			if errors.Is(err, config.ErrHostedFallbackInvalid) {
+				return nil, model.NewError("hosted_fallback_invalid", model.FailureConfiguration, err.Error(), false)
+			}
+			return nil, model.NewError("hosted_update_failed", model.FailureConfiguration, err.Error(), false)
+		}
+		return map[string]any{"project": name, "hosted_url": url, "hosted_commit": commit, "updated": true}, nil
+	case "clear":
+		if len(args) != 2 {
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project hosted clear <name>.", false)
+		}
+		if err := app.ClearHostedFallback(l, args[1]); err != nil {
+			return nil, model.NewError("hosted_update_failed", model.FailureConfiguration, err.Error(), false)
+		}
+		return map[string]any{"project": args[1], "cleared": true}, nil
+	default:
+		return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown hosted operation %q.", args[0]), false)
 	}
 }
 

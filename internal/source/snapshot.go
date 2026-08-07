@@ -19,11 +19,34 @@ const (
 	// StagingPrefix is the basename prefix of every Vci-owned direct
 	// SSH staging directory under the coordinator temp directory.
 	StagingPrefix = "vci-source-"
+	// HostedPrefix is the basename prefix of every Vci-owned pinned
+	// Git checkout directory produced by `source.Checkout`. The
+	// reaper sweeps only this prefix and never traverses arbitrary
+	// TMPDIR content. A pinned checkout is never reused between
+	// runs; a fresh rand suffix is generated per invocation.
+	HostedPrefix = "vci-hosted-"
 	// StagingMetaName is the basename of the metadata file the
 	// staging fragment writes inside each staging directory so the
 	// coordinator can rebuild the validated cache key.
 	StagingMetaName = "vci-meta"
 )
+
+// allowedTopLevelGitMarkers is the closed set of `.git`-prefixed
+// paths that may survive into the materialized snapshot at the top
+// level. These three markers are the minimum required for the
+// remote `source.Discover` to recognize the staged tree as a Git
+// repository directory via `git rev-parse --show-toplevel`. They
+// are the only signals the direct-SSH local source path appends to
+// the selected file list at the top level (see buildGraph in
+// submodule.go). All other `.git` content (config, hooks, logs,
+// packed-refs, objects/pack, branches, index, info) stays excluded
+// at every depth because gitlinks, not the `.git` directory, are
+// the contracted path-restoration signal.
+var allowedTopLevelGitMarkers = map[string]bool{
+	".git/HEAD":    true,
+	".git/objects": true,
+	".git/refs":    true,
+}
 
 // MaterializeSnapshot copies the selected build input into a new
 // Vci-owned directory under destParent, preserving relative paths,
@@ -68,10 +91,16 @@ func MaterializeSnapshot(input SourceInput, destParent string) (string, error) {
 		return "", fmt.Errorf("snapshot protect: %w", err)
 	}
 	for _, p := range validated.Files {
-		if isExcludedComponent(p) {
+		if isExcludedComponent(p) && !allowedTopLevelGitMarkers[p] {
 			// Defensive: validated input should never carry an
 			// excluded component, but the consumer-trust contract
-			// is preserved either way.
+			// is preserved either way. The three top-level
+			// minimal git markers are explicitly allowed because
+			// the direct-SSH local source path appends them so
+			// the remote `vci build .` can resolve the repository
+			// root via `source.Discover`. Nested `.git` at any
+			// depth, `.gitmodules` at any depth, and any
+			// non-marker `.git` content stays excluded.
 			continue
 		}
 		src := filepath.Join(validated.Root, p)

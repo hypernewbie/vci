@@ -236,10 +236,11 @@ func ReapSourceCache(cacheDir string, maxBytes int64) (int, int, int64, int64, i
 	return removed, scratchRemoved, totalBytes, maxBytes, rejected, nil
 }
 
-// reapTransferDirs removes stale direct-SSH transfer staging directories
-// and client materialization snapshots under the Vci-owned TempDir. It
-// only matches the explicit `vci-source-`, legacy `vci-source.`, or
-// `vci-snapshot-` prefixes and never traverses arbitrary TMPDIR content. Stale means the
+// reapTransferDirs removes stale direct-SSH transfer staging directories,
+// client materialization snapshots, and coordinator-owned pinned Git
+// checkouts under the Vci-owned TempDir. It only matches the explicit
+// `vci-source-`, legacy `vci-source.`, `vci-snapshot-`, or `vci-hosted-`
+// prefixes and never traverses arbitrary TMPDIR content. Stale means the
 // directory has not been modified within transferStaleAge. The reaper
 // never signals any process.
 func reapTransferDirs(tempDir string, now time.Time) (int, error) {
@@ -256,7 +257,7 @@ func reapTransferDirs(tempDir string, now time.Time) (int, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		if !strings.HasPrefix(entry.Name(), source.StagingPrefix) && !strings.HasPrefix(entry.Name(), "vci-source.") && !strings.HasPrefix(entry.Name(), source.SnapshotPrefix) {
+		if !strings.HasPrefix(entry.Name(), source.StagingPrefix) && !strings.HasPrefix(entry.Name(), "vci-source.") && !strings.HasPrefix(entry.Name(), source.SnapshotPrefix) && !strings.HasPrefix(entry.Name(), source.HostedPrefix) {
 			continue
 		}
 		info, infoErr := entry.Info()

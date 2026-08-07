@@ -70,12 +70,47 @@ func dispatch(command string, args []string) (Response, int) {
 		}
 		return Success(command, inventory.Projects), 0
 	case "build":
-		if len(args) != 1 {
-			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: build <path>.", false)), 2
+		// Accept exactly one of: "build <path>" (1 arg) or
+		// "build --hosted <project>" (2 args, first is the flag).
+		// Every other shape is a usage error.
+		hostedShape := len(args) == 2 && args[0] == "--hosted"
+		if len(args) != 1 && !hostedShape {
+			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: build <path> | build --hosted <project>.", false)), 2
+		}
+		if len(args) == 1 && args[0] == "--hosted" {
+			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: build <path> | build --hosted <project>.", false)), 2
 		}
 		l, err := resolveLayout()
 		if err != nil {
 			return appFailure(command, err), 2
+		}
+		// `build --hosted <project>` is a coordinator-only source
+		// mode. A client root proxies the command through ordinary
+		// RemoteCommand so the coordinator retains all source
+		// policy authority; the client sends no tar, no URL, no
+		// commit, and no configuration mutation.
+		if len(args) == 2 && args[0] == "--hosted" {
+			projectName := args[1]
+			remoteConfigured, remoteErr := app.RemoteConfigured(l)
+			if remoteErr != nil {
+				return appFailure(command, remoteErr), 2
+			}
+			if remoteConfigured {
+				raw, _, remoteErr := app.RemoteCommand(context.Background(), l, "build", "--hosted", projectName)
+				if remoteErr != nil {
+					return appFailure(command, remoteErr), 2
+				}
+				return decodeRemoteResponse(command, raw)
+			}
+			prepared, err := app.PrepareHosted(context.Background(), l, projectName)
+			if err != nil {
+				return appFailure(command, err), 2
+			}
+			if err := spawnRun(prepared.Record.ID); err != nil {
+				_ = app.Abandon(l, prepared.Record.ID)
+				return appFailure(command, err), 2
+			}
+			return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
 		}
 		remoteConfigured, remoteErr := app.RemoteConfigured(l)
 		if remoteErr != nil {

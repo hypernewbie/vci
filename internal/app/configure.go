@@ -72,6 +72,55 @@ func AddProject(l layout.Layout, name string, project config.Project) error {
 	})
 }
 
+// SetHostedFallback records a coordinator-owned hosted fallback for
+// the named project. The URL and commit are validated through
+// config.Validate before the mutation is persisted; an invalid pair
+// is rejected with ErrHostedFallbackInvalid so a setup typo cannot
+// ship a broken checkout. A client root returns an error before any
+// mutation is attempted.
+func SetHostedFallback(l layout.Layout, project, url, commit string) error {
+	if !layout.ValidName(project) {
+		return fmt.Errorf("invalid project name %q", project)
+	}
+	if _, err := (config.HostedFallback{URL: url, Commit: commit}).Validate(); err != nil {
+		return err
+	}
+	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
+		if cfg.Orchestrator != config.OrchestratorSelf {
+			return fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
+		}
+		proj, ok := cfg.Projects[project]
+		if !ok {
+			return fmt.Errorf("project %q does not exist", project)
+		}
+		proj.HostedFallback = config.HostedFallback{URL: url, Commit: commit}
+		cfg.Projects[project] = proj
+		return nil
+	})
+}
+
+// ClearHostedFallback removes the configured hosted fallback for the
+// named project. A client root returns an error before any mutation
+// is attempted. A missing project name is an error so the operator
+// can correct the typo without silently no-op'ing.
+func ClearHostedFallback(l layout.Layout, project string) error {
+	if !layout.ValidName(project) {
+		return fmt.Errorf("invalid project name %q", project)
+	}
+	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
+		if cfg.Orchestrator != config.OrchestratorSelf {
+			return fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
+		}
+		proj, ok := cfg.Projects[project]
+		if !ok {
+			return fmt.Errorf("project %q does not exist", project)
+		}
+		proj.HostedFallback = config.HostedFallback{}
+		cfg.Projects[project] = proj
+		return nil
+	})
+}
+
 type MachineView struct {
 	Name      string         `json:"name"`
 	Machine   config.Machine `json:"machine"`

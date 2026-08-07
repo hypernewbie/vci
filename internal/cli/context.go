@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/scheduler"
@@ -31,6 +32,21 @@ func appFailure(command string, err error) Response {
 	}
 	if errors.Is(err, source.ErrLFSContentUnavailable) {
 		return Failure(command, model.NewError("lfs_content_unavailable", model.FailureConfiguration, message, false))
+	}
+	// Hosted build typed sentinels. These must come BEFORE the
+	// substring-based "ssh" / "tar:" branches so a wrapped upstream
+	// message does not get reclassified as remote_unavailable.
+	if errors.Is(err, config.ErrHostedFallbackNotConfigured) {
+		return Failure(command, model.NewError("hosted_fallback_not_configured", model.FailureConfiguration, message, false))
+	}
+	if errors.Is(err, config.ErrHostedFallbackInvalid) {
+		return Failure(command, model.NewError("hosted_fallback_invalid", model.FailureConfiguration, message, false))
+	}
+	if errors.Is(err, config.ErrHostedSourceUnavailable) {
+		return Failure(command, model.NewError("hosted_source_unavailable", model.FailureInfrastructure, message, true))
+	}
+	if errors.Is(err, config.ErrHostedSourceIntegrityFailed) {
+		return Failure(command, model.NewError("hosted_source_integrity_failed", model.FailureInfrastructure, message, false))
 	}
 	lower := strings.ToLower(message)
 	switch {

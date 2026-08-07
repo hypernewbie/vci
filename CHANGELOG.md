@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+- Plan 12 Fix repairs three Plan 12 defects that the original
+  tests did not pin. The materialized snapshot now allow-lists
+  the three top-level minimal git markers (`.git/HEAD`,
+  `.git/objects`, `.git/refs`) so the client tar list references
+  files that actually exist in the snapshot. Nested `.git` at
+  any depth, `.gitmodules` at any depth, and arbitrary `.git`
+  content (config, hooks, packed-refs, objects/pack) stay
+  excluded because gitlinks, not the `.git` directory, are the
+  contracted path-restoration signal. The committed `Plan 12`
+  also broke the default direct-SSH client path (`TestStagingTrapLeavesExternalSymlinkTargetUnchanged`
+  failed deterministically with `tar: .git/HEAD: Cannot stat`).
+  The host class of the URL regex is tightened so the host
+  segment cannot legally contain characters that match an
+  alphabetic port, the path is required (the optional `/...`
+  group is now mandatory), and an explicit pre-check rejects any
+  userinfo containing `:` so a future regex change cannot
+  regress the password rejection. The optional port is validated
+  against the TCP range 1..65535. The hosted integrity check
+  switches from `strings.EqualFold` to exact equality after
+  `TrimSpace`; both sides are validated lowercase hex, so a
+  case-mismatched pin is a genuine integrity failure (hostile
+  redirect or default-branch resolution) that the explicit
+  comparison will surface. The env-inheritance test now
+  pre-seeds conflicting `GIT_TERMINAL_PROMPT`/`GIT_ASKPASS`/`GIT_ASKPASS_REQUIRE`
+  values so a future regression that forgets to drop the
+  inherited value before appending the override will fail. README
+  is updated to reflect that the hosted-Git fallback is an
+  explicit coordinator-only pinned source mode, not a fallback
+  from a failed direct build.
+- Plan 12 introduces an explicit coordinator-configured pinned
+  hosted Git fallback source mode. `vci build --hosted <project>`
+  is a coordinator-only two-argument form that pins one configured
+  full lowercase hex commit (40- or 64-char) on one configured
+  `https://host/path` or `ssh://[user@]host/path` URL. Direct
+  `build <path>` remains the default and preferred path; no
+  automatic transition exists from a failed direct build to hosted
+  Git, and no fallthrough from any error. Client roots proxy the
+  command through ordinary `RemoteCommand` over SSH; the client
+  sends no tar, no URL, no commit, no configuration mutation, and
+  no run record. The new `setup project hosted set|clear` subcommands
+  mutate only a coordinator root through `config.Mutate` and
+  validate the URL+commit before any disk write. The CLI surface is
+  closed: `--hosted` is the only allowed flag form, and every
+  invalid shape returns `invalid_arguments`. The four typed error
+  codes (`hosted_fallback_not_configured`,
+  `hosted_fallback_invalid`, `hosted_source_unavailable`,
+  `hosted_source_integrity_failed`) are mapped to stable envelopes
+  with documented class and retryable flag, and a remote valid
+  failure envelope is relayed unchanged rather than relabeled as
+  SSH failure. The hosted checkout uses the system `git`
+  executable directly via `process.Runner` — no shell, no template
+  interpolation beyond the validated URL and commit — with
+  `core.hooksPath=/dev/null`, `protocol.file.allow=never`, and
+  `protocol.version=2`; the merged environment inherits `os.Environ`
+  so `PATH`, `HOME`, and `SSH_AUTH_SOCK` are preserved. Every git
+  command's env includes `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=true`,
+  and `GIT_ASKPASS_REQUIRE=force` so no interactive prompt can
+  block a coordinator build. The pinned commit is verified by
+  reading `git rev-parse --verify HEAD` after checkout and
+  comparing for exact lowercase equality; any mismatch is a hard
+  integrity failure. The checkout lives in
+  `l.TempDir()/vci-hosted-<rand>/<project>` and is removed on every
+  exit path; stale `vci-hosted-*` roots are swept by the existing
+  reaper prefix match. The staged run record gains an additive
+  `source_provenance` block (`kind: "hosted_git"`, validated URL,
+  pinned commit); direct/local builds keep their existing fields.
+  No checkout path, credential, token, or query is ever placed
+  in the snapshot. Hosted builds do not participate in
+  source-cache admission: a hosted root matches neither the
+  cache-entry shape nor the staging shape, so the source-cache
+  path is intentionally skipped. Hosted fallback deliberately does
+  not fetch submodules or LFS objects; a gitlink fails as
+  `submodule_unavailable` and an unhydrated LFS pointer fails as
+  `lfs_content_unavailable` through the existing typed errors. No
+  `file://` URL, public network, source relay, daemon, or Go SSH
+  implementation is added; no clone mirror, retry queue, branch /
+  tag / HEAD resolution, or credential store. The full release
+  gate must remain green.
 - Plan 11 Fix repairs the Plan 11 scheduler, source, and proof
   surfaces after review found four residual correctness defects
   that the original tests did not pin. The new scheduler is
