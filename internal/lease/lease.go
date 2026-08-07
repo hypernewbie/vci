@@ -15,7 +15,6 @@ import (
 type Lease struct {
 	RunID     model.RunID `json:"run_id"`
 	Owner     string      `json:"owner"`
-	Attempt   int         `json:"attempt"`
 	ExpiresAt time.Time   `json:"expires_at"`
 }
 
@@ -36,7 +35,7 @@ func Claim(l layout.Layout, id model.RunID, owner string, now time.Time, ttl tim
 	if existing, err := read(path); err == nil && existing.ExpiresAt.After(now) {
 		return fmt.Errorf("run %s is leased by %s", id, existing.Owner)
 	}
-	data, err := json.Marshal(Lease{RunID: id, Owner: owner, Attempt: 1, ExpiresAt: now.Add(ttl).UTC()})
+	data, err := json.Marshal(Lease{RunID: id, Owner: owner, ExpiresAt: now.Add(ttl).UTC()})
 	if err != nil {
 		return err
 	}
@@ -89,29 +88,26 @@ func Release(l layout.Layout, id model.RunID, owner string) error {
 	return os.Remove(path)
 }
 
-func Expired(l layout.Layout, id model.RunID, now time.Time) (bool, error) {
-	path, err := leasePath(l, id)
-	if err != nil {
-		return false, err
-	}
-	unlock, err := lock.Acquire(filepath.Join(filepath.Dir(path), "run.lock"))
-	if err != nil {
-		return false, err
-	}
-	defer unlock()
-	current, err := read(path)
-	if err != nil {
-		return false, err
-	}
-	return !current.ExpiresAt.After(now), nil
-}
-
 func Read(l layout.Layout, id model.RunID) (Lease, error) {
 	path, err := leasePath(l, id)
 	if err != nil {
 		return Lease{}, err
 	}
 	return read(path)
+}
+
+// ReadHasNoLease reports whether the named run has no worker lease
+// (the lease file is absent). A corrupt lease file is treated as
+// "has a lease" so the caller does not misclassify it as missing.
+func ReadHasNoLease(l layout.Layout, id model.RunID) bool {
+	path, err := leasePath(l, id)
+	if err != nil {
+		return false
+	}
+	if _, err := os.Stat(path); err != nil {
+		return os.IsNotExist(err)
+	}
+	return false
 }
 
 func leasePath(l layout.Layout, id model.RunID) (string, error) {

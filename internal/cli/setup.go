@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"strconv"
 
 	"github.com/hypernewbie/vci/internal/app"
 	"github.com/hypernewbie/vci/internal/config"
@@ -46,16 +46,42 @@ func runSetup(args []string) (any, *model.VciError) {
 			return nil, errMsg
 		}
 		if len(args) < 3 {
-			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add|remove <name>.", false)
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add|remove <name> [--capacity <positive-int>].", false)
 		}
 		switch args[1] {
 		case "add":
-			if len(args) != 3 {
-				return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add <name>.", false)
+			name := ""
+			machine := config.Machine{}
+			i := 2
+			if i >= len(args) {
+				return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add <name> [--capacity <positive-int>].", false)
 			}
-			if err := app.AddMachine(l, args[2], config.Machine{}); err != nil {
+			name = args[i]
+			i++
+			for ; i < len(args); i++ {
+				switch args[i] {
+				case "--capacity":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--capacity requires a positive integer.", false)
+					}
+					n, parseErr := strconv.Atoi(args[i+1])
+					if parseErr != nil || n <= 0 {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--capacity must be a positive integer.", false)
+					}
+					machine.MaxConcurrent = n
+					i++
+				default:
+					return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown machine option %q.", args[i]), false)
+				}
+			}
+			if err := app.AddMachine(l, name, machine); err != nil {
 				return nil, model.NewError("machine_update_failed", model.FailureConfiguration, err.Error(), false)
 			}
+			result := map[string]any{"machine": name, "updated": true}
+			if machine.MaxConcurrent > 0 {
+				result["max_concurrent"] = machine.MaxConcurrent
+			}
+			return result, nil
 		case "remove":
 			if len(args) != 3 {
 				return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine remove <name>.", false)
@@ -72,9 +98,10 @@ func runSetup(args []string) (any, *model.VciError) {
 			return nil, errMsg
 		}
 		if len(args) < 3 || args[1] != "add" {
-			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> --command <exe> [--arg <arg>].", false)
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> [--machine <name>...] --command <exe> [--arg <arg>].", false)
 		}
-		machine, executable := "", ""
+		var machines []string
+		executable := ""
 		commandArgs := []string{}
 		for i := 3; i < len(args); i++ {
 			switch args[i] {
@@ -82,7 +109,7 @@ func runSetup(args []string) (any, *model.VciError) {
 				if i+1 >= len(args) {
 					return nil, model.NewError("invalid_arguments", model.FailureUsage, "--machine requires a name.", false)
 				}
-				machine = args[i+1]
+				machines = append(machines, args[i+1])
 				i++
 			case "--command":
 				if i+1 >= len(args) {
@@ -100,19 +127,17 @@ func runSetup(args []string) (any, *model.VciError) {
 				return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown project option %q.", args[i]), false)
 			}
 		}
-		if machine == "" || executable == "" {
+		if len(machines) == 0 || executable == "" {
 			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Project requires --machine and --command.", false)
 		}
-		if err := app.AddProject(l, args[2], config.Project{Machines: []string{machine}, Command: append([]string{executable}, commandArgs...)}); err != nil {
+		if err := app.AddProject(l, args[2], config.Project{Machines: machines, Command: append([]string{executable}, commandArgs...)}); err != nil {
 			return nil, model.NewError("project_update_failed", model.FailureConfiguration, err.Error(), false)
 		}
-		return map[string]any{"project": args[2], "command": append([]string{executable}, commandArgs...), "updated": true}, nil
+		return map[string]any{"project": args[2], "machines": machines, "command": append([]string{executable}, commandArgs...), "updated": true}, nil
 	default:
 		return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown setup operation %q.", args[0]), false)
 	}
 }
-
-func validRunID(value string) bool { return strings.HasPrefix(value, "run_") }
 
 // requireCoordinatorRole returns an error when this root does not declare
 // orchestrator = "self", which is the only role permitted to mutate

@@ -44,7 +44,14 @@ func Build(root string) (Manifest, map[string][]byte, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+		// Skip every .git component at any depth (directory or
+		// file). Submodule .git directories carry the child's
+		// gitdir data; the Plan 11 contract excludes that data
+		// from manifests, snapshots, and cache entries. The
+		// top-level minimal .git markers needed for source.Discover
+		// are produced by the staging path, not the local
+		// manifest, which walks the working tree as-is.
+		if isExcludedComponent(rel) {
 			if d.IsDir() {
 				return fs.SkipDir
 			}
@@ -137,6 +144,30 @@ func (s BlobStore) putBlob(digest string, data []byte) error {
 	return atomicWrite(path, data, 0o400)
 }
 
+// isGitComponent reports whether the top-relative path is a .git
+// entry at any depth. The first segment is checked first; nested
+// .git directories inside submodule working trees are also skipped.
+func isGitComponent(rel string) bool {
+	for _, segment := range strings.Split(rel, "/") {
+		if segment == ".git" {
+			return true
+		}
+	}
+	return false
+}
+
+// isExcludedComponent reports whether the top-relative path is
+// excluded at every depth: any .git component (directory or file),
+// or a .gitmodules file. .gitmodules is excluded because it can
+// carry remote URLs and embedded credentials; Vci needs gitlinks
+// from index stage records, not checkout URLs.
+func isExcludedComponent(rel string) bool {
+	if isGitComponent(rel) {
+		return true
+	}
+	return filepath.Base(rel) == ".gitmodules"
+}
+
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -166,4 +197,45 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return nil
+}
+
+// BuildWithValidation builds a manifest from the working tree at
+// root and validates every LFS-attributed regular file against the
+// formal pointer format. The validation runs against the same
+// bytes that become a blob: a typed pointer failure is reported
+// before any blob is published, reservation is taken, or run
+// record is created.
+//
+// `lfsFiles` is the set of LFS-attributed paths declared by the
+// upstream graph collector. The set is consulted via relative path
+// match; an LFS-attributed path that is missing or non-regular in
+// the local working tree is a source-state error rather than a
+// silent skip, because the agent's tool said it was there.
+//
+// Local manifest inclusion rules (ignored files, locally-deleted
+// tracked files, executable modes, symlinks) are unchanged from
+// Build; the only addition is the LFS check at the byte level.
+func BuildWithValidation(root string, lfsFiles map[string]bool) (Manifest, map[string][]byte, error) {
+	manifest, blobs, err := Build(root)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	for rel := range lfsFiles {
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		info, err := os.Lstat(full)
+		if err != nil {
+			return Manifest{}, nil, fmt.Errorf("lfs-attributed file %s: %w", rel, err)
+		}
+		if !info.Mode().IsRegular() {
+			return Manifest{}, nil, fmt.Errorf("lfs-attributed file %s is not regular", rel)
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return Manifest{}, nil, fmt.Errorf("read lfs-attributed file %s: %w", rel, err)
+		}
+		if isLFSPointer(data) {
+			return Manifest{}, nil, fmt.Errorf("%w: %s", ErrLFSContentUnavailable, rel)
+		}
+	}
+	return manifest, blobs, nil
 }

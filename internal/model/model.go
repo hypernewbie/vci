@@ -13,9 +13,6 @@ var validRunID = regexp.MustCompile(`^run_[A-Za-z0-9._-]+$`)
 
 func ValidRunID(id RunID) bool { return validRunID.MatchString(string(id)) }
 
-type ProjectName string
-type MachineName string
-
 type RunState string
 
 const (
@@ -82,7 +79,6 @@ type VciError struct {
 	Class     FailureClass `json:"class"`
 	Message   string       `json:"message"`
 	Retryable bool         `json:"retryable"`
-	Details   any          `json:"details,omitempty"`
 }
 
 func (e *VciError) Error() string { return e.Message }

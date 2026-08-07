@@ -43,7 +43,15 @@ func TestBuildAbortTerminatesOwnedCommand(t *testing.T) {
 	var buildErr error
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { defer wg.Done(); result, buildErr = Build(context.Background(), l, repo) }()
+	go func() {
+		defer wg.Done()
+		prepared, prepErr := Prepare(context.Background(), l, repo)
+		if prepErr != nil {
+			buildErr = prepErr
+			return
+		}
+		result, buildErr = ExecutePrepared(context.Background(), l, prepared.Record.ID)
+	}()
 	deadline := time.Now().Add(10 * time.Second)
 	var id model.RunID
 	for time.Now().Before(deadline) {
@@ -106,7 +114,11 @@ func TestBuildFixtureFailureIsAJobFailure(t *testing.T) {
 	if err := AddProject(l, "failure-fixture", config.Project{Machines: []string{"mac-local"}, Command: []string{"go", "test", "./..."}}); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Build(context.Background(), l, repo)
+	prepared, prepErr := Prepare(context.Background(), l, repo)
+	if prepErr != nil {
+		t.Fatal(prepErr)
+	}
+	result, err := ExecutePrepared(context.Background(), l, prepared.Record.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

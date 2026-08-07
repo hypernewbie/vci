@@ -8,7 +8,7 @@ import (
 
 func TestLocalCapturesJobExit(t *testing.T) {
 	var out, errOut bytes.Buffer
-	result, err := (Local{}).Execute(context.Background(), Request{Executable: "/bin/sh", Args: []string{"-c", "printf ok; printf bad >&2; exit 7"}, Workspace: t.TempDir(), Stdout: &out, Stderr: &errOut})
+	result, err := (Local{}).ExecuteSupervised(context.Background(), Request{Executable: "/bin/sh", Args: []string{"-c", "printf ok; printf bad >&2; exit 7"}, Workspace: t.TempDir(), Stdout: &out, Stderr: &errOut}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

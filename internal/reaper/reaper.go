@@ -10,6 +10,8 @@ import (
 	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/lease"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/scheduler"
+	"github.com/hypernewbie/vci/internal/source"
 	"github.com/hypernewbie/vci/internal/sourcecache"
 	"github.com/hypernewbie/vci/internal/store"
 )
@@ -17,12 +19,14 @@ import (
 type Report struct {
 	Removed                   int   `json:"removed"`
 	MarkedLost                int   `json:"marked_lost"`
+	QueuedAborted             int   `json:"queued_aborted"`
 	TransferRemoved           int   `json:"transfer_removed"`
 	SourceCacheRemoved        int   `json:"source_cache_removed"`
 	SourceCacheScratchRemoved int   `json:"source_cache_scratch_removed"`
 	SourceCacheBytes          int64 `json:"source_cache_bytes"`
 	SourceCacheLimitBytes     int64 `json:"source_cache_limit_bytes"`
 	SourceCacheRejected       int   `json:"source_cache_rejected"`
+	SchedulerClaimsReleased   int   `json:"scheduler_claims_released"`
 }
 
 const (
@@ -31,6 +35,15 @@ const (
 	// DefaultSourceCacheBytes is the documented default quota used
 	// when no coordinator-owned retention setting supplies one.
 	DefaultSourceCacheBytes = 500 * 1024 * 1024
+	// preStartGrace is the bounded window a freshly-published staging
+	// record may wait for its detached worker to claim a normal
+	// worker lease. During the grace a valid reservation protects the
+	// record from `setup reap`; after the grace expires with no lease,
+	// the reaper marks the run lost and the scheduler reaps the
+	// claim. An active lease overrides claim age entirely: workers
+	// that have already claimed their lease are governed by the
+	// existing lease/renewal rules, never by this grace.
+	preStartGrace = 60 * time.Second
 )
 
 func Run(l layout.Layout, now time.Time) (Report, error) {
@@ -50,6 +63,19 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		if loadErr != nil {
 			continue
 		}
+		// Legacy `queued` records: the public build path only spawns
+		// after staging, so a queued record with no lease cannot be a
+		// live submission. Terminalize it as aborted (a distinct
+		// counter from worker losses) and let scheduler reaping free
+		// any orphan claim below.
+		if record.State == model.RunQueued {
+			if lease.ReadHasNoLease(l, id) {
+				if _, transitionErr := runStore.Transition(id, model.RunAborted, now); transitionErr == nil {
+					report.QueuedAborted++
+				}
+				continue
+			}
+		}
 		if record.State != model.RunStaging && record.State != model.RunRunning {
 			continue
 		}
@@ -64,13 +90,44 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 			if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
 				report.MarkedLost++
 			}
-		} else if os.IsNotExist(leaseErr) {
+			continue
+		}
+		if !os.IsNotExist(leaseErr) {
+			// Corrupt lease metadata: leave the run untouched. A later
+			// pass with a healthy lease file is responsible for the
+			// terminal decision.
+			continue
+		}
+		// No lease. For a staging record, the only thing that can
+		// justify retaining it is a fresh, valid scheduler
+		// reservation younger than the pre-start grace. Claim age is
+		// never used to kill a run that has already claimed its
+		// worker lease; an active lease path is handled above.
+		if record.State == model.RunStaging {
+			res, resErr := scheduler.ReservationFor(l, record.Machine, id)
+			if resErr != nil {
+				// Missing or corrupt reservation: the detached worker
+				// never had a slot to claim. Terminalize as lost so
+				// the slot is freed for the next submission.
+				if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
+					report.MarkedLost++
+				}
+				continue
+			}
+			if now.Sub(res.CreatedAt) < preStartGrace {
+				// Within the grace; the worker may still be racing to
+				// claim its lease.
+				continue
+			}
 			if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
 				report.MarkedLost++
 			}
+			continue
 		}
-		// Corrupt metadata is left for a later pass; it is not proof of stale
-		// ownership and must not trigger cleanup or a process signal.
+		// Running with no lease is a stale orphan: mark lost.
+		if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
+			report.MarkedLost++
+		}
 	}
 
 	entries, err := os.ReadDir(l.WorkDir())
@@ -117,6 +174,12 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		report.SourceCacheBytes = bytes
 		report.SourceCacheLimitBytes = total
 		report.SourceCacheRejected = rejected
+	}
+
+	if released, err := scheduler.Reap(l, runStore); err != nil {
+		return report, err
+	} else {
+		report.SchedulerClaimsReleased = released
 	}
 
 	return report, nil
@@ -193,7 +256,7 @@ func reapTransferDirs(tempDir string, now time.Time) (int, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		if !strings.HasPrefix(entry.Name(), "vci-source-") && !strings.HasPrefix(entry.Name(), "vci-source.") && !strings.HasPrefix(entry.Name(), "vci-snapshot-") {
+		if !strings.HasPrefix(entry.Name(), source.StagingPrefix) && !strings.HasPrefix(entry.Name(), "vci-source.") && !strings.HasPrefix(entry.Name(), source.SnapshotPrefix) {
 			continue
 		}
 		info, infoErr := entry.Info()
@@ -211,13 +274,6 @@ func reapTransferDirs(tempDir string, now time.Time) (int, error) {
 	return removed, nil
 }
 
-func leaseExpired(l layout.Layout, id model.RunID, now time.Time) (bool, error) {
-	current, err := lease.Read(l, id)
-	if err != nil {
-		return false, err
-	}
-	return !current.ExpiresAt.After(now), nil
-}
 func removeTree(path string) error {
 	return os.RemoveAll(path)
 }

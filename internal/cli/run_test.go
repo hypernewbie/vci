@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -84,5 +87,94 @@ func TestRunRejectsMalformedRunIDsAcrossCommands(t *testing.T) {
 				t.Fatalf("command echo: %q", got.Command)
 			}
 		})
+	}
+}
+
+// TestLocalBuildDataIncludesMachine pins that a successful local
+// build response carries the selected machine name. The machine is
+// the public coordinate the client uses to map an accepted run id
+// back to a coordinator-local slot. Without it, only the run record
+// reveals the choice — which is private coordinator state.
+func TestLocalBuildDataIncludesMachine(t *testing.T) {
+	prevRoot, hadRoot := os.LookupEnv("VCI_ROOT")
+	tmp := t.TempDir()
+	if err := os.Setenv("VCI_ROOT", tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if hadRoot {
+			_ = os.Setenv("VCI_ROOT", prevRoot)
+		} else {
+			_ = os.Unsetenv("VCI_ROOT")
+		}
+	})
+	// Build a coordinator config with a single machine named "alpha".
+	cfgPath := filepath.Join(tmp, "config.toml")
+	body := "schema_version = 1\norchestrator = \"self\"\n\n[log_limits]\nstdout_bytes = 4194304\nstderr_bytes = 4194304\n\n[retention]\nmax_bytes = 536870912\n\n[machines.alpha]\n\n[projects.demo]\nmachines = [\"alpha\"]\ncommand = [\"true\"]\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "demo")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte("# demo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "vci-cli@example.com"},
+		{"config", "user.name", "vci-cli"},
+		{"config", "commit.gpgsign", "false"},
+		{"add", "-A"},
+		{"commit", "-q", "-m", "init"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = src
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	var out, errOut bytes.Buffer
+	code := Run([]string{"build", src}, &out, &errOut)
+	if code != 0 {
+		t.Logf("stderr: %s", errOut.String())
+		t.Fatalf("local build must succeed; stdout=%s", out.String())
+	}
+	var got Response
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v", err)
+	}
+	if !got.OK || got.Error != nil {
+		t.Fatalf("expected ok envelope, got: %+v", got)
+	}
+	var data struct {
+		RunID   string `json:"run_id"`
+		State   string `json:"state"`
+		Machine string `json:"machine"`
+	}
+	switch v := got.Data.(type) {
+	case []byte:
+		if err := json.Unmarshal(v, &data); err != nil {
+			t.Fatalf("data decode: %v", err)
+		}
+	case map[string]any:
+		if id, ok := v["run_id"].(string); ok {
+			data.RunID = id
+		}
+		if state, ok := v["state"].(string); ok {
+			data.State = state
+		}
+		if machine, ok := v["machine"].(string); ok {
+			data.Machine = machine
+		}
+	default:
+		t.Fatalf("data is %T, want []byte or map[string]any", v)
+	}
+	if !strings.HasPrefix(data.RunID, "run_") {
+		t.Fatalf("missing run_id: %+v", data)
+	}
+	if data.Machine != "alpha" {
+		t.Fatalf("machine must be 'alpha', got %q", data.Machine)
 	}
 }

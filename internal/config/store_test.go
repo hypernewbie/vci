@@ -7,14 +7,20 @@ import (
 	"testing"
 )
 
-func TestSaveRoundTripsAndProtectsFile(t *testing.T) {
+func TestMutateRoundTripsAndProtectsFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
+	if err := Initialize(path); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := Decode([]byte(valid))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Save(path, cfg); err != nil {
+	if err := Mutate(path, func(c *Config) error {
+		*c = cfg
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := Load(path)
@@ -35,9 +41,6 @@ func TestSaveRoundTripsAndProtectsFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("unexpected files: %#v", entries)
-	}
 	for _, entry := range entries {
 		if entry.Name() != "config.toml" && entry.Name() != "config.toml.lock" {
 			t.Fatalf("unexpected file: %s", entry.Name())
@@ -48,7 +51,7 @@ func TestSaveRoundTripsAndProtectsFile(t *testing.T) {
 func TestMutateSerializesCompatibleUpdates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
-	if err := Save(path, Defaults()); err != nil {
+	if err := Initialize(path); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -80,19 +83,17 @@ func TestMutateSerializesCompatibleUpdates(t *testing.T) {
 	}
 }
 
-func TestSavePreservesPreviousConfigOnValidationFailure(t *testing.T) {
+func TestMutatePreservesPreviousConfigOnValidationFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
-	cfg, err := Decode([]byte(valid))
-	if err != nil {
+	if err := Initialize(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := Save(path, cfg); err != nil {
-		t.Fatal(err)
-	}
-	cfg.SchemaVersion = 999
-	if err := Save(path, cfg); err == nil {
-		t.Fatal("invalid config saved")
+	if err := Mutate(path, func(c *Config) error {
+		c.SchemaVersion = 999
+		return nil
+	}); err == nil {
+		t.Fatal("invalid config mutated")
 	}
 	if _, err := Load(path); err != nil {
 		t.Fatalf("previous config lost: %v", err)

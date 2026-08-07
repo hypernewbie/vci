@@ -169,7 +169,7 @@ func TestMutateRejectsClientRootMachineAddition(t *testing.T) {
 	if err := l.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	if err := Save(l.ConfigPath(), Defaults()); err != nil {
+	if err := Initialize(l.ConfigPath()); err != nil {
 		t.Fatal(err)
 	}
 	if err := Mutate(l.ConfigPath(), func(c *Config) error {

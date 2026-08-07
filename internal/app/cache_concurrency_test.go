@@ -31,7 +31,9 @@ func TestConcurrentSameKeyClientsOverSSH(t *testing.T) {
 		t.Fatalf("ssh roundtrip: %v", err)
 	}
 
-	initCoordinatorRoot(t, fixture, "true")
+	// Coordinator with capacity 2 so the concurrent clients can both
+	// reserve a slot before the publication lock serializes them.
+	initCoordinatorRootWithCapacity(t, fixture, 2, "true")
 	clientRoot := initClientRoot(t, fixture, fixture.SSHAlias())
 
 	sourceParent := t.TempDir()

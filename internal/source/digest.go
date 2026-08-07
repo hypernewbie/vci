@@ -25,85 +25,13 @@ type CanonicalInput struct {
 	Bytes  []byte // empty for non-regular entries
 }
 
-// parentDirs returns the directory paths that must hold a file path,
-// from the shallowest to the deepest, excluding the root itself. These
-// entries make the file-list canonicalization equal to the tree-walk
-// canonicalization over a materialized snapshot.
-func parentDirs(rel string) []string {
-	var dirs []string
-	dir := filepath.Dir(rel)
-	for dir != "." && dir != "" && dir != string(filepath.Separator) {
-		dirs = append(dirs, dir)
-		dir = filepath.Dir(dir)
-	}
-	// Reverse so parents sort as ancestors (shallowest first).
-	for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
-		dirs[i], dirs[j] = dirs[j], dirs[i]
-	}
-	return dirs
-}
-
-// Canonicalize materializes the SourceInput as the immutable byte
-// sequence the digest is computed over. It reads each selected file
-// exactly once and returns a deterministic slice, sorted by relative
-// path, that contains only canonical fields. Parent directories of
-// selected files are included as directory entries without modes so the
-// result matches a tree-walk over a materialized snapshot of the same
-// input. Ignored files, deleted files, private .git/config, object-pack
-// history, and host mtimes are excluded from the identity.
-func Canonicalize(input SourceInput) ([]CanonicalInput, error) {
-	files := make([]string, 0, len(input.Files)*2)
-	for _, p := range input.Files {
-		files = append(files, parentDirs(p)...)
-		files = append(files, p)
-	}
-	sort.Strings(files)
-	canonical := make([]CanonicalInput, 0, len(files))
-	seen := make(map[string]bool)
-	for _, p := range files {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		fullPath := filepath.Join(input.Root, p)
-		fi, err := os.Lstat(fullPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, fmt.Errorf("digest stat %s: %w", p, err)
-		}
-		entry := CanonicalInput{Path: p}
-		switch {
-		case fi.Mode()&os.ModeSymlink != 0:
-			target, readErr := os.Readlink(fullPath)
-			if readErr != nil {
-				return nil, fmt.Errorf("digest readlink %s: %w", p, readErr)
-			}
-			entry.Kind = "symlink"
-			entry.Target = target
-		case fi.IsDir():
-			entry.Kind = "dir"
-		default:
-			entry.Kind = "file"
-			entry.Mode = fmt.Sprintf("%o", fi.Mode().Perm())
-			data, readErr := os.ReadFile(fullPath)
-			if readErr != nil {
-				return nil, fmt.Errorf("digest read %s: %w", p, readErr)
-			}
-			entry.Bytes = data
-		}
-		canonical = append(canonical, entry)
-	}
-	return canonical, nil
-}
-
 // CanonicalizeSnapshot walks a settled snapshot tree and returns the
 // canonical entries for every entry under root, sorted by relative
 // path. The set is exactly the materialized selected input: files,
 // symlinks, listed directories, and the parent directories that hold
-// them. Directory and symlink modes are excluded for the same reason as
-// in Canonicalize.
+// them. Directory and symlink modes are excluded so the result matches
+// a tar-extracted coordinator copy regardless of how tar created
+// intermediate directories and of how symlink modes are recorded.
 func CanonicalizeSnapshot(root string) ([]CanonicalInput, error) {
 	var entries []CanonicalInput
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -166,18 +94,6 @@ func CanonicalDigest(canonical []CanonicalInput) string {
 		h.Write([]byte{0})
 	}
 	return "sha256-" + hex.EncodeToString(h.Sum(nil))
-}
-
-// ComputeDigest calculates a deterministic SHA-256 hash over the defined
-// build input (files, modes, symlink targets, and file content bytes).
-// The canonical form matches the digest of a materialized snapshot of
-// the same input.
-func ComputeDigest(input SourceInput) (string, error) {
-	canonical, err := Canonicalize(input)
-	if err != nil {
-		return "", err
-	}
-	return CanonicalDigest(canonical), nil
 }
 
 // ComputeSnapshotDigest calculates the digest over a settled snapshot

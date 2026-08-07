@@ -26,18 +26,6 @@ func acquire(path string) (*os.File, error) {
 }
 func release(file *os.File) { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN); _ = file.Close() }
 
-func Save(path string, cfg Config) error {
-	if err := Validate(cfg); err != nil {
-		return err
-	}
-	file, err := acquire(path)
-	if err != nil {
-		return err
-	}
-	defer release(file)
-	return saveLocked(path, cfg)
-}
-
 func Initialize(path string) error {
 	file, err := acquire(path)
 	if err != nil {

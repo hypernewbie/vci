@@ -19,8 +19,10 @@ are not required.
 
 ```sh
 vci setup init                       # writes orchestrator = "self"
-vci setup machine add mac-local
+vci setup machine add mac-local                   # one local slot
+vci setup machine add fast --capacity 4           # four local slots
 vci setup project add Vci --machine mac-local --command go --arg test --arg ./...
+vci setup project add big --machine mac-local --machine fast --command go --arg test --arg ./...
 vci machines
 vci projects
 vci build .
@@ -28,6 +30,27 @@ vci check <run-id>
 vci abort <run-id>
 vci setup reap
 ```
+
+A coordinator machine is a named, coordinator-owned local capacity
+pool. Each machine has a local-slot capacity (`max_concurrent`); zero
+or omitted means one slot. A project may attach to one or more
+machines; submission reserves one available slot atomically and the
+detached worker runs locally on the selected machine. The reservation
+and the staging record are published inside a single scheduler
+transaction; a failed publish rolls back the exact claim and returns
+no run id. A successful local `build` JSON includes the selected
+`machine` so the operator does not need to read private coordinator
+state. The reaper honors a 60-second pre-start grace for staging
+runs that have a valid reservation but no worker lease yet; runs
+that hold a live worker lease are governed by lease/renewal rules
+alone. Capacity exhaustion is a stable `machine_unavailable` JSON
+error, retryable true. The scheduler is fail-closed: a corrupt,
+symlink, wrong-body, or future-dated claim surfaces as a hard error
+from `Status`, `Reap`, and `ReserveAndPublish`; only
+`ReserveAndPublish` may create a claim, and only with a publish
+callback that persists a real run record. There is no queue, no
+wait, no remote worker, no Docker, no VM — slots are local capacity
+on this coordinator host.
 
 ## First commands — client
 
@@ -47,6 +70,11 @@ and machine configuration belongs to the coordinator; the source
 repository does not supply a build-machine definition. A client never
 carries coordinator state and never inspects the coordinator's run
 files; the remote run identity is returned unchanged.
+
+The coordinator-local slot model is the smallest honest next step
+because Vci has no remote-worker control plane. Physical remote
+execution would require a separate direct source-to-selected-builder
+topology decision and is not part of this release.
 
 The current local result states are `queued`, `staging`, `running`,
 `committing`, `succeeded`, `failed`, `lost`, and `aborted`. A command
@@ -101,11 +129,27 @@ Direct-SSH client build inputs are finite local file selections: tracked files
 modes, symlinks, and minimal repository markers (`.git/HEAD`, `.git/objects`,
 `.git/refs`) are copied over direct tar-over-SSH, while ignored files
 (`.gitignore` entries), locally deleted tracked files, private `.git/config`,
-and `.git/objects` pack history are excluded. The client first materializes a
-private Vci-owned snapshot of the selection, computes the content digest from
-that settled snapshot, and archives exactly that snapshot — a source mutation
-between digest computation and archive production cannot change the bytes the
-coordinator verifies.
+and `.git/objects` pack history are excluded. Initialized submodule
+working-tree files are included recursively — every verified submodule
+contributes its own tracked, modified, untracked non-ignored, and
+executable-mode files under its validated prefix; an uninitialized or
+otherwise unverifiable gitlink fails locally before any archive, and Vci
+never executes `git submodule update`, fetches a URL, or contacts a host.
+Hydrated Git LFS working-tree bytes are ordinary selected data and are
+transferred, snapshotted, digested, cached, and built exactly like any
+other file; a formal LFS pointer (`filter=lfs` attribution with the
+pointer bytes still on disk) is rejected locally so the agent can run
+`git lfs pull` first. Vci never invokes `git lfs`, reads `.git/lfs`,
+extracts LFS URLs or tokens, or downloads an object. Child `.git`
+metadata at any depth is excluded from the manifest, snapshot, cache
+entry, and tar stream. `.gitmodules` is excluded at every depth: the
+submodule's gitlink reference is the only approved path-restoration
+signal, and a tracked `.gitmodules` cannot leak remote URLs or
+embedded credentials into the build. The client first materializes a
+private Vci-owned snapshot of the selection, computes the content
+digest from that settled snapshot, and archives exactly that snapshot
+— a source mutation between digest computation and archive production
+cannot change the bytes the coordinator verifies.
 
 Cache reuse is coordinator-local and content-addressed. Cache identity is
 `(format_version, digest, project)` everywhere: each project owns an

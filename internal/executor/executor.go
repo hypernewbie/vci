@@ -31,14 +31,7 @@ type Result struct {
 	FinishedAt         time.Time     `json:"finished_at"`
 	Duration           time.Duration `json:"duration_ns"`
 }
-type Executor interface {
-	Execute(context.Context, Request) (Result, error)
-}
 type Local struct{ Runner process.Runner }
-
-func (l Local) Execute(ctx context.Context, request Request) (Result, error) {
-	return l.execute(ctx, request, nil)
-}
 
 func (l Local) ExecuteSupervised(ctx context.Context, request Request, onStart func(process.Running) error) (Result, error) {
 	return l.execute(ctx, request, onStart)

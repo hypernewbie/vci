@@ -2,6 +2,160 @@
 
 ## Unreleased
 
+- Plan 11 Fix repairs the Plan 11 scheduler, source, and proof
+  surfaces after review found four residual correctness defects
+  that the original tests did not pin. The new scheduler is
+  fail-closed: a corrupt, symlink, wrong-body, or future-dated
+  claim surfaces as a hard error from `Status`, `Reap`, and
+  `ReserveAndPublish`; only `ReserveAndPublish` may create a claim,
+  and only with a publish callback that persists a real run record.
+  The `Reserve` wrapper is removed; the legacy no-callback shape
+  could leak orphan claims. The `withLock` helper takes the
+  in-process Go mutex first and then the on-disk flock; the order
+  is documented and uniform. Claim files are written via a unique
+  same-directory temporary file with `Sync` and parent-directory
+  `Sync`, then atomic rename to an absent target. `Release`
+  validates the exact claim body before removal; missing is
+  idempotent, corrupt/mismatched is an error. `ExecutePrepared`
+  requires `staging` state, validates the reservation, claims the
+  worker lease, and re-checks the state before any workspace,
+  manifest, or process work; a terminalized record skips all
+  materialization. Future-dated `now` arguments and stored
+  `created_at` values are rejected as corrupt state, so clock skew
+  cannot grant an unbounded grace.
+- Plan 11 Fix tightens source input validation. `ValidateInput`
+  is the canonical entry helper that canonicalizes, deduplicates,
+  sorts, and rejects `.gitmodules`, parent traversal, absolute
+  paths, trailing slashes, empty segments, and newline-bearing
+  filenames. `.gitmodules` and every `.git` component at any depth
+  are excluded from snapshots, manifests, cache entries, and tar
+  streams. The gitlink stage parser strictly parses mode/hash/
+  stage triples; malformed records, non-zero stages, duplicate
+  paths, and empty paths surface as wrapped
+  `ErrSubmoduleUnavailable`. The recursive builder's
+  `MaterializeSnapshot` always runs `ValidateInput` on its
+  argument, so a `SourceInput` cannot reach the snapshot without
+  passing the canonical contract.
+- Plan 11 Fix binds LFS validation to the bytes that actually
+  build. Local coordinator builds use `BuildWithValidation`, which
+  checks every LFS-attributed regular file against the formal
+  pointer format against the exact bytes that become a blob. A
+  typed `ErrLFSContentUnavailable` is reported before any
+  reservation is taken or any run record is created. The
+  recursed-direct-snapshot path retains its settled
+  post-materialization validation.
+- Plan 11 Fix replaces the false-baseline tests with deterministic
+  failures. `TestStatusDoesNotCountMalformedClaim` is gone; the
+  new `TestStatusFailsClosedOnCorruptClaim` and
+  `TestReserveAndPublishFailsClosedOnCorruptClaim` pin that
+  corrupt claim state never silently frees capacity. The
+  previously missed nested-gitlink symmetry test now uses a real
+  nested gitlink, and the LFS-validation tests cover the
+  hydrated-to-pointer race deterministically.
+- Plan 11 extends the finite source input to initialized submodule
+  working-tree files and hydrated Git LFS working-tree bytes.
+  Selected input is built from a recursive graph: every verified
+  repository (top-level plus every initialized submodule) contributes
+  its own tracked, modified tracked, untracked non-ignored, and
+  executable-mode files under its validated prefix. Every child
+  gitlink is verified by `git rev-parse --show-toplevel` against the
+  expected child directory before recursion; an uninitialized,
+  missing, symlinked, escaping, conflicted, or otherwise
+  unverifiable gitlink fails with typed `ErrSubmoduleUnavailable`,
+  class `configuration`, retryable false, naming the top-root-
+  relative path so the agent can run the ordinary user action
+  `git submodule update --init --recursive`. Vci never executes
+  that command, fetches a URL, reads `.git/config`, or contacts a
+  host. The submodule's working-tree content is transferred, not
+  its Git administration: every `.git` component at any depth
+  (directory or file) is excluded from the manifest, snapshot,
+  cache entry, and tar stream. There is no separate submodule
+  cache, commit-ID key, or remote lookup — recursive bytes enter
+  the settled snapshot digest naturally.
+- Plan 11 validates LFS hydration: for every selected regular file
+  with Git attribute `filter=lfs`, Vci reads the settled snapshot
+  bytes and rejects a formal pointer (version line, lowercase
+  sha256 OID, decimal size) with typed `ErrLFSContentUnavailable`,
+  class `configuration`, retryable false, naming the path so the
+  agent can run `git lfs pull`. Attribute semantics, not magic
+  content alone, decide rejection. Hydrated LFS working-tree bytes
+  are ordinary selected data and are transferred, snapshotted,
+  digested, cached, and built exactly like any other file. Vci
+  never invokes `git lfs`, reads `.git/lfs`, extracts LFS URLs or
+  tokens, or downloads an object. An installed LFS client is not
+  required when the working-tree bytes are already hydrated. The
+  LFS check applies to the top repository and every initialized
+  submodule for both local and direct-SSH paths.
+- Plan 10 Fix repairs the Plan 10 scheduler after review found four
+  crash-window, integrity, API-truth, and evidence defects. The
+  scheduler holds a single transaction API (`ReserveAndPublish`) that
+  publishes the staging record inside the reservation under one
+  in-process guard and one on-disk lock; a crashed caller cannot
+  leak an orphan claim and a record-publish failure rolls back the
+  exact claim. The new pre-start grace (60 s) protects a freshly
+  published staging run while its detached worker races to claim a
+  normal worker lease; an active lease always overrides claim age.
+  Legacy queued records with no lease terminalize as aborted through
+  the new `queued_aborted` report counter and never hold scheduler
+  capacity indefinitely. Claim validation rejects malformed JSON,
+  wrong schema versions, mismatched machines or run ids, symlinks,
+  non-regular files, and zero created_at values; corrupt state is
+  retained on disk for the operator and never silently counted as
+  free capacity. Claims are published with O_EXCL create+Sync+parent
+  Sync and an exact (machine, runID) write refuses to overwrite an
+  existing reservation. Successful local `build` JSON now carries
+  the selected `machine`, and a `scheduler.Status` failure propagates
+  to `vci machines` as a state error instead of fabricating
+  availability. The worker (`ExecutePrepared`) verifies its
+  reservation through the scheduler validator, not a raw `Stat`. A
+  claim with a missing record is reaped as orphan state. Capacity
+  exhaustion remains `machine_unavailable`, class `state`, retryable
+  true, and returns no run ID. The scheduler is still not a queue,
+  daemon, listener, remote executor, source receiver, retry loop, or
+  hosted-Git fallback. Direct client→coordinator transport is
+  unchanged.
+- Plan 10 introduces coordinator-local multi-machine scheduling. A
+  configured machine is a named, coordinator-owned local capacity
+  pool; each machine has an optional `max_concurrent` slot capacity
+  (omitted means one slot for compatibility). A project may attach
+  to multiple machines; submission reserves one available slot
+  atomically, stores the selected machine in the durable run record,
+  and starts the existing detached local worker on that machine.
+  Capacity exhaustion returns a stable `machine_unavailable` JSON
+  error, retryable true, with no run ID and no leaked claim. The
+  scheduler is **not** a queue, a daemon, or a remote executor — it
+  is coordinator-local capacity on this host. There is no Docker, VM,
+  remote worker, source relay, hosted Git fallback, retry queue, or
+  hosted control plane.
+- Plan 9 Fix repairs four concrete review findings after Plan 9: the
+  legacy `process.CancellationKilled` value is restored as a read-
+  compatible accepted phase in `Execution.Validate`; the unexported
+  `validDigest` alias in `sourcecache` is removed so every package
+  call site routes directly to `ValidDigest`; the public CLI
+  rejection table for malformed run IDs covers `run_/../../x` on
+  `check`/`abort`/`internal-run`; and `TestSnapshotDigestIndependentOfSelectedMtimes`
+  sets distinct mtimes on the materialized snapshot files
+  themselves, not only on the working-tree source file. Legacy
+  `run.json` (with removed `result` and `cancellation_phase` fields)
+  and legacy `lease.json` (with removed `attempt`) are tolerated via
+  plain `json.Unmarshal`.
+- Plan 9 subtracts dead code from the source-cache implementation and
+  consolidates duplicates. The removed surfaces had zero production
+  callers: `SaveResultState`, `Store.lockPath`, `Store.loadUnlocked`,
+  `Reaper.leaseExpired`, `executor.Executor`, `executor.Local.Execute`,
+  `lease.Expired`, `config.Save`, `app.RemoveProject`, `app.UpdateProject`,
+  `app.Build`, `model.ProjectName`, `model.MachineName`,
+  `VciError.Details`, `Lease.Attempt`, `RunRecord.Result`,
+  `RunRecord.CancellationPhase`, the list-form `source.ComputeDigest`
+  and `source.Canonicalize`, `NewTarExtract`, `StashPartialProject`,
+  `PurgePartial`, `sourcecache.validDigest`'s shadow duplicate,
+  `app.digestShape`, and `cli.validRunID`'s prefix-only rule. Safe
+  merges: the digest-shape rule is owned by `sourcecache.ValidDigest`;
+  run-id validation is owned by `model.ValidRunID`; the
+  staging/snapshot prefixes are exported as `source.StagingPrefix`,
+  `source.SnapshotPrefix`, and `source.StagingMetaName`. The remaining
+  tree is exactly the public minimal Vci contract and its bounded
+  direct source cache.
 - Plan 8 Fix Fix repairs the source cache implementation after review
   found `main` failed real SSH builds (`source is not a Git repository`)
   and the Plan 8 Fix cache was disconnected from production. The

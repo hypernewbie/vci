@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/scheduler"
+	"github.com/hypernewbie/vci/internal/source"
 )
 
 func resolveLayout() (layout.Layout, error) {
@@ -20,6 +23,15 @@ func resolveLayout() (layout.Layout, error) {
 func appFailure(command string, err error) Response {
 	message := fmt.Sprintf("%v", err)
 	code, class, retryable := "operation_failed", model.FailureConfiguration, false
+	if errors.Is(err, scheduler.ErrNoCapacity) {
+		return Failure(command, model.NewError("machine_unavailable", model.FailureState, message, true))
+	}
+	if errors.Is(err, source.ErrSubmoduleUnavailable) {
+		return Failure(command, model.NewError("submodule_unavailable", model.FailureConfiguration, message, false))
+	}
+	if errors.Is(err, source.ErrLFSContentUnavailable) {
+		return Failure(command, model.NewError("lfs_content_unavailable", model.FailureConfiguration, message, false))
+	}
 	lower := strings.ToLower(message)
 	switch {
 	case strings.Contains(lower, "cannot be aborted") || strings.Contains(lower, "is terminal"):

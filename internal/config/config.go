@@ -46,13 +46,28 @@ type Retention struct {
 
 // Machine is the coordinator-owned inventory entry. Transport endpoints are
 // not part of the machine definition; the orchestrator selector above is the
-// only place a remote target appears.
-type Machine struct{}
+// only place a remote target appears. MaxConcurrent is the optional
+// local-slot capacity for coordinator-owned parallel runs on this machine.
+// Zero is the compatibility default of one slot.
+type Machine struct {
+	MaxConcurrent int `toml:"max_concurrent" json:"max_concurrent,omitempty"`
+}
+
+// EffectiveCapacity returns the local-slot capacity of a machine. Zero
+// or omitted means one slot for compatibility with the original
+// single-machine configuration. Negative values are rejected by
+// coordinator validation.
+func EffectiveCapacity(m Machine) int {
+	if m.MaxConcurrent <= 0 {
+		return 1
+	}
+	return m.MaxConcurrent
+}
 
 type Project struct {
-	Machines    []string          `toml:"machines"`
-	Command     []string          `toml:"command"`
-	Environment map[string]string `toml:"environment"`
+	Machines    []string          `toml:"machines" json:"machines"`
+	Command     []string          `toml:"command" json:"command"`
+	Environment map[string]string `toml:"environment" json:"environment,omitempty"`
 }
 
 // DefaultLogLimits and DefaultRetention are the coordinator defaults used
@@ -151,9 +166,12 @@ func validateCoordinator(cfg Config) error {
 	if cfg.Retention.SourceCacheBytes > 0 && cfg.Retention.SourceCacheBytes < 4096 {
 		return fmt.Errorf("source cache quota is below minimum 4 KB")
 	}
-	for name := range cfg.Machines {
+	for name, machine := range cfg.Machines {
 		if !layout.ValidName(name) {
 			return fmt.Errorf("invalid machine name %q", name)
+		}
+		if machine.MaxConcurrent < 0 {
+			return fmt.Errorf("machine %q has negative max_concurrent", name)
 		}
 	}
 	for name, project := range cfg.Projects {

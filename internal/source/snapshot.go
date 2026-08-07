@@ -6,11 +6,42 @@ import (
 	"path/filepath"
 )
 
+// Shared prefix/filename constants used by the Go-side writers and
+// readers of Vci-owned staging trees and snapshot directories. Shell
+// scripts that reference the same paths embed the literal strings by
+// necessity; this is the single Go-side source of truth.
+const (
+	// SnapshotPrefix is the basename prefix of every Vci-owned
+	// settled-snapshot directory under the coordinator/client temp
+	// directory. The reaper sweeps only this prefix and never
+	// traverses arbitrary TMPDIR content.
+	SnapshotPrefix = "vci-snapshot-"
+	// StagingPrefix is the basename prefix of every Vci-owned direct
+	// SSH staging directory under the coordinator temp directory.
+	StagingPrefix = "vci-source-"
+	// StagingMetaName is the basename of the metadata file the
+	// staging fragment writes inside each staging directory so the
+	// coordinator can rebuild the validated cache key.
+	StagingMetaName = "vci-meta"
+)
+
 // MaterializeSnapshot copies the selected build input into a new
 // Vci-owned directory under destParent, preserving relative paths,
 // regular-file mode bits, and symlinks. Listed directories are created
 // as empty directories; private configuration such as .git/config is
 // not selected and therefore never copied.
+//
+// The input is validated against the canonical-entry contract before
+// any file is written: every entry must be a safe relative path. The
+// caller need not pre-validate; MaterializeSnapshot is the sole
+// producer of the snapshot tree and enforces the contract locally.
+//
+// After the snapshot is populated, LFS-attributed regular files are
+// checked against the formal pointer format. A pointer is rejected
+// with ErrLFSContentUnavailable naming the top-relative path so the
+// agent can run `git lfs pull`. Attribute semantics, not magic
+// content alone, decide rejection: a non-LFS file with pointer-
+// looking bytes is ordinary source data.
 //
 // The returned root contains exactly the selected input, so a digest
 // computed over it matches a digest recomputed over the coordinator's
@@ -21,7 +52,11 @@ import (
 // destParent must exist and be Vci-owned. The caller owns removal of
 // the returned root on success, error, and cancellation.
 func MaterializeSnapshot(input SourceInput, destParent string) (string, error) {
-	root, err := os.MkdirTemp(destParent, "vci-snapshot-")
+	validated, err := ValidateInput(input)
+	if err != nil {
+		return "", err
+	}
+	root, err := os.MkdirTemp(destParent, SnapshotPrefix)
 	if err != nil {
 		return "", fmt.Errorf("snapshot mkdir: %w", err)
 	}
@@ -32,8 +67,14 @@ func MaterializeSnapshot(input SourceInput, destParent string) (string, error) {
 		cleanup()
 		return "", fmt.Errorf("snapshot protect: %w", err)
 	}
-	for _, p := range input.Files {
-		src := filepath.Join(input.Root, p)
+	for _, p := range validated.Files {
+		if isExcludedComponent(p) {
+			// Defensive: validated input should never carry an
+			// excluded component, but the consumer-trust contract
+			// is preserved either way.
+			continue
+		}
+		src := filepath.Join(validated.Root, p)
 		fi, err := os.Lstat(src)
 		if err != nil {
 			cleanup()
@@ -78,6 +119,10 @@ func MaterializeSnapshot(input SourceInput, destParent string) (string, error) {
 			cleanup()
 			return "", fmt.Errorf("snapshot: unsupported source entry %s", p)
 		}
+	}
+	if err := ValidateLFSPointers(root, validated.LFSFiles); err != nil {
+		cleanup()
+		return "", err
 	}
 	return root, nil
 }

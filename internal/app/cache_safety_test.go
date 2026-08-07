@@ -125,7 +125,9 @@ func TestCacheHitRequiresCompleteMarker(t *testing.T) {
 
 // TestSourceDigestDiffersAcrossFileModification proves that mutating
 // any selected file after the digest has been computed changes the
-// digest. The cache key cannot be reused for changed bytes.
+// digest. The cache key cannot be reused for changed bytes. The
+// digest is computed over a materialized snapshot, which is the
+// production path the coordinator re-verifies on receive.
 func TestSourceDigestDiffersAcrossFileModification(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skipf("git not available: %v", err)
@@ -151,7 +153,11 @@ func TestSourceDigestDiffersAcrossFileModification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select before: %v", err)
 	}
-	d1, err := source.ComputeDigest(inputBefore)
+	snapBefore, err := source.MaterializeSnapshot(inputBefore, t.TempDir())
+	if err != nil {
+		t.Fatalf("materialize before: %v", err)
+	}
+	d1, err := source.ComputeSnapshotDigest(snapBefore)
 	if err != nil {
 		t.Fatalf("digest before: %v", err)
 	}
@@ -159,9 +165,6 @@ func TestSourceDigestDiffersAcrossFileModification(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("changed\n"), 0o600); err != nil {
 		t.Fatalf("write change: %v", err)
 	}
-	// Refresh the cached git status so the post-mutation select
-	// still works; for untracked/non-git read we use the source-dir
-	// scan directly.
 	if out, err := exec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); err != nil {
 		t.Fatalf("git status: %v: %s", err, out)
 	} else if len(out) > 0 {
@@ -173,7 +176,11 @@ func TestSourceDigestDiffersAcrossFileModification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select after: %v", err)
 	}
-	d2, err := source.ComputeDigest(inputAfter)
+	snapAfter, err := source.MaterializeSnapshot(inputAfter, t.TempDir())
+	if err != nil {
+		t.Fatalf("materialize after: %v", err)
+	}
+	d2, err := source.ComputeSnapshotDigest(snapAfter)
 	if err != nil {
 		t.Fatalf("digest after: %v", err)
 	}

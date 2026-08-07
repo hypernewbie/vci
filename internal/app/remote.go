@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 
 	"github.com/hypernewbie/vci/internal/config"
@@ -19,11 +18,6 @@ import (
 	"github.com/hypernewbie/vci/internal/source"
 	"github.com/hypernewbie/vci/internal/sourcecache"
 )
-
-// digestShape is the accepted form of a content-addressed source-cache
-// key. Anything else is treated as missing and never used to build a
-// remote shell fragment.
-var digestShape = regexp.MustCompile(`^sha256-[0-9a-f]{64}$`)
 
 // safeCacheKey is the validated, structured set of fields that may
 // compose a remote cache shell fragment. Building remote text from a
@@ -39,12 +33,13 @@ type safeCacheKey struct {
 // validateCacheKey returns a safeCacheKey ready for remote-shell
 // composition or an error explaining which field failed. An empty or
 // invalid digest is rejected so callers do not invent a fallback
-// identifier.
+// identifier. The shape check is delegated to sourcecache.ValidDigest
+// so the app and the cache cannot drift.
 func validateCacheKey(digest, project string) (safeCacheKey, error) {
 	if !layout.ValidName(project) {
 		return safeCacheKey{}, fmt.Errorf("repository name %q cannot name a remote project", project)
 	}
-	if !digestShape.MatchString(digest) {
+	if !sourcecache.ValidDigest(digest) {
 		return safeCacheKey{}, fmt.Errorf("source digest %q is not sha256-<64-lowercase-hex>", digest)
 	}
 	if _, err := hex.DecodeString(strings.TrimPrefix(digest, "sha256-")); err != nil {
@@ -148,7 +143,7 @@ func RemoteBuild(ctx context.Context, l layout.Layout, sourcePath string) ([]byt
 // produced by sourcecache.EntryRootRel/EntryTreeRel, so the probe
 // path can never diverge from the Go-side publication layout.
 func buildCacheProbeScript(key safeCacheKey) string {
-	if !layout.ValidName(key.Project) || !digestShape.MatchString(key.Digest) {
+	if !layout.ValidName(key.Project) || !sourcecache.ValidDigest(key.Digest) {
 		// Caller error: validateCacheKey rejects this upstream.
 		return "exit 1"
 	}
@@ -249,7 +244,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // script. Nested source filenames remain tar data; they never reach
 // the remote shell.
 func stagingShellScript(key safeCacheKey) string {
-	if !layout.ValidName(key.Project) || !digestShape.MatchString(key.Digest) {
+	if !layout.ValidName(key.Project) || !sourcecache.ValidDigest(key.Digest) {
 		// Caller error: this fragment can never be reached with an
 		// unsafe key because validateCacheKey rejects it upstream.
 		return "exit 1"

@@ -10,78 +10,62 @@ import (
 	"github.com/hypernewbie/vci/internal/process"
 )
 
-func TestComputeDigestDeterminism(t *testing.T) {
+var fixedTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func snapshotForRepo(t *testing.T, repoDir string) string {
+	t.Helper()
+	input, err := SelectBuildInput(context.Background(), repoDir, process.Native{})
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	snapshot, err := MaterializeSnapshot(input, t.TempDir())
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	return snapshot
+}
+
+// TestSnapshotDigestDeterminism asserts the snapshot digest is
+// stable for an unchanged input and changes when any selected file
+// changes. The cache key cannot be reused for changed bytes.
+func TestSnapshotDigestDeterminism(t *testing.T) {
 	dir := t.TempDir()
 	sourceDir := filepath.Join(dir, "repo")
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-
 	runGit(t, sourceDir, "init")
 	mustWrite(t, filepath.Join(sourceDir, "main.go"), "package main\n")
 	mustWrite(t, filepath.Join(sourceDir, "README.md"), "# repo\n")
 	runGit(t, sourceDir, "add", ".")
 	runGit(t, sourceDir, "commit", "-m", "init")
 
-	input1, err := SelectBuildInput(context.Background(), sourceDir, process.Native{})
+	d1, err := ComputeSnapshotDigest(snapshotForRepo(t, sourceDir))
 	if err != nil {
-		t.Fatalf("SelectBuildInput 1: %v", err)
+		t.Fatalf("digest 1: %v", err)
 	}
-	d1, err := ComputeDigest(input1)
+	d2, err := ComputeSnapshotDigest(snapshotForRepo(t, sourceDir))
 	if err != nil {
-		t.Fatalf("ComputeDigest 1: %v", err)
+		t.Fatalf("digest 2: %v", err)
 	}
-
-	input2, err := SelectBuildInput(context.Background(), sourceDir, process.Native{})
-	if err != nil {
-		t.Fatalf("SelectBuildInput 2: %v", err)
-	}
-	d2, err := ComputeDigest(input2)
-	if err != nil {
-		t.Fatalf("ComputeDigest 2: %v", err)
-	}
-
 	if d1 != d2 {
 		t.Fatalf("expected identical digest for unchanged repo; got %s vs %s", d1, d2)
 	}
 
-	// Modify a file -> digest must change
 	mustWrite(t, filepath.Join(sourceDir, "main.go"), "package main // modified\n")
-	input3, err := SelectBuildInput(context.Background(), sourceDir, process.Native{})
+	d3, err := ComputeSnapshotDigest(snapshotForRepo(t, sourceDir))
 	if err != nil {
-		t.Fatalf("SelectBuildInput 3: %v", err)
+		t.Fatalf("digest 3: %v", err)
 	}
-	d3, err := ComputeDigest(input3)
-	if err != nil {
-		t.Fatalf("ComputeDigest 3: %v", err)
-	}
-
 	if d1 == d3 {
 		t.Fatalf("digest must change when file content is modified")
 	}
-
-	// Ignored file addition -> digest must stay identical to d3
-	mustWrite(t, filepath.Join(sourceDir, ".gitignore"), "*.log\n")
-	mustWrite(t, filepath.Join(sourceDir, "test.log"), "log content")
-	input4, err := SelectBuildInput(context.Background(), sourceDir, process.Native{})
-	if err != nil {
-		t.Fatalf("SelectBuildInput 4: %v", err)
-	}
-	d4, err := ComputeDigest(input4)
-	if err != nil {
-		t.Fatalf("ComputeDigest 4: %v", err)
-	}
-
-	// Note: .gitignore is a tracked file so d4 includes .gitignore, but test.log is ignored
-	if d3 == d4 {
-		// Adding .gitignore changed tracked files, so d4 != d3. But test.log is excluded.
-	}
 }
 
-// TestCanonicalDigestShape asserts the exact wire shape of the
+// TestSnapshotDigestShape asserts the exact wire shape of the
 // returned digest string so downstream code that parses it can rely
 // on a single accepted form.
-func TestCanonicalDigestShape(t *testing.T) {
+func TestSnapshotDigestShape(t *testing.T) {
 	dir := t.TempDir()
 	sourceDir := filepath.Join(dir, "repo")
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
@@ -92,11 +76,7 @@ func TestCanonicalDigestShape(t *testing.T) {
 	runGit(t, sourceDir, "add", ".")
 	runGit(t, sourceDir, "commit", "-m", "init")
 
-	input, err := SelectBuildInput(context.Background(), sourceDir, process.Native{})
-	if err != nil {
-		t.Fatalf("select: %v", err)
-	}
-	digest, err := ComputeDigest(input)
+	digest, err := ComputeSnapshotDigest(snapshotForRepo(t, sourceDir))
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
@@ -105,36 +85,96 @@ func TestCanonicalDigestShape(t *testing.T) {
 	}
 }
 
-// TestCanonicalizeExcludesMtimes asserts the canonical sequence does
-// not depend on file mtimes. Two snapshots with identical content
-// must produce the same digest regardless of when each file was
-// touched.
-func TestCanonicalizeExcludesMtimes(t *testing.T) {
+// TestSnapshotDigestExcludesMtimes asserts the digest does not
+// depend on file mtimes. Two snapshots of identical content produced
+// at different times must produce the same digest.
+func TestSnapshotDigestExcludesMtimes(t *testing.T) {
 	dir := t.TempDir()
-	a := filepath.Join(dir, "a")
-	b := filepath.Join(dir, "b")
-	for _, d := range []string{a, b} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		runGit(t, d, "init")
-		mustWrite(t, filepath.Join(d, "main.go"), "package main\n")
-		runGit(t, d, "add", ".")
-		runGit(t, d, "commit", "-m", "init")
+	sourceDir := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.Chtimes(filepath.Join(a, "main.go"), fixedTime, fixedTime); err != nil {
+	runGit(t, sourceDir, "init")
+	mustWrite(t, filepath.Join(sourceDir, "main.go"), "package main\n")
+	runGit(t, sourceDir, "add", ".")
+	runGit(t, sourceDir, "commit", "-m", "init")
+	if err := os.Chtimes(filepath.Join(sourceDir, "main.go"), fixedTime, fixedTime); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
-	inA, _ := SelectBuildInput(context.Background(), a, process.Native{})
-	inB, _ := SelectBuildInput(context.Background(), b, process.Native{})
-	dA, _ := ComputeDigest(inA)
-	dB, _ := ComputeDigest(inB)
+	snapA := snapshotForRepo(t, sourceDir)
+	dA, err := ComputeSnapshotDigest(snapA)
+	if err != nil {
+		t.Fatalf("digest a: %v", err)
+	}
+
+	// Rebuild the same content under a different mtime and confirm
+	// the digest is stable. The two snapshots have identical bytes.
+	sourceDir2 := filepath.Join(dir, "repo2")
+	if err := os.MkdirAll(sourceDir2, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	runGit(t, sourceDir2, "init")
+	mustWrite(t, filepath.Join(sourceDir2, "main.go"), "package main\n")
+	runGit(t, sourceDir2, "add", ".")
+	runGit(t, sourceDir2, "commit", "-m", "init")
+	snapB := snapshotForRepo(t, sourceDir2)
+	dB, err := ComputeSnapshotDigest(snapB)
+	if err != nil {
+		t.Fatalf("digest b: %v", err)
+	}
 	if dA != dB {
 		t.Fatalf("digest must not depend on mtime; got %s vs %s", dA, dB)
 	}
 }
 
-var fixedTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+// TestSnapshotDigestIndependentOfSelectedMtimes proves the snapshot
+// digest excludes mtimes on files inside the materialized snapshot
+// itself, not only on the working tree before materialization. The
+// previous test only set mtime on the working-tree file; this test
+// sets distinct, non-default mtimes on the selected files of two
+// otherwise-identical snapshots immediately before digesting and
+// requires equal digests.
+func TestSnapshotDigestIndependentOfSelectedMtimes(t *testing.T) {
+	dir := t.TempDir()
+	sourceDir := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	runGit(t, sourceDir, "init")
+	mustWrite(t, filepath.Join(sourceDir, "main.go"), "package main\n")
+	mustWrite(t, filepath.Join(sourceDir, "lib.go"), "package main\n")
+	runGit(t, sourceDir, "add", ".")
+	runGit(t, sourceDir, "commit", "-m", "init")
+
+	snapA := snapshotForRepo(t, sourceDir)
+	tA := time.Date(2021, 6, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(snapA, "main.go"), tA, tA); err != nil {
+		t.Fatalf("chtimes snapA: %v", err)
+	}
+	if err := os.Chtimes(filepath.Join(snapA, "lib.go"), tA, tA); err != nil {
+		t.Fatalf("chtimes snapA lib: %v", err)
+	}
+	dA, err := ComputeSnapshotDigest(snapA)
+	if err != nil {
+		t.Fatalf("digest a: %v", err)
+	}
+
+	snapB := snapshotForRepo(t, sourceDir)
+	tB := time.Date(2024, 11, 30, 23, 59, 0, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(snapB, "main.go"), tB, tB); err != nil {
+		t.Fatalf("chtimes snapB: %v", err)
+	}
+	if err := os.Chtimes(filepath.Join(snapB, "lib.go"), tB, tB); err != nil {
+		t.Fatalf("chtimes snapB lib: %v", err)
+	}
+	dB, err := ComputeSnapshotDigest(snapB)
+	if err != nil {
+		t.Fatalf("digest b: %v", err)
+	}
+	if dA != dB {
+		t.Fatalf("digest must not depend on snapshot file mtimes; got %s vs %s", dA, dB)
+	}
+}
 
 // TestVerifySnapshotMatchesExpectedDigest proves the post-archive
 // verifier rejects a snapshot whose bytes differ from the digest

@@ -93,11 +93,14 @@ func dispatch(command string, args []string) (Response, int) {
 			return appFailure(command, err), 2
 		}
 		if err := spawnRun(prepared.Record.ID); err != nil {
+			// Spawn failed: terminalize the prepared run and release
+			// its scheduler reservation so the slot is freed.
+			_ = app.Abandon(l, prepared.Record.ID)
 			return appFailure(command, err), 2
 		}
-		return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State}), 0
+		return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
 	case "check":
-		if len(args) != 1 || !validRunID(args[0]) {
+		if len(args) != 1 || !model.ValidRunID(model.RunID(args[0])) {
 			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: check <run-id>.", false)), 2
 		}
 		l, err := resolveLayout()
@@ -121,7 +124,7 @@ func dispatch(command string, args []string) (Response, int) {
 		}
 		return Success(command, result), 0
 	case "abort":
-		if len(args) != 1 || !validRunID(args[0]) {
+		if len(args) != 1 || !model.ValidRunID(model.RunID(args[0])) {
 			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: abort <run-id>.", false)), 2
 		}
 		l, err := resolveLayout()
@@ -145,7 +148,7 @@ func dispatch(command string, args []string) (Response, int) {
 		}
 		return Success(command, result), 0
 	case "internal-run":
-		if len(args) != 1 || !validRunID(args[0]) {
+		if len(args) != 1 || !model.ValidRunID(model.RunID(args[0])) {
 			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: internal-run <run-id>.", false)), 2
 		}
 		l, err := resolveLayout()

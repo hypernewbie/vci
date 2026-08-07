@@ -18,35 +18,56 @@ import (
 )
 
 type RunRecord struct {
-	SchemaVersion           int              `json:"schema_version"`
-	ID                      model.RunID      `json:"run_id"`
-	Project                 string           `json:"project"`
-	Machine                 string           `json:"machine"`
-	State                   model.RunState   `json:"state"`
-	SourceDigest            string           `json:"source_digest,omitempty"`
-	ConfigDigest            string           `json:"config_digest,omitempty"`
-	ConfigSnapshot          json.RawMessage  `json:"config_snapshot,omitempty"`
-	Command                 []string         `json:"command"`
-	QueuedAt                time.Time        `json:"queued_at"`
-	UpdatedAt               time.Time        `json:"updated_at"`
-	Result                  *json.RawMessage `json:"result,omitempty"`
-	CancellationRequestedAt *time.Time       `json:"cancellation_requested_at,omitempty"`
-	CancellationPhase       string           `json:"cancellation_phase,omitempty"`
+	SchemaVersion           int             `json:"schema_version"`
+	ID                      model.RunID     `json:"run_id"`
+	Project                 string          `json:"project"`
+	Machine                 string          `json:"machine"`
+	State                   model.RunState  `json:"state"`
+	SourceDigest            string          `json:"source_digest,omitempty"`
+	ConfigDigest            string          `json:"config_digest,omitempty"`
+	ConfigSnapshot          json.RawMessage `json:"config_snapshot,omitempty"`
+	Command                 []string        `json:"command"`
+	QueuedAt                time.Time       `json:"queued_at"`
+	UpdatedAt               time.Time       `json:"updated_at"`
+	CancellationRequestedAt *time.Time      `json:"cancellation_requested_at,omitempty"`
 }
 
 type Store struct{ Layout layout.Layout }
 
 func NewRun(project, machine string, command []string, sourceDigest string, snapshot any, now time.Time) (RunRecord, error) {
+	id, err := newID(now)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	return NewRunFromID(model.RunID(id), project, machine, command, sourceDigest, snapshot, now)
+}
+
+// NewRunFromID builds a RunRecord under a caller-supplied run id.
+// The initial state is `queued`; production build paths must
+// transition to `staging` inside the same scheduler transaction so a
+// reservation never exists without a record.
+func NewRunFromID(id model.RunID, project, machine string, command []string, sourceDigest string, snapshot any, now time.Time) (RunRecord, error) {
+	return newRun(id, project, machine, command, sourceDigest, snapshot, model.RunQueued, now)
+}
+
+// NewStagedRunFromID builds a RunRecord already in `staging` state
+// under a caller-supplied run id. It is the production build path's
+// constructor: the scheduler transaction publishes this record, so a
+// reservation never exists without a durable staging record.
+func NewStagedRunFromID(id model.RunID, project, machine string, command []string, sourceDigest string, snapshot any, now time.Time) (RunRecord, error) {
+	return newRun(id, project, machine, command, sourceDigest, snapshot, model.RunStaging, now)
+}
+
+func newRun(id model.RunID, project, machine string, command []string, sourceDigest string, snapshot any, state model.RunState, now time.Time) (RunRecord, error) {
+	if !model.ValidRunID(id) {
+		return RunRecord{}, fmt.Errorf("invalid run id %q", id)
+	}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return RunRecord{}, err
 	}
 	sum := sha256.Sum256(data)
-	id, err := newID(now)
-	if err != nil {
-		return RunRecord{}, err
-	}
-	return RunRecord{SchemaVersion: model.SchemaVersion, ID: model.RunID(id), Project: project, Machine: machine, State: model.RunQueued, SourceDigest: sourceDigest, ConfigDigest: hex.EncodeToString(sum[:]), ConfigSnapshot: data, Command: append([]string(nil), command...), QueuedAt: now.UTC(), UpdatedAt: now.UTC()}, nil
+	return RunRecord{SchemaVersion: model.SchemaVersion, ID: id, Project: project, Machine: machine, State: state, SourceDigest: sourceDigest, ConfigDigest: hex.EncodeToString(sum[:]), ConfigSnapshot: data, Command: append([]string(nil), command...), QueuedAt: now.UTC(), UpdatedAt: now.UTC()}, nil
 }
 
 func newID(now time.Time) (string, error) {
@@ -58,13 +79,6 @@ func newID(now time.Time) (string, error) {
 }
 
 func (s Store) runDir(id model.RunID) (string, error) { return s.Layout.RunDir(string(id)) }
-func (s Store) lockPath(id model.RunID) (string, error) {
-	dir, err := s.runDir(id)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "run.lock"), nil
-}
 
 func (s Store) Save(record RunRecord) error {
 	if err := validateRecord(record); err != nil {
@@ -120,8 +134,6 @@ func (s Store) Load(id model.RunID) (RunRecord, error) {
 	}
 	return s.loadPath(filepath.Join(dir, "run.json"), id)
 }
-
-func (s Store) loadUnlocked(id model.RunID) (RunRecord, error) { return s.Load(id) }
 
 func (s Store) loadPath(path string, id model.RunID) (RunRecord, error) {
 	data, err := os.ReadFile(path)
@@ -195,7 +207,6 @@ func (s Store) RequestCancellation(id model.RunID, now time.Time) (RunRecord, er
 		if record.CancellationRequestedAt == nil {
 			t := now.UTC()
 			record.CancellationRequestedAt = &t
-			record.CancellationPhase = "requested"
 			record.UpdatedAt = t
 			dir, err := s.runDir(id)
 			if err != nil {
@@ -210,33 +221,6 @@ func (s Store) RequestCancellation(id model.RunID, now time.Time) (RunRecord, er
 				}
 			}
 		}
-		return nil
-	})
-}
-
-func (s Store) SaveResultState(id model.RunID, result any, terminal model.RunState, now time.Time) (RunRecord, error) {
-	var raw json.RawMessage
-	data, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return RunRecord{}, err
-	}
-	raw = append(raw, data...)
-	return s.Mutate(id, func(record *RunRecord) error {
-		if !model.CanTransition(record.State, model.RunCommitting) && record.State != model.RunCommitting {
-			return fmt.Errorf("run %s is not publishable from state %s", id, record.State)
-		}
-		if record.State != model.RunCommitting {
-			record.State = model.RunCommitting
-			record.UpdatedAt = now.UTC()
-		}
-		if record.Result != nil {
-			return fmt.Errorf("run %s already has a result", id)
-		}
-		record.Result = &raw
-		if err := model.Transition(record.State, terminal); err != nil {
-			return err
-		}
-		record.State, record.UpdatedAt = terminal, now.UTC()
 		return nil
 	})
 }

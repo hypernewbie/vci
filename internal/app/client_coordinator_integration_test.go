@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,9 +32,10 @@ type phase1Envelope struct {
 	OK            bool            `json:"ok"`
 	Data          json.RawMessage `json:"data"`
 	Error         *struct {
-		Code    string `json:"code"`
-		Class   string `json:"class"`
-		Message string `json:"message"`
+		Code      string `json:"code"`
+		Class     string `json:"class"`
+		Message   string `json:"message"`
+		Retryable bool   `json:"retryable"`
 	} `json:"error"`
 }
 
@@ -66,9 +68,22 @@ func runClientBinary(t *testing.T, fixture *SSHFixture, clientRoot string, args 
 
 func initCoordinatorRoot(t *testing.T, fixture *SSHFixture, command string, extraArgs ...string) {
 	t.Helper()
+	initCoordinatorRootWithCapacity(t, fixture, 0, command, extraArgs...)
+}
+
+// initCoordinatorRootWithCapacity writes a coordinator config that
+// declares mac-local with the requested local-slot capacity. A
+// non-positive value omits max_concurrent (the documented default of
+// one slot applies).
+func initCoordinatorRootWithCapacity(t *testing.T, fixture *SSHFixture, capacity int, command string, extraArgs ...string) {
+	t.Helper()
 	cfg := filepath.Join(fixture.coordinatorRoot, "config.toml")
 	allArgs := append([]string{command}, extraArgs...)
-	body := "schema_version = 1\norchestrator = \"self\"\n\n[log_limits]\nstdout_bytes = 4194304\nstderr_bytes = 4194304\n\n[retention]\nmax_bytes = 536870912\n\n[machines.mac-local]\n\n[projects.demo]\nmachines = [\"mac-local\"]\ncommand = [" + tomlSlice(allArgs) + "]\n"
+	capLine := ""
+	if capacity > 0 {
+		capLine = "max_concurrent = " + strconv.Itoa(capacity) + "\n"
+	}
+	body := "schema_version = 1\norchestrator = \"self\"\n\n[log_limits]\nstdout_bytes = 4194304\nstderr_bytes = 4194304\n\n[retention]\nmax_bytes = 536870912\n\n[machines.mac-local]\n" + capLine + "\n[projects.demo]\nmachines = [\"mac-local\"]\ncommand = [" + tomlSlice(allArgs) + "]\n"
 	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
 		t.Fatalf("phase1: write coordinator config: %v", err)
 	}

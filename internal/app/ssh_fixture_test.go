@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -72,6 +73,31 @@ func NewSSHFixture(t *testing.T) *SSHFixture {
 	fixture.buildBinary()
 	fixture.startSSHD()
 	t.Cleanup(fixture.shutdown)
+	// Safety net: if the test process dies before t.Cleanup runs
+	// (signal, panic, OOM, or ProcessGroup-only kill), the sshd
+	// listener and its unprivileged worker children can leak. The
+	// per-uid process limit on macOS is low enough that hundreds of
+	// leaked listeners make the development machine unable to fork
+	// new processes. Schedule a deferred go-routine that watches
+	// the parent test pid and kills the sshd process group if the
+	// test has not reached cleanup.
+	watcherStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watcherStop:
+				return
+			case <-ticker.C:
+				if !testProcessAlive(fixture.t) {
+					fixture.shutdown()
+					return
+				}
+			}
+		}
+	}()
+	t.Cleanup(func() { close(watcherStop) })
 	prependTestPath(t, fixture.binDir)
 	return fixture
 }
@@ -195,6 +221,24 @@ func (f *SSHFixture) binaries() {
 			f.t.Fatalf("fixture: required tool %s missing after skip: %v", name, err)
 		}
 	}
+}
+
+// testProcessAlive reports whether the parent test process is still
+// running. The safety-net goroutine uses this to detect a test that
+// died without running t.Cleanup and triggers shutdown so sshd
+// listeners are not leaked.
+func testProcessAlive(t *testing.T) bool {
+	t.Helper()
+	pid := os.Getpid()
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// Signal 0 is the standard "is this pid alive?" probe.
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return false
+	}
+	return true
 }
 
 // pickLoopbackPort opens a listener on an unused loopback port, drops
@@ -431,6 +475,12 @@ Subsystem sftp /usr/libexec/sftp-server
 	}
 	cmd := exec.CommandContext(ctx, sshdPath, "-f", cfg, "-E", filepath.Join(sshDir, "sshd.log"))
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	// Run sshd in its own process group so shutdown can kill any
+	// forked worker processes too. Without this, an abrupt test
+	// termination leaks every sshd listener as an orphan, and
+	// subsequent tests cannot fork because the per-uid process
+	// limit (kern.maxprocperuid) is exhausted.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		f.t.Fatalf("fixture: sshd start: %v\n%s", err, out)
 	}
@@ -460,7 +510,16 @@ func (f *SSHFixture) shutdown() {
 		f.sshdCancel()
 	}
 	if f.sshd != nil && f.sshd.Process != nil {
-		_ = f.sshd.Process.Signal(os.Interrupt)
+		// Kill the entire process group: sshd forks a privileged
+		// listener plus unprivileged child workers for each
+		// connection, and the children are not in the parent's
+		// process group unless sshd was started with Setpgid. Kill
+		// the group by sending SIGTERM to -pgid. A second SIGKILL
+		// is the safety net for any workers that ignore SIGTERM.
+		pgid, err := syscall.Getpgid(f.sshd.Process.Pid)
+		if err == nil {
+			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		}
 		done := make(chan struct{})
 		go func() {
 			_ = f.sshd.Wait()
@@ -469,7 +528,11 @@ func (f *SSHFixture) shutdown() {
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
-			_ = f.sshd.Process.Kill()
+			if err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				_ = f.sshd.Process.Kill()
+			}
 			<-done
 		}
 	}

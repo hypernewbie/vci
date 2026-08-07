@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -35,13 +36,34 @@ func TestMachineAndProjectLifecycle(t *testing.T) {
 	if err := RemoveMachine(l, "mac-local"); err == nil {
 		t.Fatal("removed attached machine")
 	}
-	if err := UpdateProject(l, "Vci", config.Project{Machines: []string{"mac-local"}, Command: []string{"go", "test"}}); err != nil {
+}
+
+// TestInventoryPropagatesSchedulerStatusError pins that a scheduler
+// inspection failure (for example a non-directory at the scheduler
+// lock parent) is propagated to ReadInventory. Today the inventory
+// silently suppresses the error and fabricates `available == capacity`,
+// which falsely reports free slots to the operator.
+func TestInventoryPropagatesSchedulerStatusError(t *testing.T) {
+	l := testLayout(t)
+	if err := AddMachine(l, "alpha", config.Machine{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := RemoveProject(l, "Vci"); err != nil {
+	if err := AddProject(l, "demo", config.Project{Machines: []string{"alpha"}, Command: []string{"true"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := RemoveMachine(l, "mac-local"); err != nil {
+	// Replace the scheduler lock parent with a regular file so the
+	// scheduler lock acquisition fails. ReadInventory must surface the
+	// failure rather than fabricate availability.
+	if err := os.RemoveAll(l.LocksDir()); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(l.LocksDir()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(l.LocksDir(), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadInventory(l); err == nil {
+		t.Fatal("ReadInventory must propagate scheduler inspection failure")
 	}
 }

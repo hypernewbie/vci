@@ -21,6 +21,7 @@ import (
 	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/process"
 	"github.com/hypernewbie/vci/internal/reaper"
+	"github.com/hypernewbie/vci/internal/scheduler"
 	"github.com/hypernewbie/vci/internal/source"
 	"github.com/hypernewbie/vci/internal/sourcecache"
 	"github.com/hypernewbie/vci/internal/store"
@@ -163,7 +164,7 @@ func cacheEntryDigestAt(l layout.Layout, repoRoot, projectName string) (string, 
 	if len(parts) != 4 || parts[0] != sourcecache.FormatVersion {
 		return "", false
 	}
-	if parts[2] != projectName || parts[3] != projectName || !digestShape.MatchString(parts[1]) {
+	if parts[2] != projectName || parts[3] != projectName || !sourcecache.ValidDigest(parts[1]) {
 		return "", false
 	}
 	return parts[1], true
@@ -185,10 +186,10 @@ func stagingMetaPathAt(l layout.Layout, repoRoot string) (string, bool) {
 	if filepath.Dir(parent) != tmpDir {
 		return "", false
 	}
-	if !strings.HasPrefix(filepath.Base(parent), "vci-source-") {
+	if !strings.HasPrefix(filepath.Base(parent), source.StagingPrefix) {
 		return "", false
 	}
-	meta := filepath.Join(parent, "vci-meta")
+	meta := filepath.Join(parent, source.StagingMetaName)
 	if _, err := os.Stat(meta); err != nil {
 		return "", false
 	}
@@ -210,7 +211,7 @@ func readStagingMeta(path string) (stagingMeta, error) {
 	if meta.FormatVersion != sourcecache.FormatVersion {
 		return stagingMeta{}, fmt.Errorf("unsupported staging format version %q", meta.FormatVersion)
 	}
-	if !digestShape.MatchString(meta.Digest) {
+	if !sourcecache.ValidDigest(meta.Digest) {
 		return stagingMeta{}, fmt.Errorf("staging meta has invalid digest %q", meta.Digest)
 	}
 	if !layout.ValidName(meta.Project) {
@@ -250,10 +251,9 @@ func Prepare(ctx context.Context, l layout.Layout, sourcePath string) (PreparedR
 		return PreparedRun{}, err
 	}
 	project := cfg.Projects[projectName]
-	if len(project.Machines) != 1 {
-		return PreparedRun{}, fmt.Errorf("project %q must have exactly one local machine in the first build slice", projectName)
+	if len(project.Machines) == 0 {
+		return PreparedRun{}, fmt.Errorf("project %q has no attached machines", projectName)
 	}
-	machineName := project.Machines[0]
 
 	// Coordinator-owned source-cache handling at the public build
 	// boundary. No wire protocol is involved: the direct staging tree
@@ -271,7 +271,30 @@ func Prepare(ctx context.Context, l layout.Layout, sourcePath string) (PreparedR
 		defer releaseClaim()
 	}
 
-	manifest, blobs, err := source.Build(repo.Root)
+	// Local coordinator builds share the same recursive source
+	// validation as direct-SSH: an uninitialized submodule or an
+	// LFS pointer fails before any source manifest is produced. The
+	// attribute-graph + LFS-pointer rules live in internal/source
+	// and are reused here so local and remote paths agree.
+	graph, err := source.SelectBuildInput(ctx, repo.Root, process.Native{})
+	if err != nil {
+		return PreparedRun{}, err
+	}
+	snapParent, err := os.MkdirTemp(l.TempDir(), source.SnapshotPrefix)
+	if err != nil {
+		return PreparedRun{}, fmt.Errorf("prepare local snapshot dir: %w", err)
+	}
+	defer os.RemoveAll(snapParent)
+	if _, err := source.MaterializeSnapshot(graph, snapParent); err != nil {
+		return PreparedRun{}, err
+	}
+
+	// BuildWithValidation checks LFS-attributed files against the
+	// formal pointer format using the same bytes that become a
+	// blob. The local manifest construction is the source of truth
+	// for what the run will execute against; the validation cannot
+	// be skipped.
+	manifest, blobs, err := source.BuildWithValidation(repo.Root, graph.LFSFiles)
 	if err != nil {
 		return PreparedRun{}, err
 	}
@@ -279,28 +302,38 @@ func Prepare(ctx context.Context, l layout.Layout, sourcePath string) (PreparedR
 	if err := blobStore.PutManifestAndBlobs(manifest, blobs); err != nil {
 		return PreparedRun{}, err
 	}
-	snapshot := map[string]any{"schema_version": config.SchemaVersion, "project": projectName, "project_config": project, "machine": machineName, "log_limits": cfg.LogLimits, "retention": cfg.Retention}
+	now := time.Now().UTC()
 	runStore := store.Store{Layout: l}
-	record, err := store.NewRun(projectName, machineName, project.Command, manifest.Digest, snapshot, time.Now().UTC())
+	// Reserve a slot on an eligible machine and publish the staging
+	// record atomically. The transaction holds the scheduler lock
+	// from sweep-through-save, so a crashed caller cannot leave an
+	// orphan claim. Prepare never persists a queued record under the
+	// public build path: the reservation transaction publishes the
+	// record directly in `staging` state.
+	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, manifest.Digest, map[string]any{"schema_version": config.SchemaVersion, "project": projectName, "project_config": project, "log_limits": cfg.LogLimits, "retention": cfg.Retention}, now)
 	if err != nil {
 		return PreparedRun{}, err
 	}
-	if err := runStore.Save(record); err != nil {
-		return PreparedRun{}, err
-	}
-	staged, err := runStore.Transition(record.ID, model.RunStaging, time.Now().UTC())
+	var staged store.RunRecord
+	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
+		snapshot := map[string]any{"schema_version": config.SchemaVersion, "project": projectName, "project_config": project, "machine": machineName, "log_limits": cfg.LogLimits, "retention": cfg.Retention}
+		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, snapshot, now)
+		if buildErr != nil {
+			return buildErr
+		}
+		if saveErr := runStore.Save(record); saveErr != nil {
+			return saveErr
+		}
+		staged = record
+		return nil
+	})
 	if err != nil {
+		if errors.Is(err, scheduler.ErrNoCapacity) {
+			return PreparedRun{}, err
+		}
 		return PreparedRun{}, err
 	}
 	return PreparedRun{Record: staged}, nil
-}
-
-func Build(ctx context.Context, l layout.Layout, sourcePath string) (BuildResult, error) {
-	prepared, err := Prepare(ctx, l, sourcePath)
-	if err != nil {
-		return BuildResult{}, err
-	}
-	return ExecutePrepared(ctx, l, prepared.Record.ID)
 }
 
 func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (BuildResult, error) {
@@ -312,14 +345,27 @@ func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (Buil
 	if record.State == model.RunAborted {
 		return BuildResult{}, fmt.Errorf("run %s was aborted", id)
 	}
-	var snapshot runSnapshot
-	if err := json.Unmarshal(record.ConfigSnapshot, &snapshot); err != nil {
-		return BuildResult{}, fmt.Errorf("decode run configuration snapshot: %w", err)
+	// The detached worker must only begin work when the run record
+	// is still in `staging` state. A reaper terminalization or a
+	// competing failing path can move the record out of staging
+	// between the reservation and the worker start; refusing here
+	// means the slot is freed without a half-built workspace.
+	if record.State != model.RunStaging {
+		return BuildResult{}, fmt.Errorf("run %s is not in staging state (state=%s)", id, record.State)
 	}
-	manifest, err := (source.BlobStore{Layout: l}).LoadManifest(record.SourceDigest)
-	if err != nil {
-		return BuildResult{}, err
+	// Verify the reservation before any work begins. The detached
+	// worker must not create an unreserved execution. The reservation
+	// is validated by the scheduler, not by a raw Stat: a missing
+	// claim surfaces as os.ErrNotExist and a corrupt claim surfaces
+	// as a wrapped error.
+	if _, err := scheduler.ReservationFor(l, record.Machine, id); err != nil {
+		return BuildResult{}, fmt.Errorf("scheduler reservation missing for %s on %s: %w", id, record.Machine, err)
 	}
+	defer func() { _ = scheduler.Release(l, record.Machine, id) }()
+	// Claim the worker lease before any workspace or process work.
+	// The lease is what the reaper and the cancellation path use to
+	// recognize a live worker; without it, the reaper would free the
+	// slot on the next sweep and a duplicate worker could start.
 	owner, err := process.NewOwner()
 	if err != nil {
 		return BuildResult{}, err
@@ -329,6 +375,26 @@ func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (Buil
 		return BuildResult{}, err
 	}
 	defer func() { _ = lease.Release(l, id, owner) }()
+	// Re-check state after claiming the lease. A reaper that
+	// terminalized the record between the initial load and the lease
+	// claim must not see a half-built workspace. Release the lease
+	// and the reservation cleanly so the slot is freed for the next
+	// submission.
+	recheck, err := runStore.Load(id)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if recheck.State != model.RunStaging {
+		return BuildResult{}, fmt.Errorf("run %s left staging state before lease (state=%s)", id, recheck.State)
+	}
+	var snapshot runSnapshot
+	if err := json.Unmarshal(record.ConfigSnapshot, &snapshot); err != nil {
+		return BuildResult{}, fmt.Errorf("decode run configuration snapshot: %w", err)
+	}
+	manifest, err := (source.BlobStore{Layout: l}).LoadManifest(record.SourceDigest)
+	if err != nil {
+		return BuildResult{}, err
+	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

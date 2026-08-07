@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+
+	"github.com/hypernewbie/vci/internal/model"
 )
 
 var safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -30,11 +32,27 @@ func (l Layout) LocksDir() string       { return filepath.Join(l.StateDir(), "lo
 func (l Layout) TempDir() string        { return filepath.Join(l.StateDir(), "tmp") }
 func (l Layout) SourceCacheDir() string { return filepath.Join(l.StateDir(), "source-cache") }
 
+// SchedulerLockPath returns the single Vci-owned scheduler lock used to
+// serialize inspect/sweep/select/claim/write under scheduler concurrency.
+// Its parent is LocksDir(), which previously had no real consumer.
+func (l Layout) SchedulerLockPath() string { return filepath.Join(l.LocksDir(), "scheduler.lock") }
+
+// MachineClaimsDir returns the root of the durable per-machine reservation
+// tree. Each machine has a subdirectory; each reservation is one
+// JSON file at <machine>/<run-id>.json.
+func (l Layout) MachineClaimsDir() string { return filepath.Join(l.StateDir(), "machine-claims") }
+
+// MachineClaimPath returns the absolute claim file for one
+// (machine, run-id) tuple. The caller must validate both names.
+func (l Layout) MachineClaimPath(machine string, runID model.RunID) string {
+	return filepath.Join(l.MachineClaimsDir(), machine, string(runID)+".json")
+}
+
 func (l Layout) Ensure() error {
 	if l.Root == "" {
 		return fmt.Errorf("vci root is empty")
 	}
-	for _, dir := range []string{l.Root, l.StateDir(), l.RunsDir(), l.SourcesDir(), l.BlobsDir(), l.ManifestsDir(), l.WorkDir(), l.LocksDir(), l.TempDir(), l.SourceCacheDir()} {
+	for _, dir := range []string{l.Root, l.StateDir(), l.RunsDir(), l.SourcesDir(), l.BlobsDir(), l.ManifestsDir(), l.WorkDir(), l.LocksDir(), l.TempDir(), l.SourceCacheDir(), l.MachineClaimsDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
