@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- Plan 13 Fix repairs four Plan 13 defects the original tests did
+  not pin. (1) `TestDockerRunsViaStub` flagged any `state/`
+  substring in the docker `run` arg string as a dangerous mount
+  leak, but the runner only ever mounts the per-run workspace,
+  which legitimately lives under `<root>/state/work/<run>/` and
+  `<root>/state/work/<run>/.tmp/`. The banned-mount check now
+  distinguishes the per-run workspace mount from a real
+  state-root, `.vci`, or `.ssh` mount, so `vci build .` runs the
+  full test suite inside its own per-run workspace without a
+  false-positive failure. (2) `runtime.Docker` now uses
+  `os.Getuid()/os.Getgid()` so the container identity matches the
+  coordinator host (previously always `0:0`). (3) The image
+  validator accepts an optional `host:port/` registry prefix
+  (`myregistry:5000/repo:tag`,
+  `myregistry:5000/repo@sha256:...`) while keeping the strict
+  no-shell, no-scheme, no-path allow-list. (4) `selectExecutor`
+  reads the durable `snapshot.Machine` (the reserved machine),
+  falling back to `ProjectConfig.Machines[0]` only for legacy
+  records; a multi-machine project that reserves a docker
+  machine always selects the docker runner.
+- Plan 13 introduces an optional per-machine container runtime.
+  A coordinator machine may declare `runtime = "docker"` and a
+  verbatim image reference; the project's command then runs
+  inside the container via the system `docker` binary. The
+  default path is bare execution: a machine with no runtime
+  fields runs exactly as before. The runner is selected from
+  the durable run snapshot (not live config), so historical
+  runs remain explainable after config changes. The executor
+  arg slice is exact (no shell, no template interpolation):
+  `docker run --rm -v <workspace>:/vci/work:ro -w /vci/work
+  --network none --user <uid>:<gid> --cpus 2 --memory 4g
+  <image> <command...>`. The workspace is bind-mounted
+  read-only; Vci never mounts `~/.vci`, `state/`, or `~/.ssh`.
+  The image validator is strict: a verbatim
+  `[A-Za-z0-9._-]` registry/repo reference with optional tag
+  and `@sha256:<64hex>` digest; flag-like values, scheme-bearing
+  values, paths, whitespace, and unknown runtime values are
+  rejected at config-load time. `runtime = "vm"` is reserved
+  for a future slice and rejected as `unsupported_runtime`.
+  Three typed envelopes are mapped via `errors.Is` before the
+  substring classifier: `runtime_unavailable` (infrastructure
+  retryable when docker is missing or refuses), `runtime_image_not_found`
+  (configuration non-retryable when docker exits 125), and
+  other docker failures are classified by exit code. Client
+  roots continue to reject `[machines.*]` tables. The source
+  cache, scheduler, hosted fallback, and direct-SSH transport
+  behaviour are unchanged. No relay, daemon, custom protocol,
+  source relay, source receiver, or remote worker was added.
 - Plan 12 Fix repairs three Plan 12 defects that the original
   tests did not pin. The materialized snapshot now allow-lists
   the three top-level minimal git markers (`.git/HEAD`,

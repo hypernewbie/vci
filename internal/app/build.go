@@ -47,8 +47,10 @@ type PreparedRun struct {
 	Record store.RunRecord
 }
 type runSnapshot struct {
-	ProjectConfig config.Project   `json:"project_config"`
-	LogLimits     config.LogLimits `json:"log_limits"`
+	ProjectConfig config.Project            `json:"project_config"`
+	Machine       string                    `json:"machine,omitempty"`
+	Machines      map[string]config.Machine `json:"machines"`
+	LogLimits     config.LogLimits          `json:"log_limits"`
 }
 
 // stagingMeta is the Vci-owned identity record the staging shell writes
@@ -360,6 +362,7 @@ func buildStagedSnapshot(projectName string, project config.Project, machineName
 		"project":        projectName,
 		"project_config": project,
 		"machine":        machineName,
+		"machines":       cfg.Machines,
 		"log_limits":     cfg.LogLimits,
 		"retention":      cfg.Retention,
 	}
@@ -593,8 +596,8 @@ func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (Buil
 	if len(project.Command) == 0 {
 		project.Command = record.Command
 	}
-	executorLocal := executor.Local{}
-	execResult, execErr := executorLocal.ExecuteSupervised(workerCtx, executor.Request{Executable: project.Command[0], Args: project.Command[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
+	execRunner := selectExecutor(snapshot)
+	execResult, execErr := execRunner.ExecuteSupervised(workerCtx, executor.Request{Executable: project.Command[0], Args: project.Command[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
 		execution := process.Execution{SchemaVersion: model.SchemaVersion, RunID: id, Owner: owner, PID: running.PID, PGID: running.PGID, StartedAt: running.StartedAt, CancellationPhase: process.CancellationNone}
 		return process.WriteExecution(filepath.Join(runDir, "execution.json"), execution)
 	})

@@ -10,6 +10,7 @@ import (
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/runtime"
 	"github.com/hypernewbie/vci/internal/scheduler"
 	"github.com/hypernewbie/vci/internal/source"
 )
@@ -47,6 +48,12 @@ func appFailure(command string, err error) Response {
 	}
 	if errors.Is(err, config.ErrHostedSourceIntegrityFailed) {
 		return Failure(command, model.NewError("hosted_source_integrity_failed", model.FailureInfrastructure, message, false))
+	}
+	if errors.Is(err, runtime.ErrRuntimeUnavailable) {
+		return Failure(command, model.NewError("runtime_unavailable", model.FailureInfrastructure, message, true))
+	}
+	if errors.Is(err, runtime.ErrRuntimeImageNotFound) {
+		return Failure(command, model.NewError("runtime_image_not_found", model.FailureConfiguration, message, false))
 	}
 	lower := strings.ToLower(message)
 	switch {

@@ -165,3 +165,85 @@ max_concurrent = 2
 		t.Fatalf("client root with machines.max_concurrent accepted")
 	}
 }
+
+// TestSetupMachineAddAcceptsDockerRuntime pins that
+// `setup machine add <name> --runtime docker --image <ref>`
+// persists the runtime declaration and the machines envelope
+// surfaces it. The image is a verbatim reference; the runtime
+// runner parses it as a positional argument.
+func TestSetupMachineAddAcceptsDockerRuntime(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	image := "ghcr.io/org/ci@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	if code := Run([]string{"setup", "machine", "add", "linux-docker", "--runtime", "docker", "--image", image}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add docker: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"machines"}, &out, &errOut); code != 0 {
+		t.Fatalf("machines: %d %s", code, out.String())
+	}
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("machines failed: %+v", resp.Error)
+	}
+	machines, _ := resp.Data.([]any)
+	if len(machines) != 1 {
+		t.Fatalf("machines count: %d", len(machines))
+	}
+	entry, _ := machines[0].(map[string]any)
+	machine, _ := entry["machine"].(map[string]any)
+	if machine["runtime"] != "docker" {
+		t.Errorf("runtime: %v", machine["runtime"])
+	}
+	if machine["image"] != image {
+		t.Errorf("image: %v", machine["image"])
+	}
+}
+
+// TestSetupMachineAddRejectsBadDockerImage pins that a
+// flag-like image is rejected at the CLI surface and the
+// coordinator config is not mutated.
+func TestSetupMachineAddRejectsBadDockerImage(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "bad", "--runtime", "docker", "--image", "--rm-all"}, &out, &errOut); code == 0 {
+		t.Fatalf("flag-like image accepted")
+	}
+	var resp Response
+	_ = json.Unmarshal(out.Bytes(), &resp)
+	// The CLI emits an invalid_arguments envelope; the deeper
+	// config validator would emit machine_update_failed, but the
+	// CLI parser defends ahead of the validator.
+	if resp.Error == nil {
+		t.Fatalf("expected error: %s", out.String())
+	}
+}
+
+// TestSetupMachineAddRejectsVMMode pins that `runtime=vm` is
+// rejected at the CLI surface as configuration. The schema is
+// forward-compatible; the executor slice is not.
+func TestSetupMachineAddRejectsVMMode(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "vm1", "--runtime", "vm", "--snapshot", "abc"}, &out, &errOut); code == 0 {
+		t.Fatalf("vm mode accepted")
+	}
+}

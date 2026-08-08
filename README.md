@@ -13,7 +13,10 @@ selector in the root configuration decides which.
 The default path is the local coordinator on macOS. Configuration
 lives under `~/.vci` in production and is injected by tests. The
 source path is the direct path passed to `build`; hosted Git remotes
-are not required.
+are not required. A machine may optionally declare a container
+runtime (`docker`) so the project's command runs inside a
+declared image with the per-run workspace bind-mounted read-only;
+the bare host path remains the default.
 
 ## First commands — coordinator
 
@@ -21,8 +24,10 @@ are not required.
 vci setup init                       # writes orchestrator = "self"
 vci setup machine add mac-local                   # one local slot
 vci setup machine add fast --capacity 4           # four local slots
+vci setup machine add linux-docker --runtime docker --image ghcr.io/org/ci:pin   # container runtime
 vci setup project add Vci --machine mac-local --command go --arg test --arg ./...
 vci setup project add big --machine mac-local --machine fast --command go --arg test --arg ./...
+vci setup project add lintest --machine linux-docker --command go --arg test --arg ./...
 vci machines
 vci projects
 vci build .
@@ -223,6 +228,61 @@ query is ever placed in the snapshot. The hosted path is
 coordinator-only; a client root proxies `vci build --hosted
 <project>` through ordinary `RemoteCommand` over SSH and never
 holds a checkout or a run record.
+
+## Container runtime (per-machine, optional)
+
+A machine may declare an optional container runtime so the
+project's command runs inside a declared image instead of on the
+coordinator host. The default path is bare execution. The runtime
+selector is read from the durable run snapshot, so a run whose
+machine config changes after submission still publishes the
+runtime it was actually launched with.
+
+```toml
+[machines.linux-docker]
+runtime = "docker"
+image   = "ghcr.io/org/ci@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+```
+
+```sh
+vci setup machine add linux-docker --runtime docker --image ghcr.io/org/ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
+vci setup project add lintest --machine linux-docker --command go --arg test --arg ./...
+vci build .
+```
+
+The image reference is verbatim — Vci never builds, pulls, or pins
+images from inside Vci. The host `docker` config is used as-is.
+The validator rejects flag-like values, scheme-bearing values,
+paths, whitespace, and an unknown runtime. `runtime = "vm"` is
+reserved for a future slice and is rejected as
+`unsupported_runtime` so the schema is forward-compatible without
+shipping VM execution.
+
+The runner shells out to the system `docker` binary without a Go
+SDK. The exact arg slice is:
+
+```
+docker run --rm \
+    -v <workspace>:/vci/work:ro \
+    -w /vci/work \
+    --network none \
+    --user $(id -u):$(id -g) \
+    --cpus 2 --memory 4g \
+    <image> <command...>
+```
+
+The workspace is bind-mounted read-only at `/vci/work`. Vci never
+mounts `~/.vci`, `state/`, or `~/.ssh`. Only the per-run workspace
+is mounted. The runner respects the caller context for cancellation
+and propagates the docker exit code as a job or infrastructure
+failure. `runtime_unavailable` is an infrastructure retryable
+envelope (docker missing or daemon refuses); `runtime_image_not_found`
+is a configuration non-retryable envelope (docker exit 125).
+
+VM mode is not executed; the documented error is `unsupported_runtime`
+(configuration). The deferred extensions — image build/push inside
+Vci, automatic registry auth, remote docker, multi-host worker
+selection — are not part of this release.
 
 ## Build and development
 

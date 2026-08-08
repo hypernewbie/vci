@@ -49,8 +49,21 @@ type Retention struct {
 // only place a remote target appears. MaxConcurrent is the optional
 // local-slot capacity for coordinator-owned parallel runs on this machine.
 // Zero is the compatibility default of one slot.
+//
+// Runtime, Image, and Snapshot are the optional container/VM runtime
+// declaration. The default Runtime is empty (bare host): the project's
+// command runs directly on the coordinator host, exactly as before. A
+// `runtime = "docker"` Machine mounts the per-run workspace read-only into
+// the container at /vci/work and runs the command inside it. The image
+// reference is verbatim (the coordinator never builds, pulls, or pins from
+// inside Vci); a digest-shaped value is preferred but tags are accepted as
+// documented. VM mode is reserved for the future slice; the current
+// validator rejects it as `unsupported_runtime`.
 type Machine struct {
-	MaxConcurrent int `toml:"max_concurrent" json:"max_concurrent,omitempty"`
+	MaxConcurrent int    `toml:"max_concurrent" json:"max_concurrent,omitempty"`
+	Runtime       string `toml:"runtime" json:"runtime,omitempty"`
+	Image         string `toml:"image" json:"image,omitempty"`
+	Snapshot      string `toml:"snapshot" json:"snapshot,omitempty"`
 }
 
 // EffectiveCapacity returns the local-slot capacity of a machine. Zero
@@ -177,6 +190,9 @@ func validateCoordinator(cfg Config) error {
 		}
 		if machine.MaxConcurrent < 0 {
 			return fmt.Errorf("machine %q has negative max_concurrent", name)
+		}
+		if err := ValidateMachineRuntime(name, machine); err != nil {
+			return err
 		}
 	}
 	for name, project := range cfg.Projects {

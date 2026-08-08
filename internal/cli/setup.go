@@ -70,6 +70,24 @@ func runSetup(args []string) (any, *model.VciError) {
 					}
 					machine.MaxConcurrent = n
 					i++
+				case "--runtime":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--runtime requires a value (docker, or empty for bare).", false)
+					}
+					machine.Runtime = args[i+1]
+					i++
+				case "--image":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--image requires an image reference.", false)
+					}
+					machine.Image = args[i+1]
+					i++
+				case "--snapshot":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--snapshot requires a snapshot reference.", false)
+					}
+					machine.Snapshot = args[i+1]
+					i++
 				default:
 					return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown machine option %q.", args[i]), false)
 				}
@@ -80,6 +98,15 @@ func runSetup(args []string) (any, *model.VciError) {
 			result := map[string]any{"machine": name, "updated": true}
 			if machine.MaxConcurrent > 0 {
 				result["max_concurrent"] = machine.MaxConcurrent
+			}
+			if machine.Runtime != "" {
+				result["runtime"] = machine.Runtime
+			}
+			if machine.Image != "" {
+				result["image"] = machine.Image
+			}
+			if machine.Snapshot != "" {
+				result["snapshot"] = machine.Snapshot
 			}
 			return result, nil
 		case "remove":
