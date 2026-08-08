@@ -57,12 +57,15 @@ func TestRunRejectsMalformedRunIDsAcrossCommands(t *testing.T) {
 		{"check-traversal", "check", []string{"run_/../../x"}},
 		{"abort-traversal", "abort", []string{"run_/../../x"}},
 		{"internal-run-traversal", "internal-run", []string{"run_/../../x"}},
+		{"logs-traversal", "logs", []string{"run_/../../x"}},
 		{"check-whitespace", "check", []string{"run_has space"}},
 		{"abort-whitespace", "abort", []string{"run_has space"}},
 		{"internal-run-whitespace", "internal-run", []string{"run_has space"}},
+		{"logs-whitespace", "logs", []string{"run_has space"}},
 		{"check-empty-after-prefix", "check", []string{"run_"}},
 		{"abort-empty-after-prefix", "abort", []string{"run_"}},
 		{"internal-run-empty-after-prefix", "internal-run", []string{"run_"}},
+		{"logs-empty-after-prefix", "logs", []string{"run_"}},
 	}
 
 	for _, tc := range cases {

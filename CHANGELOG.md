@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Plan 17 adds a read-only run log CLI. `vci logs <run-id>` streams
+  the run's durable `stdout.log` bytes to stdout (binary-safe);
+  `vci logs <run-id> --stderr` selects `stderr.log`; `--tail <n>`
+  prints the last `n` lines with `n` bounded to 1..100000 (reads the
+  whole file, no follow/tail daemon). `logs` is the second non-JSON
+  stdout path (after `artifacts get`): raw bytes stream directly so
+  binary/garbled output survives, while every failure still returns a
+  JSON envelope. New `app.ReadLog` validates the stream
+  (`ErrInvalidLogStream` → `invalid_arguments`), `Lstat`s to reject
+  symlinks, and maps missing runs and missing log files to
+  `not_found` (`model.ErrRunNotFound`/`ErrLogNotFound`). On a client
+  root `logs` proxies via `runSSHRaw` exactly like `artifacts get`
+  (`RemoteLog`), so the tail is applied on the coordinator and only
+  the requested window crosses the wire. The durable log files are
+  unchanged: still `state/runs/<id>/{stdout,stderr}.log`, still
+  referenced by `vci check`'s `stdout_path`/`stderr_path`. No new
+  source protocol, relay, daemon, framed protocol, or Go SSH client.
+- Plan 16 makes collected artifacts observable and bounded. `vci
+  artifacts ls <run-id>` returns the collected relative paths plus
+  the durable 64 MiB cap flag as JSON; `vci artifacts get <run-id>
+  <rel>` streams the artifact's exact raw bytes to stdout (the only
+  non-JSON stdout path in the CLI, so binary content survives), and
+  every failure still returns a JSON envelope. On a client root both
+  proxy to the coordinator over ordinary ssh (`RemoteCommand` for
+  `ls`, a raw `ssh` stream for `get`), exactly like `check`. The
+  relative path is validated before any filesystem access (no `..`,
+  no absolute path, no control/whitespace, no `.git`/`.vci` segment);
+  `GetArtifact` `Lstat`s to reject symlinks swapped in after
+  collection. `reaper.ReapArtifacts` removes the artifacts directory
+  of `lost`/`aborted` runs older than 30 minutes, while `succeeded`
+  and `failed` runs keep their artifacts until the run itself is
+  reaped; `app.Maintain` surfaces `artifacts_reaped`. No put/push/
+  registry surface, no new source protocol, no relay or daemon.
 - Plan 15 lets a machine declare a remote worker host. A machine
   gains an optional `host` field — a strict system `ssh` destination
   (alias or `user@host`; no leading `-`, no whitespace/control

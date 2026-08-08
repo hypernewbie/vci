@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/hypernewbie/vci/internal/config"
@@ -330,6 +331,31 @@ func runSSH(ctx context.Context, host, command string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
+// runSSHRaw executes `ssh <host> <command>` and returns the remote
+// stdout verbatim. It is the transport for the raw-byte `artifacts
+// get` path: the remote writes artifact bytes, not a JSON envelope, to
+// stdout. A non-zero remote exit with a valid Vci error envelope is
+// preserved so the caller can report the remote error; only no
+// response or genuine SSH failure is classified as infrastructure.
+func runSSHRaw(ctx context.Context, host, command string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "ssh", host, command)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		if validEnvelope(stdout.Bytes()) {
+			return stdout.Bytes(), nil
+		}
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("ssh %s: %s", host, message)
+	}
+	return stdout.Bytes(), nil
+}
+
 // validEnvelope returns true when the given bytes decode as a Vci response
 // envelope with the expected schema version. Used to decide whether a
 // non-zero remote exit should be propagated as an envelope or treated as an
@@ -376,6 +402,48 @@ func RemoteCommand(ctx context.Context, l layout.Layout, name string, args ...st
 		return nil, remote, err
 	}
 	raw, err := runSSH(ctx, host, buildRemoteCommand(name, args...))
+	return raw, true, err
+}
+
+// RemoteLog proxies `vci logs <run-id> [--stderr] [--tail <n>]` to
+// the configured remote host over ordinary SSH and returns the remote
+// stdout verbatim. Like RemoteGetArtifact, the remote `vci logs`
+// writes raw log bytes to stdout, so the captured bytes are the log
+// (the tail, if any, is applied on the coordinator so only the
+// requested window crosses the wire). A non-zero remote exit with a
+// valid Vci error envelope (missing run/log, invalid stream or tail)
+// is preserved unchanged for the caller to report; only no response
+// or genuine SSH failure is classified as infrastructure.
+func RemoteLog(ctx context.Context, l layout.Layout, id model.RunID, stream string, tail int) ([]byte, bool, error) {
+	host, remote, err := remoteTarget(l)
+	if err != nil || !remote {
+		return nil, remote, err
+	}
+	args := []string{"logs", string(id)}
+	if stream == "stderr" {
+		args = append(args, "--stderr")
+	}
+	if tail > 0 {
+		args = append(args, "--tail", strconv.Itoa(tail))
+	}
+	raw, err := runSSHRaw(ctx, host, buildRemoteCommand(args[0], args[1:]...))
+	return raw, true, err
+}
+
+// RemoteGetArtifact proxies `vci artifacts get <run-id> <rel>` to the
+// configured remote host over ordinary SSH and returns the remote
+// stdout verbatim. Unlike RemoteCommand (JSON envelopes), the remote
+// `artifacts get` writes the artifact's raw bytes to stdout, so the
+// captured bytes are the artifact. A non-zero remote exit with a valid
+// Vci error envelope (missing run/artifact, invalid rel) is preserved
+// unchanged for the caller to report; only no response or genuine SSH
+// failure is classified as infrastructure.
+func RemoteGetArtifact(ctx context.Context, l layout.Layout, id model.RunID, rel string) ([]byte, bool, error) {
+	host, remote, err := remoteTarget(l)
+	if err != nil || !remote {
+		return nil, remote, err
+	}
+	raw, err := runSSHRaw(ctx, host, buildRemoteCommand("artifacts", "get", string(id), rel))
 	return raw, true, err
 }
 

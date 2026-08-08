@@ -1,9 +1,15 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 )
+
+// ErrRunNotFound is returned by read-side run operations when the
+// requested run record does not exist. Public CLIs map it to the
+// `not_found` envelope (configuration class, not retryable).
+var ErrRunNotFound = errors.New("run not found")
 
 const SchemaVersion = 1
 

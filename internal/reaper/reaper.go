@@ -36,6 +36,7 @@ type Report struct {
 	SourceCacheLimitBytes     int64 `json:"source_cache_limit_bytes"`
 	SourceCacheRejected       int   `json:"source_cache_rejected"`
 	SchedulerClaimsReleased   int   `json:"scheduler_claims_released"`
+	ArtifactsReaped           int   `json:"artifacts_reaped"`
 }
 
 const (
@@ -203,6 +204,16 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		report.SchedulerClaimsReleased = released
 	}
 
+	// Reaper-owned artifact retention: artifacts of lost/aborted runs
+	// older than transferStaleAge are removed. Succeeded and failed
+	// runs keep their artifacts until the run itself is reaped by the
+	// existing retention passes.
+	if reaped, err := ReapArtifacts(l, now); err != nil {
+		return report, err
+	} else {
+		report.ArtifactsReaped = reaped
+	}
+
 	return report, nil
 }
 
@@ -298,6 +309,65 @@ func reapTransferDirs(tempDir string, now time.Time) (int, error) {
 
 func removeTree(path string) error {
 	return os.RemoveAll(path)
+}
+
+// ReapArtifacts removes the collected artifacts directory
+// (state/runs/<run>/artifacts) of lost and aborted runs whose run
+// record is older than transferStaleAge. The age is the record's
+// last transition time (when the run became lost/aborted), falling
+// back to the artifacts directory mtime when the timestamp is absent.
+// Succeeded and failed runs keep their artifacts until the run itself
+// is reaped by the existing retention passes, and live-lease runs are
+// never touched: a freshly terminalized run is younger than the age
+// gate, so the reaper cannot race a terminalizing worker. Returns the
+// number of artifacts directories removed.
+func ReapArtifacts(l layout.Layout, now time.Time) (int, error) {
+	entries, err := os.ReadDir(l.RunsDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	runStore := store.Store{Layout: l}
+	threshold := now.Add(-transferStaleAge)
+	reaped := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := model.RunID(entry.Name())
+		if !model.ValidRunID(id) {
+			continue
+		}
+		record, loadErr := runStore.Load(id)
+		if loadErr != nil {
+			continue
+		}
+		if record.State != model.RunLost && record.State != model.RunAborted {
+			continue
+		}
+		age := record.UpdatedAt
+		if age.IsZero() {
+			info, infoErr := entry.Info()
+			if infoErr != nil {
+				continue
+			}
+			age = info.ModTime()
+		}
+		if !age.Before(threshold) {
+			continue
+		}
+		artDir := filepath.Join(l.RunsDir(), string(id), "artifacts")
+		if _, statErr := os.Stat(artDir); statErr != nil {
+			continue
+		}
+		if err := removeTree(artDir); err != nil {
+			return reaped, err
+		}
+		reaped++
+	}
+	return reaped, nil
 }
 
 // isTerminal reports whether a run state is final and immutable.

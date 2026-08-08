@@ -14,6 +14,7 @@ package app
 // home is removed when the test exits, regardless of pass or fail.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,6 +55,11 @@ type SSHFixture struct {
 	binary          string
 	sshd            *exec.Cmd
 	sshdCancel      context.CancelFunc
+	// sshdExited is closed once the foreground sshd listener process
+	// (started with -D) has been waited on. shutdown selects on it so
+	// cleanup returns only after the listener and its process group
+	// are truly gone and their ports released.
+	sshdExited chan struct{}
 }
 
 // NewSSHFixture prepares and starts an isolated loopback sshd. The
@@ -473,7 +480,16 @@ Subsystem sftp /usr/libexec/sftp-server
 	if err != nil {
 		f.t.Fatalf("fixture: locate sshd: %v", err)
 	}
-	cmd := exec.CommandContext(ctx, sshdPath, "-f", cfg, "-E", filepath.Join(sshDir, "sshd.log"))
+	// -D keeps sshd in the foreground. Without it, macOS OpenSSH
+	// daemonizes: the exec'd process forks a detached listener and
+	// exits immediately, so by the time shutdown runs the tracked
+	// process is gone, Getpgid fails with ESRCH, and the real
+	// listener leaks forever (holding its port and keeping the
+	// session's build workers alive to race t.TempDir cleanup). With
+	// -D the exec'd process IS the listener, so shutdown's
+	// process-group kill and Wait actually terminate it before the
+	// next test binds.
+	cmd := exec.CommandContext(ctx, sshdPath, "-D", "-f", cfg, "-E", filepath.Join(sshDir, "sshd.log"))
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	// Run sshd in its own process group so shutdown can kill any
 	// forked worker processes too. Without this, an abrupt test
@@ -481,15 +497,31 @@ Subsystem sftp /usr/libexec/sftp-server
 	// subsequent tests cannot fork because the per-uid process
 	// limit (kern.maxprocperuid) is exhausted.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		f.t.Fatalf("fixture: sshd start: %v\n%s", err, out)
+	// sshd now lives for the whole test, so Start (not
+	// CombinedOutput) is required; startup errors land in stderrBuf
+	// and are surfaced by the readiness poll below.
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		f.t.Fatalf("fixture: sshd start: %v", err)
 	}
 	f.sshd = cmd
+	f.sshdExited = make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(f.sshdExited)
+	}()
 
 	// Wait until the listener accepts a connection so the alias has
 	// something real to talk to.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
+		select {
+		case <-f.sshdExited:
+			log, _ := os.ReadFile(filepath.Join(sshDir, "sshd.log"))
+			f.t.Fatalf("fixture: sshd exited during startup: %s\nsshd log:\n%s", strings.TrimSpace(stderrBuf.String()), log)
+		default:
+		}
 		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", f.port), 200*time.Millisecond)
 		if err == nil {
 			_ = c.Close()
@@ -520,11 +552,14 @@ func (f *SSHFixture) shutdown() {
 		if err == nil {
 			_ = syscall.Kill(-pgid, syscall.SIGTERM)
 		}
-		done := make(chan struct{})
-		go func() {
-			_ = f.sshd.Wait()
-			close(done)
-		}()
+		done := f.sshdExited
+		if done == nil {
+			done = make(chan struct{})
+			go func() {
+				_ = f.sshd.Wait()
+				close(done)
+			}()
+		}
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
@@ -536,6 +571,75 @@ func (f *SSHFixture) shutdown() {
 			<-done
 		}
 	}
+	// The detached build worker (`vci internal-run <run-id>`) is
+	// spawned with setsid (internal/cli/spawn.go) and lives in its
+	// own session, so it survives the sshd process-group kill above
+	// and keeps writing run records, leases, and the scheduler lock
+	// into the fixture home while t.TempDir cleanup races it. Kill
+	// any remaining fixture-owned process and wait for it to exit so
+	// the fixture home is quiescent before this cleanup returns.
+	f.killRemainingFixtureProcesses()
+}
+
+// killRemainingFixtureProcesses terminates every process that still
+// references the fixture home after the sshd process group has been
+// killed. The remote build worker escapes the sshd group via setsid
+// (internal/cli/spawn.go spawnRun), and its argv[0] is the
+// fixture-built `vci` binary under the fixture home, so the process
+// table is the reliable place to find it. SIGTERM first, escalate to
+// SIGKILL after a bounded grace, and return only once no fixture
+// process remains so the fixture home is quiescent before the test's
+// t.TempDir removal runs.
+func (f *SSHFixture) killRemainingFixtureProcesses() {
+	termDeadline := time.Now().Add(2 * time.Second)
+	hardDeadline := termDeadline.Add(2 * time.Second)
+	for {
+		pids := fixtureProcessPIDs(f.homeDir)
+		if len(pids) == 0 {
+			return
+		}
+		sig := syscall.SIGTERM
+		if time.Now().After(termDeadline) {
+			sig = syscall.SIGKILL
+		}
+		for _, pid := range pids {
+			if proc, err := os.FindProcess(pid); err == nil {
+				_ = proc.Signal(sig)
+			}
+		}
+		if time.Now().After(hardDeadline) {
+			// Absolute bound; the sweep is best-effort from here.
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// fixtureProcessPIDs lists the pids of processes whose command line
+// references the fixture home. Every process the fixture owns starts
+// with a path under the home (sshd config, remote coordinator shells,
+// and the detached worker's binary), so a match is safe to terminate.
+func fixtureProcessPIDs(homeDir string) []int {
+	out, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil
+	}
+	self := os.Getpid()
+	var pids []int
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid == self {
+			continue
+		}
+		if strings.Contains(strings.Join(fields[1:], " "), homeDir) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
 }
 
 // waitForSSHRoundtrip runs `true` through the SSH alias until the

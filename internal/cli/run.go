@@ -27,6 +27,20 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
+	// `vci artifacts get <run-id> <rel>` is the first non-JSON stdout
+	// path: the artifact's raw bytes stream directly so binary content
+	// survives. Every other command, including `artifacts ls`, uses
+	// the JSON envelope.
+	if parsed.Name == "artifacts" && len(parsed.Args) >= 1 && parsed.Args[0] == "get" {
+		return runArtifactsGet(parsed.Args, stdout, stderr)
+	}
+	// `vci logs <run-id> [--stderr] [--tail <n>]` is the second
+	// non-JSON stdout path: the selected stream's durable log bytes
+	// stream directly so binary or garbled output survives. Every
+	// failure still returns a JSON envelope.
+	if parsed.Name == "logs" {
+		return runLogs(parsed.Args, stdout, stderr)
+	}
 	response, exitCode := dispatch(parsed.Name, parsed.Args)
 	if err := Write(stdout, response); err != nil {
 		fmt.Fprintln(stderr, err)
@@ -195,6 +209,12 @@ func dispatch(command string, args []string) (Response, int) {
 			return appFailure(command, err), 2
 		}
 		return Success(command, map[string]any{"run_id": args[0], "completed": true}), 0
+	case "artifacts":
+		data, artErr := runArtifacts(args)
+		if artErr != nil {
+			return Failure(command, artErr), 2
+		}
+		return Success(command, data), 0
 	default:
 		return Failure(command, model.NewError("unknown_command", model.FailureUsage, fmt.Sprintf("Command %q is not recognized.", command), false)), 2
 	}

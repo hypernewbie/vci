@@ -3,7 +3,7 @@ package cli
 import "testing"
 
 func TestParseCommands(t *testing.T) {
-	for _, args := range [][]string{{"build", "."}, {"check", "run_1"}, {"projects"}, {"machines"}, {"setup", "init"}} {
+	for _, args := range [][]string{{"build", "."}, {"check", "run_1"}, {"projects"}, {"machines"}, {"setup", "init"}, {"logs", "run_1"}} {
 		got, err := Parse(args)
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", args, err)

@@ -14,6 +14,10 @@ type MaintenanceReport struct {
 	Retention retention.Report `json:"retention"`
 }
 
+// Maintain runs the reaper sweep and enforces blob retention. The
+// sweep includes ReapArtifacts (invoked inside reaper.Run), surfaced
+// as reaped.artifacts_reaped in the JSON report alongside the existing
+// removed/marked_lost counters.
 func Maintain(l layout.Layout) (MaintenanceReport, error) {
 	cfg, err := config.Load(l.ConfigPath())
 	if err != nil {

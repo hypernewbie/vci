@@ -70,7 +70,8 @@ orchestrator = "builder"
 ```
 
 Every public command (`build`, `check`, `abort`, `machines`,
-`projects`) is proxied to the coordinator over ordinary system SSH.
+`projects`, `artifacts`, `logs`) is proxied to the coordinator over
+ordinary system SSH.
 Administrative `setup` mutations reject locally.
 
 Stdout is machine-readable JSON. Diagnostics belong on stderr. Project
@@ -379,6 +380,50 @@ the host's staged workspace with `scp` over the same ssh channel
 before the same collector publishes them locally, so the durable
 artifact root is always `state/runs/<run_id>/artifacts/` on the
 coordinator.
+
+```sh
+vci artifacts ls <run-id>         # JSON: files list + truncated flag
+vci artifacts get <run-id> <rel>  # raw bytes to stdout (binary-safe)
+```
+
+`ls` is a read-only inventory query. `get` is the first non-JSON
+stdout path in the CLI: the artifact's exact bytes stream directly so
+binary content survives, while every failure still returns a JSON
+envelope. On a client root both proxy to the coordinator over the same
+ordinary ssh channel as `check`. The relative path is validated before
+any filesystem access (no `..`, no absolute path, no control/
+whitespace characters, no `.git`/`.vci` segment); a swapped-in symlink
+is rejected via `Lstat`. The reaper removes the artifacts directory of
+`lost`/`aborted` runs older than 30 minutes; `succeeded` and `failed`
+runs keep their artifacts until the run itself is reaped.
+
+## Run logs
+
+Every run captures its job's stdout and stderr into durable per-run
+files at `state/runs/<run_id>/stdout.log` and `stderr.log` (mode
+0600); `vci check` references them as `stdout_path`/`stderr_path`.
+`vci logs` streams one of those files without scraping paths out of
+the check JSON:
+
+```sh
+vci logs <run-id>              # stdout.log bytes to stdout (binary-safe)
+vci logs <run-id> --stderr     # stderr.log bytes to stdout
+vci logs <run-id> --tail <n>   # last n lines (1..100000)
+```
+
+`logs` is the second non-JSON stdout path in the CLI (after
+`artifacts get`): the durable log bytes stream directly so binary or
+garbled output survives, while every failure still returns a JSON
+envelope. `--tail <n>` reads the whole file and prints the last `n`
+lines; `n` must be between 1 and 100000, anything else is
+`invalid_arguments`. There is no `--follow`: a follow loop would be a
+polling daemon, which is out of scope. On a client root `logs` proxies
+to the coordinator over the same ordinary ssh channel as
+`check`/`artifacts get`, and the tail is applied on the coordinator so
+only the requested window crosses the wire. `ReadLog` validates the
+stream (`stdout`/`stderr` only), rejects a swapped-in symlink via
+`Lstat`, and reports missing runs and missing log files as
+`not_found`.
 
 ## Build and development
 

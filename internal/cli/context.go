@@ -23,37 +23,47 @@ func resolveLayout() (layout.Layout, error) {
 }
 
 func appFailure(command string, err error) Response {
+	code, class, message, retryable := classify(err)
+	return Failure(command, model.NewError(code, class, message, retryable))
+}
+
+// classify maps an app-side error to the public (code, class, message,
+// retryable) tuple shared by every JSON envelope producer. The typed
+// sentinels are matched with errors.Is first; the substring branches
+// are the fallback for wrapped transport and state errors. The message
+// is the error's own text so operators see the underlying cause.
+func classify(err error) (string, model.FailureClass, string, bool) {
 	message := fmt.Sprintf("%v", err)
 	code, class, retryable := "operation_failed", model.FailureConfiguration, false
 	if errors.Is(err, scheduler.ErrNoCapacity) {
-		return Failure(command, model.NewError("machine_unavailable", model.FailureState, message, true))
+		return "machine_unavailable", model.FailureState, message, true
 	}
 	if errors.Is(err, source.ErrSubmoduleUnavailable) {
-		return Failure(command, model.NewError("submodule_unavailable", model.FailureConfiguration, message, false))
+		return "submodule_unavailable", model.FailureConfiguration, message, false
 	}
 	if errors.Is(err, source.ErrLFSContentUnavailable) {
-		return Failure(command, model.NewError("lfs_content_unavailable", model.FailureConfiguration, message, false))
+		return "lfs_content_unavailable", model.FailureConfiguration, message, false
 	}
 	// Hosted build typed sentinels. These must come BEFORE the
 	// substring-based "ssh" / "tar:" branches so a wrapped upstream
 	// message does not get reclassified as remote_unavailable.
 	if errors.Is(err, config.ErrHostedFallbackNotConfigured) {
-		return Failure(command, model.NewError("hosted_fallback_not_configured", model.FailureConfiguration, message, false))
+		return "hosted_fallback_not_configured", model.FailureConfiguration, message, false
 	}
 	if errors.Is(err, config.ErrHostedFallbackInvalid) {
-		return Failure(command, model.NewError("hosted_fallback_invalid", model.FailureConfiguration, message, false))
+		return "hosted_fallback_invalid", model.FailureConfiguration, message, false
 	}
 	if errors.Is(err, config.ErrHostedSourceUnavailable) {
-		return Failure(command, model.NewError("hosted_source_unavailable", model.FailureInfrastructure, message, true))
+		return "hosted_source_unavailable", model.FailureInfrastructure, message, true
 	}
 	if errors.Is(err, config.ErrHostedSourceIntegrityFailed) {
-		return Failure(command, model.NewError("hosted_source_integrity_failed", model.FailureInfrastructure, message, false))
+		return "hosted_source_integrity_failed", model.FailureInfrastructure, message, false
 	}
 	if errors.Is(err, runtime.ErrRuntimeUnavailable) {
-		return Failure(command, model.NewError("runtime_unavailable", model.FailureInfrastructure, message, true))
+		return "runtime_unavailable", model.FailureInfrastructure, message, true
 	}
 	if errors.Is(err, runtime.ErrRuntimeImageNotFound) {
-		return Failure(command, model.NewError("runtime_image_not_found", model.FailureConfiguration, message, false))
+		return "runtime_image_not_found", model.FailureConfiguration, message, false
 	}
 	lower := strings.ToLower(message)
 	switch {
@@ -68,5 +78,5 @@ func appFailure(command string, err error) Response {
 	case strings.Contains(lower, "lock"):
 		code, class, retryable = "lock_failed", model.FailureState, true
 	}
-	return Failure(command, model.NewError(code, class, message, retryable))
+	return code, class, message, retryable
 }
