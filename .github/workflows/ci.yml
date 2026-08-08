@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # ubuntu-latest runners ship git-lfs, which would try to smudge
+    # the fake LFS pointers in the source tests during `git submodule
+    # add` and fail the setup. The macOS-first dev machine has no
+    # git-lfs, so its smudge filter is inert and vci's own pointer
+    # detection is what the tests pin. Skip smudging to match that
+    # environment without removing git-lfs.
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l cmd/ internal/)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt found unformatted files:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+        timeout-minutes: 5
+
+      - name: go vet
+        run: go vet ./...
+        timeout-minutes: 10
+
+      - name: go test
+        run: go test -p 2 ./... -count=1
+        timeout-minutes: 15
+
+      - name: go test -race
+        run: go test -race -p 2 ./...
+        timeout-minutes: 15
+
+      - name: Self-check
+        run: ./scripts/self-check.sh
+        timeout-minutes: 15
+
+      - name: Detach check
+        run: ./scripts/detach-check.sh
+        timeout-minutes: 15

@@ -6,23 +6,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/hypernewbie/vci/internal/config"
-	"github.com/hypernewbie/vci/internal/layout"
-	"github.com/hypernewbie/vci/internal/process"
+	"github.com/hypernewbie/vci/internal/model"
 )
 
 // hostedTestLayout returns a t.TempDir()-rooted Layout whose Ensure
 // has already run. Tests use this so the hosted parent MkdirTemp can
 // land under state/tmp.
-func hostedTestLayout(t *testing.T) layout.Layout {
+func hostedTestLayout(t *testing.T) model.Layout {
 	t.Helper()
 	root := t.TempDir()
-	l := layout.Layout{Root: root}
+	l := model.Layout{Root: root}
 	if err := l.Ensure(); err != nil {
 		t.Fatal(err)
 	}
@@ -319,30 +316,15 @@ func TestHostedCleanRefusesOutsideTempDir(t *testing.T) {
 	}
 }
 
-// matchAll matches every argv. It must be paired with a more specific
-// pattern that runs first (the runner iterates patterns in order).
-func matchAll() func([]string) bool { return func(_ []string) bool { return true } }
-
 // TestHostedCheckoutEnvDoesNotMutateCaller pins that safeCheckoutEnv
 // returns a fresh slice per call and never aliases os.Environ().
 func TestHostedCheckoutEnvDoesNotMutateCaller(t *testing.T) {
 	a := safeCheckoutEnv()
 	b := safeCheckoutEnv()
-	if reflect.DeepEqual(a, b) == false {
-		// Two distinct slices must not share underlying memory.
-		if &a[0] == &b[0] {
-			t.Fatal("env slices alias")
-		}
+	// Two distinct slices must not share underlying memory.
+	if &a[0] == &b[0] {
+		t.Fatal("env slices alias")
 	}
-}
-
-// TestPrepareHostedDoesNotCreateHostedTempOnDirect is a placeholder
-// for the app-level PrepareHosted test; the integration test lives in
-// internal/app/hosted_app_test.go. Pinning this name here documents
-// that the source-level hosted temp-root invariant is asserted at
-// the app boundary, not the source boundary.
-func TestPrepareHostedDoesNotCreateHostedTempOnDirect_DocOnly(t *testing.T) {
-	t.Skip("asserted in internal/app/hosted_app_test.go")
 }
 
 // --- helpers ---
@@ -377,15 +359,3 @@ func envToMap(env []string) map[string]string {
 	}
 	return out
 }
-
-// cancelingRunner returns context.Canceled on every Run call. The
-// hosted path propagates this as a wrapped unavailable error.
-type cancelingRunner struct{}
-
-func (cancelingRunner) Run(ctx context.Context, cmd process.Command) (process.Result, error) {
-	<-ctx.Done()
-	return process.Result{}, ctx.Err()
-}
-
-// ensure unused import
-var _ = time.Second

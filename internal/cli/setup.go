@@ -8,7 +8,6 @@ import (
 
 	"github.com/hypernewbie/vci/internal/app"
 	"github.com/hypernewbie/vci/internal/config"
-	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/model"
 )
 
@@ -196,7 +195,7 @@ func runSetup(args []string) (any, *model.VciError) {
 // Both subcommands mutate only a coordinator root via the
 // config.Mutate-backed app helpers. The --url and --commit values are
 // validated through HostedFallback.Validate before any disk write.
-func runSetupProjectHosted(l layout.Layout, args []string) (any, *model.VciError) {
+func runSetupProjectHosted(l model.Layout, args []string) (any, *model.VciError) {
 	if len(args) < 1 {
 		return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project hosted set <name> --url <url> --commit <object-id>\n       setup project hosted clear <name>", false)
 	}
@@ -252,7 +251,7 @@ func runSetupProjectHosted(l layout.Layout, args []string) (any, *model.VciError
 // requireCoordinatorRole returns an error when this root does not declare
 // orchestrator = "self", which is the only role permitted to mutate
 // coordinator state through setup.
-func requireCoordinatorRole(l layout.Layout) *model.VciError {
+func requireCoordinatorRole(l model.Layout) *model.VciError {
 	if err := app.RequireCoordinatorRole(l); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return model.NewError("setup_not_initialized", model.FailureConfiguration,

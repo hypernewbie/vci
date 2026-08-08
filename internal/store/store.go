@@ -1,3 +1,10 @@
+// Package store persists a coordinator's durable per-run state.
+// A run's directory holds its record, lease, and result; Store
+// serializes every write behind an advisory lock so concurrent
+// workers and reapers cannot corrupt a run. The package also
+// provides the inter-process lock primitive (Acquire) and the
+// worker-lease helpers (Claim, Renew, Release, Read) that guard
+// a run against concurrent workers.
 package store
 
 import (
@@ -9,10 +16,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"time"
 
-	"github.com/hypernewbie/vci/internal/layout"
-	"github.com/hypernewbie/vci/internal/lock"
 	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/process"
 )
@@ -32,7 +38,7 @@ type RunRecord struct {
 	CancellationRequestedAt *time.Time      `json:"cancellation_requested_at,omitempty"`
 }
 
-type Store struct{ Layout layout.Layout }
+type Store struct{ Layout model.Layout }
 
 func NewRun(project, machine string, command []string, sourceDigest string, snapshot any, now time.Time) (RunRecord, error) {
 	id, err := newID(now)
@@ -91,7 +97,7 @@ func (s Store) Save(record RunRecord) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	unlock, err := lock.Acquire(filepath.Join(dir, "run.lock"))
+	unlock, err := Acquire(filepath.Join(dir, "run.lock"))
 	if err != nil {
 		return err
 	}
@@ -160,7 +166,7 @@ func (s Store) Mutate(id model.RunID, fn func(*RunRecord) error) (RunRecord, err
 	if err != nil {
 		return RunRecord{}, err
 	}
-	unlock, err := lock.Acquire(filepath.Join(dir, "run.lock"))
+	unlock, err := Acquire(filepath.Join(dir, "run.lock"))
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -173,7 +179,7 @@ func (s Store) Mutate(id model.RunID, fn func(*RunRecord) error) (RunRecord, err
 	if err := fn(&record); err != nil {
 		return RunRecord{}, err
 	}
-	if isTerminal(before.State) && !reflect.DeepEqual(before, record) {
+	if model.IsTerminal(before.State) && !reflect.DeepEqual(before, record) {
 		return RunRecord{}, fmt.Errorf("terminal run %s is immutable", id)
 	}
 	if err := validateRecord(record); err != nil {
@@ -183,10 +189,6 @@ func (s Store) Mutate(id model.RunID, fn func(*RunRecord) error) (RunRecord, err
 		return RunRecord{}, err
 	}
 	return record, nil
-}
-
-func isTerminal(state model.RunState) bool {
-	return state == model.RunSucceeded || state == model.RunFailed || state == model.RunLost || state == model.RunAborted
 }
 
 func (s Store) Transition(id model.RunID, to model.RunState, now time.Time) (RunRecord, error) {
@@ -256,4 +258,177 @@ func atomicJSON(path string, data []byte) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func (s Store) PublishResult(id model.RunID, value any) error {
+	dir, err := s.Layout.RunDir(string(id))
+	if err != nil {
+		return err
+	}
+	unlock, err := Acquire(filepath.Join(dir, "run.lock"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	record, err := s.loadPath(filepath.Join(dir, "run.json"), id)
+	if err != nil {
+		return err
+	}
+	if model.IsTerminal(record.State) {
+		return fmt.Errorf("run %s is terminal", id)
+	}
+	path := filepath.Join(dir, "result.json")
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("run %s already has a result", id)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicJSON(path, data)
+}
+
+func (s Store) ReadResult(id model.RunID) (json.RawMessage, error) {
+	dir, err := s.Layout.RunDir(string(id))
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(dir, "result.json"))
+}
+
+type Lease struct {
+	RunID     model.RunID `json:"run_id"`
+	Owner     string      `json:"owner"`
+	ExpiresAt time.Time   `json:"expires_at"`
+}
+
+func Claim(l model.Layout, id model.RunID, owner string, now time.Time, ttl time.Duration) error {
+	dir, err := l.RunDir(string(id))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	unlock, err := Acquire(filepath.Join(dir, "run.lock"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	path := filepath.Join(dir, "lease.json")
+	if existing, err := read(path); err == nil && existing.ExpiresAt.After(now) {
+		return fmt.Errorf("run %s is leased by %s", id, existing.Owner)
+	}
+	data, err := json.Marshal(Lease{RunID: id, Owner: owner, ExpiresAt: now.Add(ttl).UTC()})
+	if err != nil {
+		return err
+	}
+	return atomicJSON(path, data)
+}
+
+func Renew(l model.Layout, id model.RunID, owner string, now time.Time, ttl time.Duration) error {
+	path, err := leasePath(l, id)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	unlock, err := Acquire(filepath.Join(dir, "run.lock"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := read(path)
+	if err != nil {
+		return err
+	}
+	if current.Owner != owner || !current.ExpiresAt.After(now) {
+		return fmt.Errorf("lease for %s is not owned by %s", id, owner)
+	}
+	current.ExpiresAt = now.Add(ttl).UTC()
+	data, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	return atomicJSON(path, data)
+}
+
+func Release(l model.Layout, id model.RunID, owner string) error {
+	path, err := leasePath(l, id)
+	if err != nil {
+		return err
+	}
+	unlock, err := Acquire(filepath.Join(filepath.Dir(path), "run.lock"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := read(path)
+	if err != nil {
+		return err
+	}
+	if current.Owner != owner {
+		return fmt.Errorf("lease for %s is not owned by %s", id, owner)
+	}
+	return os.Remove(path)
+}
+
+func Read(l model.Layout, id model.RunID) (Lease, error) {
+	path, err := leasePath(l, id)
+	if err != nil {
+		return Lease{}, err
+	}
+	return read(path)
+}
+
+// ReadHasNoLease reports whether the named run has no worker lease
+// (the lease file is absent). A corrupt lease file is treated as
+// "has a lease" so the caller does not misclassify it as missing.
+func ReadHasNoLease(l model.Layout, id model.RunID) bool {
+	path, err := leasePath(l, id)
+	if err != nil {
+		return false
+	}
+	if _, err := os.Stat(path); err != nil {
+		return os.IsNotExist(err)
+	}
+	return false
+}
+
+func leasePath(l model.Layout, id model.RunID) (string, error) {
+	dir, err := l.RunDir(string(id))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "lease.json"), nil
+}
+func read(path string) (Lease, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Lease{}, err
+	}
+	var out Lease
+	if err := json.Unmarshal(data, &out); err != nil {
+		return Lease{}, err
+	}
+	return out, nil
+}
+
+func Acquire(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create lock directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open lock: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, nil
 }

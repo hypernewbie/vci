@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hypernewbie/vci/internal/layout"
+	"github.com/hypernewbie/vci/internal/model"
 )
 
 // Role-awareness tests. The orchestrator selector splits Vci roots
@@ -165,7 +165,7 @@ func TestDecodeRejectsMachinesHostField(t *testing.T) {
 
 func TestMutateRejectsClientRootMachineAddition(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), ".vci")
-	l := layout.Layout{Root: dir}
+	l := model.Layout{Root: dir}
 	if err := l.Ensure(); err != nil {
 		t.Fatal(err)
 	}

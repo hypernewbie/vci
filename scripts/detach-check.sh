@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
 root=$(mktemp -d)
-bin=$(mktemp -t vci-bin)
+# BSD mktemp accepts `-t prefix`, but GNU mktemp (the Linux CI
+# runner) requires a template with at least three X's. Use an
+# explicit template so the script runs on both.
+bin=$(mktemp "${TMPDIR:-/tmp}/vci-bin.XXXXXX")
 cleanup() { chmod -R u+rwx "$root" 2>/dev/null || true; rm -rf "$root" 2>/dev/null || true; rm -f "$bin"; }
 trap cleanup EXIT
 go build -o "$bin" ./cmd/vci

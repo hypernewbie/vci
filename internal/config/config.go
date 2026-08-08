@@ -1,28 +1,29 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"github.com/BurntSushi/toml"
+	"github.com/hypernewbie/vci/internal/model"
 	"os"
 	"path"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"unicode"
-
-	"github.com/BurntSushi/toml"
-	"github.com/hypernewbie/vci/internal/layout"
 )
 
 const SchemaVersion = 1
 
-// OrchestratorSelf selects the local coordinator role. Any other non-empty
-// value is treated as an SSH host passed to the ordinary system `ssh`
-// executable by a client root.
+// OrchestratorSelf selects local coordination.
+// Non-empty values are SSH hosts for clients.
 const OrchestratorSelf = "self"
 
-// Config is the on-disk Vci root configuration. The schema has exactly two
-// roles: a coordinator (Orchestrator == OrchestratorSelf) that owns machine,
-// project, retention, and log-limit policy, and a client (any other value)
-// that holds only the orchestrator selector.
+// Config is root config.
+// Coordinator roots define machines, projects, and limits.
+// Client roots only set the orchestrator.
 type Config struct {
 	SchemaVersion int                `toml:"schema_version"`
 	Orchestrator  string             `toml:"orchestrator"`
@@ -39,37 +40,14 @@ type LogLimits struct {
 
 type Retention struct {
 	MaxBytes int64 `toml:"max_bytes"`
-	// SourceCacheBytes optionally overrides the documented default
-	// cache quota. Omitted means the documented default. The value
-	// cannot be set on a client root.
+	// SourceCacheBytes overrides cache quota.
+	// Omitted uses default and is disallowed on client roots.
 	SourceCacheBytes int64 `toml:"source_cache_bytes"`
 }
 
-// Machine is the coordinator-owned inventory entry. MaxConcurrent is the
-// optional local-slot capacity for coordinator-owned parallel runs on this
-// machine. Zero is the compatibility default of one slot.
-//
-// Host is the optional SSH destination that selects the worker host for
-// this machine. Empty means the machine runs on the coordinator host
-// (local). Any other value must pass ValidateMachineHost and is passed to
-// the ordinary system `ssh` executable as a destination argument: the
-// detached worker stages the workspace into the remote
-// `~/.vci/state/work/<run>` tree and runs the selected runtime there. The
-// orchestrator selector above remains the only client-side remote target;
-// Host is coordinator-owned per-slot routing and never appears on a client
-// root.
-//
-// Runtime, Image, and Snapshot are the optional container/VM runtime
-// declaration. The default Runtime is empty (bare host): the project's
-// command runs directly on the machine's host, exactly as before. A
-// `runtime = "docker"` Machine mounts the per-run workspace read-only into
-// the container at /vci/work and runs the command inside it. The image
-// reference is verbatim (the coordinator never builds, pulls, or pins from
-// inside Vci); a digest-shaped value is preferred but tags are accepted as
-// documented. A `runtime = "vm"` Machine shares the per-run workspace
-// read-write with the guest via the system VM binary at /vci/work. Host
-// and Runtime are orthogonal: bare, docker, and vm all run on either the
-// coordinator host or the named remote host.
+// Machine defines one executable slot.
+// MaxConcurrent is local capacity; zero means one.
+// Host is optional SSH destination; runtime selects host/docker/vm behavior.
 type Machine struct {
 	MaxConcurrent int    `toml:"max_concurrent" json:"max_concurrent,omitempty"`
 	Host          string `toml:"host" json:"host,omitempty"`
@@ -78,10 +56,7 @@ type Machine struct {
 	Snapshot      string `toml:"snapshot" json:"snapshot,omitempty"`
 }
 
-// EffectiveCapacity returns the local-slot capacity of a machine. Zero
-// or omitted means one slot for compatibility with the original
-// single-machine configuration. Negative values are rejected by
-// coordinator validation.
+// EffectiveCapacity returns local slot capacity, treating 0 or missing as one.
 func EffectiveCapacity(m Machine) int {
 	if m.MaxConcurrent <= 0 {
 		return 1
@@ -93,25 +68,17 @@ type Project struct {
 	Machines    []string          `toml:"machines" json:"machines"`
 	Command     []string          `toml:"command" json:"command"`
 	Environment map[string]string `toml:"environment" json:"environment,omitempty"`
-	// Artifacts is the optional list of workspace-relative glob
-	// patterns. After the command finishes but before result
-	// publication, each matched regular file is copied to
-	// `state/runs/<run_id>/artifacts/<rel>`. Symlinks, device
-	// files, `..` escapes, and excluded paths (`.git`, `.vci`)
-	// are rejected. The total per-run cap is bounded by the
-	// artifact collector (currently 64 MiB).
+	// Artifacts are optional workspace-relative glob patterns.
+	// Matching regular files are copied into run artifacts; symlinks, devices,
+	// `..`, `.git`, and `.vci` entries are rejected.
 	Artifacts []string `toml:"artifacts,omitempty" json:"artifacts,omitempty"`
-	// HostedFallback is the optional immutable source declaration
-	// for `vci build --hosted <project>`. Either both URL and
-	// Commit are set or the field is treated as absent; partial
-	// declarations are rejected by validation.
+	// HostedFallback is optional source data for `vci build --hosted`.
+	// URL and Commit must both be set or both be empty.
 	HostedFallback HostedFallback `toml:"hosted_fallback" json:"hosted_fallback,omitempty"`
 }
 
-// DefaultLogLimits and DefaultRetention are the coordinator defaults used
-// when a fresh root is initialized. They are also the implicit values for a
-// client root so that an omitted section decodes as the default without
-// declaring coordinator policy.
+// DefaultLogLimits and DefaultRetention are coordinator defaults for new roots
+// and implicit client defaults when fields are omitted.
 var (
 	DefaultLogLimits = LogLimits{StdoutBytes: 4 << 20, StderrBytes: 4 << 20}
 	DefaultRetention = Retention{MaxBytes: 512 << 20}
@@ -142,8 +109,7 @@ func Decode(data []byte) (Config, error) {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
 	if !meta.IsDefined("orchestrator") {
-		// Compatibility for existing local roots that pre-date the
-		// orchestrator selector. Missing means self.
+		// Existing local roots without orchestrator are treated as self.
 		cfg.Orchestrator = OrchestratorSelf
 	}
 	if undecoded := meta.Undecoded(); len(undecoded) != 0 {
@@ -155,11 +121,7 @@ func Decode(data []byte) (Config, error) {
 	return cfg, nil
 }
 
-// Validate enforces role-aware configuration rules. A coordinator root may
-// declare machines, projects, retention, and log limits. A client root may
-// declare only the orchestrator selector; any coordinator-owned field is
-// rejected because it could drift from the coordinator's authoritative
-// state.
+// Validate enforces role-aware configuration rules for coordinator and client roots.
 func Validate(cfg Config) error {
 	if cfg.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("unsupported config schema version %d", cfg.SchemaVersion)
@@ -173,12 +135,9 @@ func Validate(cfg Config) error {
 	return validateClient(cfg)
 }
 
-// ValidateMachineHost enforces the documented machine `host` rules: the
-// value may be empty (the machine runs on the coordinator host) or a strict
-// SSH destination — no whitespace or control characters, no leading `-`
-// (option-like), no `://` scheme, no `..` path segment. The value is passed
-// to the system `ssh` executable as a destination argument, so it must be
-// safe as a positional argument, exactly like ValidateOrchestrator.
+// ValidateMachineHost checks machine hosts for ssh-safe destination format.
+// Empty hosts are local; reject whitespace/control chars, leading '-', schemes,
+// and .. segments.
 func ValidateMachineHost(host string) error {
 	if host == "" {
 		return nil
@@ -202,9 +161,7 @@ func ValidateMachineHost(host string) error {
 	return nil
 }
 
-// ValidateOrchestrator rejects empty, option-like, whitespace, or control-
-// character values. The string is passed to the system `ssh` executable, so
-// it must be safe as a destination argument.
+// ValidateOrchestrator validates an ssh destination string.
 func ValidateOrchestrator(value string) error {
 	if value == "" {
 		return fmt.Errorf("orchestrator value is empty")
@@ -234,7 +191,7 @@ func validateCoordinator(cfg Config) error {
 		return fmt.Errorf("source cache quota is below minimum 4 KB")
 	}
 	for name, machine := range cfg.Machines {
-		if !layout.ValidName(name) {
+		if !model.ValidName(name) {
 			return fmt.Errorf("invalid machine name %q", name)
 		}
 		if machine.MaxConcurrent < 0 {
@@ -248,7 +205,7 @@ func validateCoordinator(cfg Config) error {
 		}
 	}
 	for name, project := range cfg.Projects {
-		if !layout.ValidName(name) {
+		if !model.ValidName(name) {
 			return fmt.Errorf("invalid project name %q", name)
 		}
 		if len(project.Machines) == 0 {
@@ -257,9 +214,10 @@ func validateCoordinator(cfg Config) error {
 		if len(project.Command) == 0 || strings.TrimSpace(project.Command[0]) == "" {
 			return fmt.Errorf("project %q has no command", name)
 		}
-		// The hosted fallback is optional; when both fields are
-		// empty this is a no-op. A partial declaration is rejected
-		// up-front so a setup typo cannot ship a broken checkout.
+		if err := ValidateProjectEnvironment(name, project.Environment); err != nil {
+			return err
+		}
+		// Hosted fallback is optional; if set, both fields must validate.
 		if project.HostedFallback.URL != "" || project.HostedFallback.Commit != "" {
 			if _, err := project.HostedFallback.Validate(); err != nil {
 				return fmt.Errorf("project %q hosted fallback: %w", name, err)
@@ -270,7 +228,7 @@ func validateCoordinator(cfg Config) error {
 		}
 		seen := map[string]bool{}
 		for _, machine := range project.Machines {
-			if !layout.ValidName(machine) {
+			if !model.ValidName(machine) {
 				return fmt.Errorf("project %q has invalid machine %q", name, machine)
 			}
 			if seen[machine] {
@@ -304,10 +262,20 @@ func validateClient(cfg Config) error {
 	return nil
 }
 
-// ValidateProjectArtifacts pins the per-glob rules: not empty, no
-// whitespace or control characters, no leading dash, no scheme, no
-// absolute path, no `..` segment, and a `path.Match`-parseable
-// pattern. The caller is the project-level validator.
+// validEnvKey enforces POSIX env var names.
+var validEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// ValidateProjectEnvironment checks that project env keys are POSIX identifiers.
+func ValidateProjectEnvironment(name string, env map[string]string) error {
+	for key := range env {
+		if !validEnvKey.MatchString(key) {
+			return fmt.Errorf("project %q environment key %q is not a valid POSIX identifier", name, key)
+		}
+	}
+	return nil
+}
+
+// ValidateProjectArtifacts enforces allowed artifact glob format and safety.
 func ValidateProjectArtifacts(name string, globs []string) error {
 	for i, glob := range globs {
 		if err := validateArtifactGlob(glob); err != nil {
@@ -351,4 +319,100 @@ func formatKeys(keys []toml.Key) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ", ")
+}
+
+func acquire(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create config directory: %w", err)
+	}
+	file, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open config lock: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock config: %w", err)
+	}
+	return file, nil
+}
+func release(file *os.File) { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN); _ = file.Close() }
+
+func Initialize(path string) error {
+	file, err := acquire(path)
+	if err != nil {
+		return err
+	}
+	defer release(file)
+	if _, err := os.Stat(path); err == nil {
+		if _, err := Load(path); err != nil {
+			return fmt.Errorf("validate existing config: %w", err)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect config: %w", err)
+	}
+	return saveLocked(path, Defaults())
+}
+
+func Mutate(path string, fn func(*Config) error) error {
+	file, err := acquire(path)
+	if err != nil {
+		return err
+	}
+	defer release(file)
+	cfg, err := Load(path)
+	if err != nil {
+		return err
+	}
+	if err := fn(&cfg); err != nil {
+		return err
+	}
+	return saveLocked(path, cfg)
+}
+
+func saveLocked(path string, cfg Config) error {
+	if err := Validate(cfg); err != nil {
+		return err
+	}
+	var encoded bytes.Buffer
+	if err := toml.NewEncoder(&encoded).Encode(cfg); err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create config temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("protect config temp file: %w", err)
+	}
+	if _, err := tmp.Write(encoded.Bytes()); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write config temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync config temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close config temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("publish config: %w", err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync config directory: %w", err)
+	}
+	return nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }

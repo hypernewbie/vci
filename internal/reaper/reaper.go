@@ -5,21 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hypernewbie/vci/internal/config"
+	"github.com/hypernewbie/vci/internal/host"
+	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/scheduler"
+	"github.com/hypernewbie/vci/internal/source"
+	"github.com/hypernewbie/vci/internal/store"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/hypernewbie/vci/internal/config"
-	"github.com/hypernewbie/vci/internal/host"
-	"github.com/hypernewbie/vci/internal/layout"
-	"github.com/hypernewbie/vci/internal/lease"
-	"github.com/hypernewbie/vci/internal/model"
-	"github.com/hypernewbie/vci/internal/scheduler"
-	"github.com/hypernewbie/vci/internal/source"
-	"github.com/hypernewbie/vci/internal/sourcecache"
-	"github.com/hypernewbie/vci/internal/store"
 )
 
 type Report struct {
@@ -45,18 +41,12 @@ const (
 	// DefaultSourceCacheBytes is the documented default quota used
 	// when no coordinator-owned retention setting supplies one.
 	DefaultSourceCacheBytes = 500 * 1024 * 1024
-	// preStartGrace is the bounded window a freshly-published staging
-	// record may wait for its detached worker to claim a normal
-	// worker lease. During the grace a valid reservation protects the
-	// record from `setup reap`; after the grace expires with no lease,
-	// the reaper marks the run lost and the scheduler reaps the
-	// claim. An active lease overrides claim age entirely: workers
-	// that have already claimed their lease are governed by the
-	// existing lease/renewal rules, never by this grace.
+	// preStartGrace is the short wait after staging publish for a worker lease.
+	// If no lease appears in this window, the run is marked lost.
 	preStartGrace = 60 * time.Second
 )
 
-func Run(l layout.Layout, now time.Time) (Report, error) {
+func Run(l model.Layout, now time.Time) (Report, error) {
 	var report Report
 	runStore := store.Store{Layout: l}
 	active := map[string]bool{}
@@ -73,60 +63,52 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		if loadErr != nil {
 			continue
 		}
-		// Legacy `queued` records: the public build path only spawns
-		// after staging, so a queued record with no lease cannot be a
-		// live submission. Terminalize it as aborted (a distinct
-		// counter from worker losses) and let scheduler reaping free
-		// any orphan claim below.
+		// Legacy queued records are not live without a lease; queueing occurs after staging.
+		// Mark as aborted (distinct counter) and let scheduler reap orphan claims.
 		if record.State == model.RunQueued {
-			if lease.ReadHasNoLease(l, id) {
+			if store.ReadHasNoLease(l, id) {
 				if _, transitionErr := runStore.Transition(id, model.RunAborted, now); transitionErr == nil {
 					report.QueuedAborted++
 				}
 				continue
 			}
 		}
-		if record.State != model.RunStaging && record.State != model.RunRunning {
+		// Only staging, running, and committing states can hold a live lease.
+		// Committing means publish is in progress; if lease is stale or
+		// missing, mark lost so the scheduler can release the claim.
+		if record.State != model.RunStaging && record.State != model.RunRunning && record.State != model.RunCommitting {
 			continue
 		}
-		leaseRecord, leaseErr := lease.Read(l, id)
+		leaseRecord, leaseErr := store.Read(l, id)
 		if leaseErr == nil {
 			if leaseRecord.ExpiresAt.After(now.Add(-renewalGrace)) {
 				active[string(id)] = true
 				continue
 			}
-			// A valid but stale lease is abandoned. The worker, if still alive,
-			// must self-terminate when its renewal fails; reaper never signals it.
+			// Stale lease is abandoned ownership; a live worker exits on renewal failure.
+			// Reaper only updates state.
 			if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
 				report.MarkedLost++
 			}
 			continue
 		}
 		if !os.IsNotExist(leaseErr) {
-			// Corrupt lease metadata: leave the run untouched. A later
-			// pass with a healthy lease file is responsible for the
-			// terminal decision.
+			// Ignore corrupt lease metadata until a later healthy lease file appears.
 			continue
 		}
-		// No lease. For a staging record, the only thing that can
-		// justify retaining it is a fresh, valid scheduler
-		// reservation younger than the pre-start grace. Claim age is
-		// never used to kill a run that has already claimed its
-		// worker lease; an active lease path is handled above.
+		// No lease on staging: keep only while reservation is newer than preStartGrace.
+		// Ignore claim age once a lease exists; active leases are handled above.
 		if record.State == model.RunStaging {
 			res, resErr := scheduler.ReservationFor(l, record.Machine, id)
 			if resErr != nil {
-				// Missing or corrupt reservation: the detached worker
-				// never had a slot to claim. Terminalize as lost so
-				// the slot is freed for the next submission.
+				// Missing or corrupt reservation means no slot was claimed; mark lost to free it.
 				if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
 					report.MarkedLost++
 				}
 				continue
 			}
 			if now.Sub(res.CreatedAt) < preStartGrace {
-				// Within the grace; the worker may still be racing to
-				// claim its lease.
+				// Within grace window, worker may still claim lease.
 				continue
 			}
 			if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
@@ -134,7 +116,7 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 			}
 			continue
 		}
-		// Running with no lease is a stale orphan: mark lost.
+		// Running/committing without lease is a stale orphan; mark lost and release claim.
 		if _, transitionErr := runStore.Transition(id, model.RunLost, now); transitionErr == nil {
 			report.MarkedLost++
 		}
@@ -154,9 +136,9 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 			if active[id] {
 				continue
 			}
-			if _, err := runStore.Load(model.RunID(id)); err == nil {
-				if record, _ := runStore.Load(model.RunID(id)); record.State == model.RunStaging || record.State == model.RunRunning {
-					if _, leaseErr := lease.Read(l, model.RunID(id)); leaseErr == nil {
+			if record, err := runStore.Load(model.RunID(id)); err == nil {
+				if record.State == model.RunStaging || record.State == model.RunRunning {
+					if _, leaseErr := store.Read(l, model.RunID(id)); leaseErr == nil {
 						continue
 					}
 				}
@@ -176,10 +158,8 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		report.TransferRemoved = removed
 	}
 
-	// Per-run workspace and remote turd ownership. The reaper owns
-	// state/work/<run>/.tmp, .home, and the workspace itself after a
-	// terminal run's lease is gone, plus the mirrored remote tree for
-	// host machines. See reapWorkDirs and reapRemoteTurds.
+	// Reap per-run workspace artifacts and remote mirrors after lease expiry.
+	// Includes state/work/<run>/.tmp, .home, workspace, and remote copy for host-backed runs.
 	if tmpRemoved, workspacesRemoved, err := reapWorkDirs(l, now); err != nil {
 		return report, err
 	} else {
@@ -204,10 +184,7 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		report.SchedulerClaimsReleased = released
 	}
 
-	// Reaper-owned artifact retention: artifacts of lost/aborted runs
-	// older than transferStaleAge are removed. Succeeded and failed
-	// runs keep their artifacts until the run itself is reaped by the
-	// existing retention passes.
+	// Reap artifacts for lost/aborted runs; other states follow normal retention.
 	if reaped, err := ReapArtifacts(l, now); err != nil {
 		return report, err
 	} else {
@@ -217,64 +194,9 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 	return report, nil
 }
 
-// SourceCacheQuota returns the effective source-cache quota for a
-// coordinator config: the configured retention.source_cache_bytes when
-// positive, otherwise the documented default. Admission before
-// publication and the reaper share this rule, so a config that omits
-// the setting cannot publish without a bound.
-func SourceCacheQuota(cfg config.Config) int64 {
-	if cfg.Retention.SourceCacheBytes <= 0 {
-		return DefaultSourceCacheBytes
-	}
-	return cfg.Retention.SourceCacheBytes
-}
-
-// sourceCacheQuota returns the configured source-cache quota in
-// bytes, falling back to DefaultSourceCacheBytes when the
-// coordinator-owned setting is zero. Loading the config is best-
-// effort: a malformed config simply gets the documented default.
-func sourceCacheQuota(l layout.Layout) int64 {
-	if l.Root == "" {
-		return DefaultSourceCacheBytes
-	}
-	cfg, err := config.Load(l.ConfigPath())
-	if err != nil {
-		return DefaultSourceCacheBytes
-	}
-	return SourceCacheQuota(cfg)
-}
-
-// cacheScratchAge is how old a cache partial or lock must be before
-// the reaper removes it. Publication holds locks only for the duration
-// of one verified copy, and partials are either published or discarded
-// synchronously, so anything older is abandoned scratch.
-const cacheScratchAge = time.Hour
-
-// ReapSourceCache enforces the configured quota and removes stale
-// Vci-owned cache scratch (partials and locks). The return values give
-// the machine-readable maintenance report: removed entries, removed
-// scratch items, retained bytes (active entries always counted), the
-// configured quota, and how many oversize candidates could not be
-// admitted by eviction.
-func ReapSourceCache(cacheDir string, maxBytes int64) (int, int, int64, int64, int, error) {
-	removed, totalBytes, rejected, err := sourcecache.EnforceQuota(cacheDir, maxBytes)
-	if err != nil {
-		return 0, 0, 0, maxBytes, 0, err
-	}
-	scratchRemoved, err := sourcecache.ReapStaleScratch(cacheDir, time.Now().UTC(), cacheScratchAge)
-	if err != nil {
-		return removed, 0, totalBytes, maxBytes, rejected, err
-	}
-	return removed, scratchRemoved, totalBytes, maxBytes, rejected, nil
-}
-
-// reapTransferDirs removes stale direct-SSH transfer staging directories,
-// client materialization snapshots, and coordinator-owned pinned Git
-// checkouts under the Vci-owned TempDir. It only matches the explicit
-// `vci-source-`, legacy `vci-source.`, `vci-snapshot-`, or `vci-hosted-`
-// prefixes and never traverses arbitrary TMPDIR content. Stale means the
-// directory has not been modified within transferStaleAge. The reaper
-// never signals any process.
+// reapTransferDirs prunes TempDir subdirectories with prefixes vci-source-,
+// vci-source., vci-snapshot-, or vci-hosted-. A directory is removed
+// when its mod time is older than transferStaleAge.
 func reapTransferDirs(tempDir string, now time.Time) (int, error) {
 	entries, err := os.ReadDir(tempDir)
 	if err != nil {
@@ -311,17 +233,10 @@ func removeTree(path string) error {
 	return os.RemoveAll(path)
 }
 
-// ReapArtifacts removes the collected artifacts directory
-// (state/runs/<run>/artifacts) of lost and aborted runs whose run
-// record is older than transferStaleAge. The age is the record's
-// last transition time (when the run became lost/aborted), falling
-// back to the artifacts directory mtime when the timestamp is absent.
-// Succeeded and failed runs keep their artifacts until the run itself
-// is reaped by the existing retention passes, and live-lease runs are
-// never touched: a freshly terminalized run is younger than the age
-// gate, so the reaper cannot race a terminalizing worker. Returns the
-// number of artifacts directories removed.
-func ReapArtifacts(l layout.Layout, now time.Time) (int, error) {
+// ReapArtifacts removes artifact directories for lost/aborted runs older than transferStaleAge.
+// Succeeded and failed runs keep artifacts for other retention passes.
+// Returns removed directory count.
+func ReapArtifacts(l model.Layout, now time.Time) (int, error) {
 	entries, err := os.ReadDir(l.RunsDir())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -370,23 +285,9 @@ func ReapArtifacts(l layout.Layout, now time.Time) (int, error) {
 	return reaped, nil
 }
 
-// isTerminal reports whether a run state is final and immutable.
-func isTerminal(state model.RunState) bool {
-	return state == model.RunSucceeded || state == model.RunFailed || state == model.RunLost || state == model.RunAborted
-}
-
-// reapWorkDirs owns per-run workspace cleanup under state/work:
-//   - `.tmp`/`.home` subdirs inside a workspace that is no longer
-//     protected by a live worker lease are removed when older than
-//     transferStaleAge (a live run owns its temp roots);
-//   - a whole workspace is removed when its run record is terminal
-//     and its worker lease is gone — the worker already released the
-//     lease only after removeOwned, so a terminal record with no
-//     live lease cannot race a live worker.
-//
-// Returns the number of per-run temp roots removed and the number of
-// whole workspaces removed.
-func reapWorkDirs(l layout.Layout, now time.Time) (int, int, error) {
+// reapWorkDirs removes stale temp roots and terminal workspaces without live leases.
+// Returns counts of temp-root and workspace removals.
+func reapWorkDirs(l model.Layout, now time.Time) (int, int, error) {
 	entries, err := os.ReadDir(l.WorkDir())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -405,12 +306,11 @@ func reapWorkDirs(l layout.Layout, now time.Time) (int, int, error) {
 			continue
 		}
 		record, loadErr := runStore.Load(id)
-		leaseRecord, leaseErr := lease.Read(l, id)
+		leaseRecord, leaseErr := store.Read(l, id)
 		liveLease := leaseErr == nil && leaseRecord.ExpiresAt.After(now.Add(-renewalGrace))
-		terminal := loadErr == nil && isTerminal(record.State)
+		terminal := loadErr == nil && model.IsTerminal(record.State)
 		workDir := filepath.Join(l.WorkDir(), entry.Name())
-		// 1. Stale per-run temp roots. Only when no live lease: a
-		// live worker owns .tmp/.home and may still be writing them.
+		// Remove stale .tmp/.home only when no live lease exists.
 		if !liveLease {
 			for _, sub := range []string{".tmp", ".home"} {
 				p := filepath.Join(workDir, sub)
@@ -426,7 +326,7 @@ func reapWorkDirs(l layout.Layout, now time.Time) (int, int, error) {
 				}
 			}
 		}
-		// 2. Whole workspace: terminal run, lease gone.
+		// Remove whole workspace for terminal runs without a live lease.
 		if terminal && !liveLease {
 			if err := removeTree(workDir); err != nil {
 				return tmpRemoved, workspacesRemoved, err
@@ -437,14 +337,10 @@ func reapWorkDirs(l layout.Layout, now time.Time) (int, int, error) {
 	return tmpRemoved, workspacesRemoved, nil
 }
 
-// reapRemoteTurds sweeps the mirrored remote workspace trees of
-// terminal runs whose reserved machine declared a remote host. A
-// terminal run whose worker lease is gone cannot have a live remote
-// worker, so the remote `~/.vci/state/work/<run>` tree is a turd
-// owned by the reaper. Cleanup is best-effort: an unreachable or
-// misconfigured host counts as nothing to report, and every ssh call
-// is bounded by CleanupRemote's timeout.
-func reapRemoteTurds(l layout.Layout, now time.Time) int {
+// reapRemoteTurds removes mirrored remote workspace trees for terminal
+// runs on remote hosts. If host is unreachable or misconfigured, cleanup is
+// best-effort and ignored. All ssh calls are timeout-bound in CleanupRemote.
+func reapRemoteTurds(l model.Layout, now time.Time) int {
 	runStore := store.Store{Layout: l}
 	entries, err := os.ReadDir(l.RunsDir())
 	if err != nil {
@@ -460,13 +356,12 @@ func reapRemoteTurds(l layout.Layout, now time.Time) int {
 			continue
 		}
 		record, loadErr := runStore.Load(id)
-		if loadErr != nil || !isTerminal(record.State) {
+		if loadErr != nil || !model.IsTerminal(record.State) {
 			continue
 		}
-		leaseRecord, leaseErr := lease.Read(l, id)
+		leaseRecord, leaseErr := store.Read(l, id)
 		if leaseErr == nil && leaseRecord.ExpiresAt.After(now.Add(-renewalGrace)) {
-			// The worker may still be terminalizing; its lease is
-			// released only after removeOwned completes.
+			// Skip if worker lease is still active while terminalization finishes.
 			continue
 		}
 		hostName, ok := remoteHostFor(record)
@@ -484,10 +379,8 @@ func reapRemoteTurds(l layout.Layout, now time.Time) int {
 	return cleaned
 }
 
-// remoteHostFor returns the machine host of a run's reserved machine
-// by decoding the durable config snapshot. A missing or malformed
-// snapshot, an unknown machine, or an empty host yields ok=false: the
-// reaper never invokes ssh on guesswork.
+// remoteHostFor reads the durable config snapshot and returns the reserved machine host.
+// Returns ok=false for missing/malformed snapshot, unknown machine, or empty host.
 func remoteHostFor(record store.RunRecord) (string, bool) {
 	var snap struct {
 		Machine  string                    `json:"machine"`
@@ -507,13 +400,8 @@ func remoteHostFor(record store.RunRecord) (string, bool) {
 	return machine.Host, true
 }
 
-// CleanupRemote removes a Vci-owned remote tree via the ordinary
-// system `ssh` executable: `ssh <host> rm -rf -- <path>`. Both the
-// host and the path are strictly validated before any subprocess
-// runs, and the validated path is embedded as exactly one shell word
-// (a fixed layout plus a validated run id), so a crafted machine host
-// or run id can never inject shell text. The call is bounded by a
-// 30-second timeout so an unreachable host cannot wedge maintenance.
+// CleanupRemote validates host and path then runs `ssh <host> rm -rf -- <path>`.
+// Inputs are validated and execution is bounded by a 30-second timeout.
 func CleanupRemote(ctx context.Context, hostName, remotePath string) error {
 	if err := host.ValidateHost(hostName); err != nil {
 		return err

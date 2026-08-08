@@ -18,7 +18,29 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   check=$(go run ./cmd/vci check "$run_id")
   state=$(printf '%s\n' "$check" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"].get("state"))')
   [ "$state" = succeeded ] && break
-  [ "$state" = failed ] && { printf '%s\n' "$check"; exit 1; }
+  [ "$state" = failed ] && {
+    printf '%s\n' "$check"
+    # The run record names the job's stdout/stderr logs under Vci
+    # state; print their tails so a CI failure names the failing
+    # test instead of only the envelope.
+    printf '%s\n' "$check" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["data"]
+for key in ("stdout_path", "stderr_path"):
+    path = d.get(key)
+    if not path:
+        continue
+    print("--- %s: %s (last 100 lines) ---" % (key, path))
+    try:
+        with open(path, "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+        lines = text.splitlines()
+        print("\n".join(lines[-100:]))
+    except OSError as exc:
+        print("(unreadable: %s)" % exc)
+'
+    exit 1
+  }
   sleep 1
 done
 if [ "$state" != succeeded ]; then

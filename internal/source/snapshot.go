@@ -1,79 +1,38 @@
 package source
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
-// Shared prefix/filename constants used by the Go-side writers and
-// readers of Vci-owned staging trees and snapshot directories. Shell
-// scripts that reference the same paths embed the literal strings by
-// necessity; this is the single Go-side source of truth.
+// Prefixes for Vci-owned snapshot and staging names used by scripts.
 const (
-	// SnapshotPrefix is the basename prefix of every Vci-owned
-	// settled-snapshot directory under the coordinator/client temp
-	// directory. The reaper sweeps only this prefix and never
-	// traverses arbitrary TMPDIR content.
+	// SnapshotPrefix names Vci-owned snapshot temp directories.
 	SnapshotPrefix = "vci-snapshot-"
-	// StagingPrefix is the basename prefix of every Vci-owned direct
-	// SSH staging directory under the coordinator temp directory.
+	// StagingPrefix names Vci-owned direct-SSH staging directories.
 	StagingPrefix = "vci-source-"
-	// HostedPrefix is the basename prefix of every Vci-owned pinned
-	// Git checkout directory produced by `source.Checkout`. The
-	// reaper sweeps only this prefix and never traverses arbitrary
-	// TMPDIR content. A pinned checkout is never reused between
-	// runs; a fresh rand suffix is generated per invocation.
+	// HostedPrefix names Vci-owned pinned Git checkout directories.
 	HostedPrefix = "vci-hosted-"
-	// StagingMetaName is the basename of the metadata file the
-	// staging fragment writes inside each staging directory so the
-	// coordinator can rebuild the validated cache key.
+	// StagingMetaName is the metadata filename used inside each staging directory.
 	StagingMetaName = "vci-meta"
 )
 
-// allowedTopLevelGitMarkers is the closed set of `.git`-prefixed
-// paths that may survive into the materialized snapshot at the top
-// level. These three markers are the minimum required for the
-// remote `source.Discover` to recognize the staged tree as a Git
-// repository directory via `git rev-parse --show-toplevel`. They
-// are the only signals the direct-SSH local source path appends to
-// the selected file list at the top level (see buildGraph in
-// submodule.go). All other `.git` content (config, hooks, logs,
-// packed-refs, objects/pack, branches, index, info) stays excluded
-// at every depth because gitlinks, not the `.git` directory, are
-// the contracted path-restoration signal.
+// allowedTopLevelGitMarkers keeps only repository-root markers for discovery:
+// .git/HEAD, .git/objects, .git/refs; all other git paths are excluded.
 var allowedTopLevelGitMarkers = map[string]bool{
 	".git/HEAD":    true,
 	".git/objects": true,
 	".git/refs":    true,
 }
 
-// MaterializeSnapshot copies the selected build input into a new
-// Vci-owned directory under destParent, preserving relative paths,
-// regular-file mode bits, and symlinks. Listed directories are created
-// as empty directories; private configuration such as .git/config is
-// not selected and therefore never copied.
-//
-// The input is validated against the canonical-entry contract before
-// any file is written: every entry must be a safe relative path. The
-// caller need not pre-validate; MaterializeSnapshot is the sole
-// producer of the snapshot tree and enforces the contract locally.
-//
-// After the snapshot is populated, LFS-attributed regular files are
-// checked against the formal pointer format. A pointer is rejected
-// with ErrLFSContentUnavailable naming the top-relative path so the
-// agent can run `git lfs pull`. Attribute semantics, not magic
-// content alone, decide rejection: a non-LFS file with pointer-
-// looking bytes is ordinary source data.
-//
-// The returned root contains exactly the selected input, so a digest
-// computed over it matches a digest recomputed over the coordinator's
-// tar-extracted copy: the client archives this settled snapshot, never
-// the live working tree, and no source mutation between digest
-// computation and archive production can change the archived bytes.
-//
-// destParent must exist and be Vci-owned. The caller owns removal of
-// the returned root on success, error, and cancellation.
+// MaterializeSnapshot validates and copies selected input into a new snapshot directory,
+// runs LFS checks, and returns the snapshot path.
+// Caller must remove the snapshot root; destParent must exist.
 func MaterializeSnapshot(input SourceInput, destParent string) (string, error) {
 	validated, err := ValidateInput(input)
 	if err != nil {
@@ -92,15 +51,8 @@ func MaterializeSnapshot(input SourceInput, destParent string) (string, error) {
 	}
 	for _, p := range validated.Files {
 		if isExcludedComponent(p) && !allowedTopLevelGitMarkers[p] {
-			// Defensive: validated input should never carry an
-			// excluded component, but the consumer-trust contract
-			// is preserved either way. The three top-level
-			// minimal git markers are explicitly allowed because
-			// the direct-SSH local source path appends them so
-			// the remote `vci build .` can resolve the repository
-			// root via `source.Discover`. Nested `.git` at any
-			// depth, `.gitmodules` at any depth, and any
-			// non-marker `.git` content stays excluded.
+			// Allow required top-level git markers for discovery; exclude all other
+			// nested git paths, .gitmodules, and non-marker .git contents.
 			continue
 		}
 		src := filepath.Join(validated.Root, p)
@@ -154,4 +106,99 @@ func MaterializeSnapshot(input SourceInput, destParent string) (string, error) {
 		return "", err
 	}
 	return root, nil
+}
+
+// CanonicalInput is the hash-relevant snapshot entry payload used for digests.
+// It keeps only fields meaningful for byte-for-byte reproducibility.
+type CanonicalInput struct {
+	Path   string
+	Kind   string // "file", "symlink", "dir"
+	Mode   string // octal mode bits (regular files only)
+	Target string // symlink target or empty
+	Bytes  []byte // empty for non-regular entries
+}
+
+// CanonicalizeSnapshot walks root, captures normalized file/dir/symlink entries,
+// sorts them by path, and omits directory/symlink mode details.
+func CanonicalizeSnapshot(root string) ([]CanonicalInput, error) {
+	var entries []CanonicalInput
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		if rel == "." {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return infoErr
+		}
+		entry := CanonicalInput{Path: filepath.ToSlash(rel)}
+		switch {
+		case d.Type()&os.ModeSymlink != 0:
+			target, readErr := os.Readlink(path)
+			if readErr != nil {
+				return fmt.Errorf("snapshot digest readlink %s: %w", rel, readErr)
+			}
+			entry.Kind = "symlink"
+			entry.Target = target
+		case d.IsDir():
+			entry.Kind = "dir"
+		case info.Mode().IsRegular():
+			entry.Kind = "file"
+			entry.Mode = fmt.Sprintf("%o", info.Mode().Perm())
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return fmt.Errorf("snapshot digest read %s: %w", rel, readErr)
+			}
+			entry.Bytes = data
+		default:
+			return fmt.Errorf("snapshot digest: unsupported entry %s", rel)
+		}
+		entries = append(entries, entry)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries, nil
+}
+
+// CanonicalDigest returns a sha256 hash of canonical entries as "sha256-<64 hex>".
+func CanonicalDigest(canonical []CanonicalInput) string {
+	h := sha256.New()
+	for _, entry := range canonical {
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00", entry.Path, entry.Kind, entry.Mode, entry.Target)
+		if entry.Kind == "file" {
+			h.Write(entry.Bytes)
+		}
+		h.Write([]byte{0})
+	}
+	return "sha256-" + hex.EncodeToString(h.Sum(nil))
+}
+
+// ComputeSnapshotDigest computes the canonical snapshot digest for cache validation.
+func ComputeSnapshotDigest(root string) (string, error) {
+	canonical, err := CanonicalizeSnapshot(root)
+	if err != nil {
+		return "", err
+	}
+	return CanonicalDigest(canonical), nil
+}
+
+// VerifySnapshot recomputes and checks a snapshot digest against the expected value.
+func VerifySnapshot(root string, expected string) error {
+	got, err := ComputeSnapshotDigest(root)
+	if err != nil {
+		return err
+	}
+	if got != expected {
+		return fmt.Errorf("snapshot digest mismatch: want %s got %s", expected, got)
+	}
+	return nil
 }

@@ -5,17 +5,17 @@ import (
 	"sort"
 
 	"github.com/hypernewbie/vci/internal/config"
-	"github.com/hypernewbie/vci/internal/layout"
+	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/scheduler"
 	"github.com/hypernewbie/vci/internal/store"
 )
 
-func load(l layout.Layout) (config.Config, error) { return config.Load(l.ConfigPath()) }
+func load(l model.Layout) (config.Config, error) { return config.Load(l.ConfigPath()) }
 
 // RequireCoordinatorRole returns an error when the configured root does
 // not declare orchestrator = "self". Used by setup mutation paths so a
 // client root cannot drift the coordinator's authoritative state.
-func RequireCoordinatorRole(l layout.Layout) error {
+func RequireCoordinatorRole(l model.Layout) error {
 	cfg, err := config.Load(l.ConfigPath())
 	if err != nil {
 		return err
@@ -26,8 +26,8 @@ func RequireCoordinatorRole(l layout.Layout) error {
 	return nil
 }
 
-func AddMachine(l layout.Layout, name string, machine config.Machine) error {
-	if !layout.ValidName(name) {
+func AddMachine(l model.Layout, name string, machine config.Machine) error {
+	if !model.ValidName(name) {
 		return fmt.Errorf("invalid machine name %q", name)
 	}
 	if machine.MaxConcurrent < 0 {
@@ -45,7 +45,7 @@ func AddMachine(l layout.Layout, name string, machine config.Machine) error {
 	})
 }
 
-func RemoveMachine(l layout.Layout, name string) error {
+func RemoveMachine(l model.Layout, name string) error {
 	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
 		if _, exists := cfg.Machines[name]; !exists {
 			return fmt.Errorf("machine %q does not exist", name)
@@ -62,8 +62,8 @@ func RemoveMachine(l layout.Layout, name string) error {
 	})
 }
 
-func AddProject(l layout.Layout, name string, project config.Project) error {
-	if !layout.ValidName(name) {
+func AddProject(l model.Layout, name string, project config.Project) error {
+	if !model.ValidName(name) {
 		return fmt.Errorf("invalid project name %q", name)
 	}
 	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
@@ -75,14 +75,11 @@ func AddProject(l layout.Layout, name string, project config.Project) error {
 	})
 }
 
-// SetHostedFallback records a coordinator-owned hosted fallback for
-// the named project. The URL and commit are validated through
-// config.Validate before the mutation is persisted; an invalid pair
-// is rejected with ErrHostedFallbackInvalid so a setup typo cannot
-// ship a broken checkout. A client root returns an error before any
-// mutation is attempted.
-func SetHostedFallback(l layout.Layout, project, url, commit string) error {
-	if !layout.ValidName(project) {
+// SetHostedFallback sets hosted fallback on a coordinator project.
+// It validates URL and commit before writing config.
+// Client roots cannot call it.
+func SetHostedFallback(l model.Layout, project, url, commit string) error {
+	if !model.ValidName(project) {
 		return fmt.Errorf("invalid project name %q", project)
 	}
 	if _, err := (config.HostedFallback{URL: url, Commit: commit}).Validate(); err != nil {
@@ -102,12 +99,11 @@ func SetHostedFallback(l layout.Layout, project, url, commit string) error {
 	})
 }
 
-// ClearHostedFallback removes the configured hosted fallback for the
-// named project. A client root returns an error before any mutation
-// is attempted. A missing project name is an error so the operator
-// can correct the typo without silently no-op'ing.
-func ClearHostedFallback(l layout.Layout, project string) error {
-	if !layout.ValidName(project) {
+// ClearHostedFallback removes hosted fallback from a project.
+// Client roots cannot call it.
+// Error if the project is missing.
+func ClearHostedFallback(l model.Layout, project string) error {
+	if !model.ValidName(project) {
 		return fmt.Errorf("invalid project name %q", project)
 	}
 	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
@@ -140,7 +136,7 @@ type Inventory struct {
 	Projects []ProjectView `json:"projects"`
 }
 
-func ReadInventory(l layout.Layout) (Inventory, error) {
+func ReadInventory(l model.Layout) (Inventory, error) {
 	cfg, err := load(l)
 	if err != nil {
 		return Inventory{}, err
@@ -181,4 +177,11 @@ func ReadInventory(l layout.Layout) (Inventory, error) {
 		out.Projects = append(out.Projects, ProjectView{Name: name, Project: cfg.Projects[name]})
 	}
 	return out, nil
+}
+
+func Initialize(l model.Layout) error {
+	if err := l.Ensure(); err != nil {
+		return err
+	}
+	return config.Initialize(l.ConfigPath())
 }

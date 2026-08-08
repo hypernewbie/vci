@@ -3,57 +3,26 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/hypernewbie/vci/internal/config"
+	"github.com/hypernewbie/vci/internal/host"
+	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/process"
+	"github.com/hypernewbie/vci/internal/reaper"
+	"github.com/hypernewbie/vci/internal/runtime"
+	"github.com/hypernewbie/vci/internal/source"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
-
-	"github.com/hypernewbie/vci/internal/config"
-	"github.com/hypernewbie/vci/internal/layout"
-	"github.com/hypernewbie/vci/internal/model"
-	"github.com/hypernewbie/vci/internal/process"
-	"github.com/hypernewbie/vci/internal/source"
-	"github.com/hypernewbie/vci/internal/sourcecache"
+	"time"
 )
 
-// safeCacheKey is the validated, structured set of fields that may
-// compose a remote cache shell fragment. Building remote text from a
-// typed value keeps every shell-embedding call site from ever seeing
-// client-controlled bytes. The format version is a single constant
-// owned by the sourcecache package (sourcecache.FormatVersion); no
-// second layout string exists.
-type safeCacheKey struct {
-	Digest  string // sha256-<64-lowercase-hex>
-	Project string // layout.ValidName
-}
-
-// validateCacheKey returns a safeCacheKey ready for remote-shell
-// composition or an error explaining which field failed. An empty or
-// invalid digest is rejected so callers do not invent a fallback
-// identifier. The shape check is delegated to sourcecache.ValidDigest
-// so the app and the cache cannot drift.
-func validateCacheKey(digest, project string) (safeCacheKey, error) {
-	if !layout.ValidName(project) {
-		return safeCacheKey{}, fmt.Errorf("repository name %q cannot name a remote project", project)
-	}
-	if !sourcecache.ValidDigest(digest) {
-		return safeCacheKey{}, fmt.Errorf("source digest %q is not sha256-<64-lowercase-hex>", digest)
-	}
-	if _, err := hex.DecodeString(strings.TrimPrefix(digest, "sha256-")); err != nil {
-		return safeCacheKey{}, fmt.Errorf("source digest %q has invalid hex: %w", digest, err)
-	}
-	return safeCacheKey{Digest: digest, Project: project}, nil
-}
-
-// RemoteConfigured reports whether this root selects direct SSH for any
-// command. The answer is driven by the top-level `orchestrator`
-// selector. `self` (the coordinator) returns false; any other value
-// is treated as the SSH destination for a client root.
-func RemoteConfigured(l layout.Layout) (bool, error) {
+// RemoteConfigured reports whether this layout uses a client SSH target.
+func RemoteConfigured(l model.Layout) (bool, error) {
 	host, err := remoteOrchestrator(l)
 	if err != nil {
 		return false, err
@@ -63,7 +32,7 @@ func RemoteConfigured(l layout.Layout) (bool, error) {
 
 // remoteOrchestrator returns the SSH destination for a client root and an
 // empty string for a coordinator root.
-func remoteOrchestrator(l layout.Layout) (string, error) {
+func remoteOrchestrator(l model.Layout) (string, error) {
 	cfg, err := config.Load(l.ConfigPath())
 	if err != nil {
 		return "", err
@@ -74,17 +43,9 @@ func remoteOrchestrator(l layout.Layout) (string, error) {
 	return cfg.Orchestrator, nil
 }
 
-// RemoteBuild materializes a private Vci-owned snapshot of the selected
-// build input, computes the content digest from that settled snapshot,
-// and archives exactly that snapshot over ordinary SSH into a remote
-// staging directory under the coordinator's Vci root. If the
-// coordinator already owns a completed immutable cache entry for the
-// same (format version, digest, project) key, no tar producer starts:
-// the public remote `vci build .` runs directly from the verified entry.
-//
-// The remote run identity is returned unchanged; no local run record is
-// created and no remote run files are inspected.
-func RemoteBuild(ctx context.Context, l layout.Layout, sourcePath string) ([]byte, bool, error) {
+// RemoteBuild snapshots selected input, computes its digest, and streams it
+// to remote staging over SSH.
+func RemoteBuild(ctx context.Context, l model.Layout, sourcePath string) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
@@ -95,14 +56,11 @@ func RemoteBuild(ctx context.Context, l layout.Layout, sourcePath string) ([]byt
 	}
 	// Validate the repository basename immediately, before any
 	// further work touches remote shell text or staging directories.
-	if !layout.ValidName(input.ProjectName) {
+	if !model.ValidName(input.ProjectName) {
 		return nil, true, fmt.Errorf("repository name %q cannot name a remote project", input.ProjectName)
 	}
 
-	// Materialize the settled snapshot first. The digest is computed
-	// over this snapshot and this exact snapshot is archived, so a
-	// source mutation between digest computation and archive
-	// production cannot change the bytes the coordinator verifies.
+	// Materialize one snapshot so the digest and archive come from identical bytes.
 	if err := os.MkdirAll(l.TempDir(), 0o700); err != nil {
 		return nil, true, fmt.Errorf("prepare client snapshot dir: %w", err)
 	}
@@ -121,9 +79,7 @@ func RemoteBuild(ctx context.Context, l layout.Layout, sourcePath string) ([]byt
 		return nil, true, err
 	}
 
-	// Try remote cache lookup over SSH first. The cache probe is built
-	// from the validated cache key and the sourcecache layout helpers,
-	// never from raw client text.
+	// Try remote source cache lookup over SSH before uploading the snapshot.
 	cacheScript := buildCacheProbeScript(key)
 	raw, err := runSSH(ctx, host, cacheScript)
 	if err == nil && validEnvelope(raw) {
@@ -138,45 +94,14 @@ func RemoteBuild(ctx context.Context, l layout.Layout, sourcePath string) ([]byt
 	return raw, remote, err
 }
 
-// buildCacheProbeScript returns the small SSH-side fragment that asks
-// the coordinator whether a completed cache entry exists. The shell
-// text references only the validated cache key fields and the layout
-// produced by sourcecache.EntryRootRel/EntryTreeRel, so the probe
-// path can never diverge from the Go-side publication layout.
-func buildCacheProbeScript(key safeCacheKey) string {
-	if !layout.ValidName(key.Project) || !sourcecache.ValidDigest(key.Digest) {
-		// Caller error: validateCacheKey rejects this upstream.
-		return "exit 1"
-	}
-	parent := sourcecache.EntryRootRel(key.Digest, key.Project)
-	tree := sourcecache.EntryTreeRel(key.Digest, key.Project)
-	return fmt.Sprintf(`set -eu
-ROOT="${VCI_ROOT:-$HOME/.vci}"
-CACHE="$ROOT/state/source-cache"
-PARENT="$CACHE/%s"
-TREE="$CACHE/%s"
-if [ -f "$PARENT/complete" ] && [ -f "$PARENT/meta.json" ]; then
-	cd "$TREE"
-	vci build .
-else
-	exit 42
-fi
-`, parent, tree)
-}
-
-// buildOverStaging composes a single ssh session that owns the entire
-// staging lifecycle: mkdir, populate from a client tar stream of the
-// settled snapshot, run the public `vci build .` from the staged
-// project directory, and trap-based cleanup. The validated cache key
-// fields are the only inputs that reach the remote shell. The number of
-// source bytes handed to the system tar is returned so the caller can
-// report transport facts.
+// buildOverStaging uploads the tar stream over SSH, runs the remote build,
+// and returns output plus tar bytes sent.
 func buildOverStaging(ctx context.Context, host string, input source.SourceInput, snapshotRoot string, key safeCacheKey) ([]byte, bool, int64, error) {
-	if !layout.ValidName(input.ProjectName) {
+	if !model.ValidName(input.ProjectName) {
 		return nil, true, 0, fmt.Errorf("repository name %q cannot name a remote project", input.ProjectName)
 	}
 
-	tarCmd := exec.CommandContext(ctx, "tar", "-cf", "-", "-C", snapshotRoot, "--null", "-T", "-", "--no-recursion")
+	tarCmd := exec.CommandContext(ctx, "tar", "-cf", "-", "-C", snapshotRoot, "--no-recursion", "--null", "-T", "-")
 	var pathBuf bytes.Buffer
 	for _, p := range input.Files {
 		pathBuf.WriteString(p)
@@ -219,9 +144,8 @@ func buildOverStaging(ctx context.Context, host string, input source.SourceInput
 	return stdout.Bytes(), true, counter.n, nil
 }
 
-// countingReader counts the bytes read from an underlying reader. The
-// client wraps the tar stream with it so the source bytes supplied to
-// SSH are a measured fact, not an inference from elapsed time.
+// countingReader counts bytes read from an underlying reader.
+// Used to measure exact tar bytes sent to SSH.
 type countingReader struct {
 	r io.Reader
 	n int64
@@ -233,46 +157,9 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// stagingShellScript composes the remote-side fragment that owns the
-// staging directory, populates it from the client tar stream, records
-// the expected cache identity in a Vci-owned sibling metadata file, and
-// invokes the public remote `vci build .` from inside the staged
-// project directory. The staging dir is removed wholesale on every exit
-// path so a hostile source-tree symlink cannot trick the trap into
-// touching an external path.
-//
-// Every field in `key` is validated; nothing else is embedded in the
-// script. Nested source filenames remain tar data; they never reach
-// the remote shell.
-func stagingShellScript(key safeCacheKey) string {
-	if !layout.ValidName(key.Project) || !sourcecache.ValidDigest(key.Digest) {
-		// Caller error: this fragment can never be reached with an
-		// unsafe key because validateCacheKey rejects it upstream.
-		return "exit 1"
-	}
-	prefix := "vci-source-" + key.Project
-	return fmt.Sprintf(`set -eu
-ROOT="${VCI_ROOT:-$HOME/.vci}"
-TMP_PARENT="$ROOT/state/tmp"
-mkdir -m 700 -p "$TMP_PARENT"
-STAGING=$(mktemp -d -p "$TMP_PARENT" -t %s.XXXXXXXX)
-chmod 700 "$STAGING"
-trap 'rm -rf "$STAGING" 2>/dev/null || true' EXIT INT TERM
-PROJECT="$STAGING/%s"
-mkdir -m 700 "$PROJECT"
-printf '%%s %%s %%s\n' '%s' '%s' '%s' > "$STAGING/vci-meta"
-chmod 600 "$STAGING/vci-meta"
-tar -C "$PROJECT" -xpf -
-cd "$PROJECT"
-vci build .
-`, prefix, key.Project, sourcecache.FormatVersion, key.Digest, key.Project)
-}
-
-// RemoteCheck and RemoteAbort use the one configured remote target directly.
-// They take the run ID returned by the remote public CLI unchanged. No
-// fixed timeout is applied: cancellation is owned by the caller context
-// and the controlled test deadline.
-func RemoteCheck(ctx context.Context, l layout.Layout, id model.RunID) ([]byte, bool, error) {
+// RemoteCheck and RemoteAbort forward the remote run ID unchanged.
+// Caller context controls timeout.
+func RemoteCheck(ctx context.Context, l model.Layout, id model.RunID) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
@@ -281,7 +168,7 @@ func RemoteCheck(ctx context.Context, l layout.Layout, id model.RunID) ([]byte, 
 	return raw, true, err
 }
 
-func RemoteAbort(ctx context.Context, l layout.Layout, id model.RunID) ([]byte, bool, error) {
+func RemoteAbort(ctx context.Context, l model.Layout, id model.RunID) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
@@ -290,12 +177,9 @@ func RemoteAbort(ctx context.Context, l layout.Layout, id model.RunID) ([]byte, 
 	return raw, true, err
 }
 
-// remoteTarget returns the configured remote host from the orchestrator
-// selector. A client root carries only the selector; the coordinator
-// owned project and machine configuration that the build needs lives
-// on the remote side and is resolved by the remote `vci build .`
-// itself.
-func remoteTarget(l layout.Layout) (string, bool, error) {
+// remoteTarget returns the orchestrator host for client layouts.
+// Empty host means this layout is a coordinator.
+func remoteTarget(l model.Layout) (string, bool, error) {
 	host, err := remoteOrchestrator(l)
 	if err != nil {
 		return "", false, err
@@ -303,12 +187,8 @@ func remoteTarget(l layout.Layout) (string, bool, error) {
 	return host, host != "", nil
 }
 
-// runSSH executes `ssh <host> <command>` via the ordinary system ssh
-// binary and returns the remote stdout. When the remote process
-// exits non-zero, a valid Vci JSON envelope is preserved so the caller
-// can report the remote error rather than relabeling it as SSH
-// failure. Only no response, malformed response, schema mismatch, or
-// genuine SSH failure is classified as infrastructure.
+// runSSH runs `ssh <host> <command>` and returns stdout bytes.
+// Valid Vci envelopes are returned even on remote non-zero exits.
 func runSSH(ctx context.Context, host, command string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "ssh", host, command)
 	var stdout, stderr bytes.Buffer
@@ -331,12 +211,8 @@ func runSSH(ctx context.Context, host, command string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
-// runSSHRaw executes `ssh <host> <command>` and returns the remote
-// stdout verbatim. It is the transport for the raw-byte `artifacts
-// get` path: the remote writes artifact bytes, not a JSON envelope, to
-// stdout. A non-zero remote exit with a valid Vci error envelope is
-// preserved so the caller can report the remote error; only no
-// response or genuine SSH failure is classified as infrastructure.
+// runSSHRaw runs `ssh <host> <command>` and returns raw stdout bytes.
+// Valid Vci envelopes are returned even on remote non-zero exits.
 func runSSHRaw(ctx context.Context, host, command string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "ssh", host, command)
 	var stdout, stderr bytes.Buffer
@@ -356,10 +232,8 @@ func runSSHRaw(ctx context.Context, host, command string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
-// validEnvelope returns true when the given bytes decode as a Vci response
-// envelope with the expected schema version. Used to decide whether a
-// non-zero remote exit should be propagated as an envelope or treated as an
-// SSH infrastructure failure.
+// validEnvelope checks if bytes decode to a valid Vci envelope
+// with the expected schema version.
 func validEnvelope(data []byte) bool {
 	var envelope struct {
 		SchemaVersion int             `json:"schema_version"`
@@ -391,12 +265,9 @@ func validEnvelope(data []byte) bool {
 	return remoteErr.Code != "" && remoteErr.Class != "" && remoteErr.Message != ""
 }
 
-// RemoteCommand runs an ordinary public Vci command on the configured
-// remote host. It returns the remote JSON envelope unchanged; a non-zero
-// remote exit with a valid envelope is preserved. Only no response,
-// malformed response, schema mismatch, or genuine SSH failure is
-// classified as infrastructure.
-func RemoteCommand(ctx context.Context, l layout.Layout, name string, args ...string) ([]byte, bool, error) {
+// RemoteCommand runs a public Vci command on the configured remote host.
+// It returns the raw remote JSON envelope.
+func RemoteCommand(ctx context.Context, l model.Layout, name string, args ...string) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
@@ -405,16 +276,8 @@ func RemoteCommand(ctx context.Context, l layout.Layout, name string, args ...st
 	return raw, true, err
 }
 
-// RemoteLog proxies `vci logs <run-id> [--stderr] [--tail <n>]` to
-// the configured remote host over ordinary SSH and returns the remote
-// stdout verbatim. Like RemoteGetArtifact, the remote `vci logs`
-// writes raw log bytes to stdout, so the captured bytes are the log
-// (the tail, if any, is applied on the coordinator so only the
-// requested window crosses the wire). A non-zero remote exit with a
-// valid Vci error envelope (missing run/log, invalid stream or tail)
-// is preserved unchanged for the caller to report; only no response
-// or genuine SSH failure is classified as infrastructure.
-func RemoteLog(ctx context.Context, l layout.Layout, id model.RunID, stream string, tail int) ([]byte, bool, error) {
+// RemoteLog proxies `vci logs` to the remote host and returns raw log bytes.
+func RemoteLog(ctx context.Context, l model.Layout, id model.RunID, stream string, tail int) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
@@ -430,15 +293,8 @@ func RemoteLog(ctx context.Context, l layout.Layout, id model.RunID, stream stri
 	return raw, true, err
 }
 
-// RemoteGetArtifact proxies `vci artifacts get <run-id> <rel>` to the
-// configured remote host over ordinary SSH and returns the remote
-// stdout verbatim. Unlike RemoteCommand (JSON envelopes), the remote
-// `artifacts get` writes the artifact's raw bytes to stdout, so the
-// captured bytes are the artifact. A non-zero remote exit with a valid
-// Vci error envelope (missing run/artifact, invalid rel) is preserved
-// unchanged for the caller to report; only no response or genuine SSH
-// failure is classified as infrastructure.
-func RemoteGetArtifact(ctx context.Context, l layout.Layout, id model.RunID, rel string) ([]byte, bool, error) {
+// RemoteGetArtifact proxies `vci artifacts get` and returns raw artifact bytes.
+func RemoteGetArtifact(ctx context.Context, l model.Layout, id model.RunID, rel string) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
@@ -461,4 +317,103 @@ func buildRemoteCommand(name string, args ...string) string {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+// executeRemote stages workspace on a remote host via ssh, runs the command,
+// fetches artifacts if requested, and best-effort cleans the remote workspace.
+// Uses `ssh`, `tar`, and `scp` only and returns runtime.Result with matches.
+func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir string, machine config.Machine, workspace string, project config.Project, pair process.Pair) (runtime.Result, []string, bool, error) {
+	remoteWorkDir, err := host.RemoteWorkDir(id)
+	if err != nil {
+		return runtime.Result{}, nil, false, err
+	}
+	defer func() {
+		// Best-effort remote workspace cleanup on the success path.
+		// The reaper does terminal sweeps of `~/.vci/state/work/<run>`;
+		// this removes the tree immediately.
+		_ = reaper.CleanupRemote(context.Background(), machine.Host, remoteWorkDir)
+	}()
+
+	if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
+		return runtime.Result{}, nil, false, fmt.Errorf("stage remote workspace: %w", err)
+	}
+	argv, err := remoteArgv(machine, remoteWorkDir, project.Command)
+	if err != nil {
+		return runtime.Result{}, nil, false, err
+	}
+	started := time.Now().UTC()
+	exitCode, runErr := host.RunRemote(ctx, machine.Host, remoteWorkDir, argv, project.Environment, pair.Stdout, pair.Stderr)
+	finished := time.Now().UTC()
+	result := runtime.Result{ExitCode: exitCode, ResolvedExecutable: argv[0], StartedAt: started, FinishedAt: finished, Duration: finished.Sub(started)}
+
+	// Fetch matching artifacts via scp into a temporary parent,
+	// then let local collection publish them into runDir/artifacts.
+	var collected []string
+	var truncated bool
+	if len(project.Artifacts) > 0 {
+		fetchParent, mkErr := os.MkdirTemp(l.TempDir(), "vci-fetch-")
+		if mkErr != nil {
+			return result, nil, false, fmt.Errorf("artifact fetch dir: %w", mkErr)
+		}
+		defer func() { _ = os.RemoveAll(fetchParent) }()
+		if err := host.FetchRemote(ctx, machine.Host, remoteWorkDir, fetchParent); err != nil {
+			return result, nil, false, err
+		}
+		collected, truncated, err = CollectArtifacts(filepath.Join(fetchParent, string(id)), runDir, project.Artifacts)
+		if err != nil {
+			return result, nil, false, fmt.Errorf("collect remote artifacts: %w", err)
+		}
+	}
+	return result, collected, truncated, runErr
+}
+
+// selectExecutor selects runtime based on the snapshot's machine.
+// Defaults to runtime.Local when machine runtime is empty.
+func selectExecutor(snapshot runSnapshot) Executor {
+	machine := resolvedMachine(snapshot)
+	switch machine.Runtime {
+	case "docker":
+		return runtime.Docker{Image: machine.Image}
+	case "vm":
+		return runtime.VM{Snapshot: machine.Snapshot, Binary: "tart"}
+	}
+	return runtime.Local{}
+}
+
+// resolvedMachine resolves the machine reserved by the snapshot,
+// falling back to ProjectConfig.Machines[0] for legacy records.
+func resolvedMachine(snapshot runSnapshot) config.Machine {
+	name := snapshot.Machine
+	if name == "" && len(snapshot.ProjectConfig.Machines) > 0 {
+		name = snapshot.ProjectConfig.Machines[0]
+	}
+	return lookupMachine(snapshot, name)
+}
+
+// remoteArgv builds the remote command argv.
+// Docker/VM use runtime-specific remote arg builders; others run directly.
+func remoteArgv(machine config.Machine, remoteWorkDir string, command []string) ([]string, error) {
+	switch machine.Runtime {
+	case "docker":
+		args, err := (runtime.Docker{Image: machine.Image}).CommandArgvRemote(remoteWorkDir, command)
+		if err != nil {
+			return nil, err
+		}
+		return append([]string{"docker"}, args...), nil
+	case "vm":
+		return (runtime.VM{Snapshot: machine.Snapshot, Binary: "tart"}).CommandArgvRemote(remoteWorkDir, command)
+	}
+	return command, nil
+}
+
+// lookupMachine resolves a machine by name from snapshot data.
+// Snapshot state is used, so live config changes do not rewrite history.
+func lookupMachine(snapshot runSnapshot, machineName string) config.Machine {
+	if machineName == "" {
+		return config.Machine{}
+	}
+	if machine, ok := snapshot.Machines[machineName]; ok {
+		return machine
+	}
+	return config.Machine{}
 }

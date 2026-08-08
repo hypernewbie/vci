@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -81,7 +82,9 @@ func TestRunRemoteRecordsShell(t *testing.T) {
 
 // TestRunRemoteRecordsDockerAndVM pins that the docker and vm runtime
 // argv reach the remote shell with the workspace as the only mount
-// source.
+// source, and that the mount source's leading `~` is rewritten to the
+// captured login home (`"$__vci_login_home"`) instead of being left
+// for the shell to expand against the isolated runtime HOME.
 func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -91,12 +94,12 @@ func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
 		{
 			name: "docker",
 			argv: []string{"docker", "run", "--rm", "-v", "~/.vci/state/work/run_abc:/vci/work:ro", "-w", "/vci/work", "ghcr.io/org/ci:pin", "true"},
-			want: []string{"exec", "'docker'", "run", "--rm", "~/.vci/state/work/run_abc:/vci/work:ro", "'ghcr.io/org/ci:pin'"},
+			want: []string{"exec", "'docker'", "run", "--rm", `"$__vci_login_home"/.vci/state/work/run_abc:/vci/work:ro`, "'ghcr.io/org/ci:pin'"},
 		},
 		{
 			name: "vm",
 			argv: []string{"tart", "run", "--no-gui", "--dir", "~/.vci/state/work/run_abc:/vci/work", "--workdir", "/vci/work", "ghcr.io/org/vm:pin", "--", "true"},
-			want: []string{"exec", "'tart'", "run", "--no-gui", "~/.vci/state/work/run_abc:/vci/work", "'ghcr.io/org/vm:pin'", "--", "'true'"},
+			want: []string{"exec", "'tart'", "run", "--no-gui", `"$__vci_login_home"/.vci/state/work/run_abc:/vci/work`, "'ghcr.io/org/vm:pin'", "--", "'true'"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -118,6 +121,14 @@ func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
 					t.Errorf("shell missing %q: %s", want, s)
 				}
 			}
+			// The login home is captured before the isolation re-export,
+			// and no mount source resolves through the isolated HOME.
+			if !strings.Contains(s, "__vci_login_home=$HOME && export HOME=") {
+				t.Errorf("login home not captured before isolation: %s", s)
+			}
+			if strings.Contains(s, ".home/.vci") {
+				t.Errorf("mount resolved through isolated HOME: %s", s)
+			}
 			// Exactly one `-v`/`--dir` mount and it is the workspace.
 			if strings.Count(s, "-v") != 1 && !strings.Contains(s, "--dir") {
 				t.Errorf("mount shape unexpected: %s", s)
@@ -126,6 +137,81 @@ func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
 				t.Errorf("leak: %s", s)
 			}
 		})
+	}
+}
+
+// TestRemoteRuntimeMountUsesLoginHome pins the mount-source fix end to
+// end: the composed remote shell is executed against a real `sh` with
+// stub docker/tart binaries in PATH, and the recorded mount source is
+// the workspace under the original login HOME — not the isolated
+// runtime HOME (`.home`) tree. It also pins that the runtime still
+// receives the isolated HOME/TMPDIR.
+func TestRemoteRuntimeMountUsesLoginHome(t *testing.T) {
+	loginHome := filepath.Join(t.TempDir(), "home")
+	workDir := "~/.vci/state/work/run_abc"
+	absWork := filepath.Join(loginHome, ".vci", "state", "work", "run_abc")
+	for _, dir := range []string{loginHome, absWork} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Stub docker/tart record their environment and argv; the shell
+	// `exec`s them, so HOME/TMPDIR here are the runtime's isolated
+	// values and `$*` carries the resolved mount source.
+	dir := t.TempDir()
+	dockerLog := filepath.Join(dir, "docker.log")
+	writeStub(t, dir, "docker", "#!/bin/sh\necho \"HOME=$HOME TMPDIR=$TMPDIR $*\" >> "+dockerLog+"\nexit 0\n")
+	tartLog := filepath.Join(dir, "tart.log")
+	writeStub(t, dir, "tart", "#!/bin/sh\necho \"HOME=$HOME TMPDIR=$TMPDIR $*\" >> "+tartLog+"\nexit 0\n")
+	t.Setenv("HOME", loginHome)
+
+	dockerShell, err := composeShell(workDir, []string{"docker", "run", "--rm", "-v", workDir + ":/vci/work:ro", "-w", "/vci/work", "ghcr.io/org/ci:pin", "true"}, nil)
+	if err != nil {
+		t.Fatalf("compose docker shell: %v", err)
+	}
+	if err := exec.Command("sh", "-c", dockerShell).Run(); err != nil {
+		t.Fatalf("run docker shell: %v\nshell: %s", err, dockerShell)
+	}
+	tartShell, err := composeShell(workDir, []string{"tart", "run", "--no-gui", "--dir", workDir + ":/vci/work", "--workdir", "/vci/work", "ghcr.io/org/vm:pin", "--", "true"}, nil)
+	if err != nil {
+		t.Fatalf("compose tart shell: %v", err)
+	}
+	if err := exec.Command("sh", "-c", tartShell).Run(); err != nil {
+		t.Fatalf("run tart shell: %v\nshell: %s", err, tartShell)
+	}
+
+	dockerData, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("docker stub log missing: %v", err)
+	}
+	d := string(dockerData)
+	if want := absWork + ":/vci/work:ro"; !strings.Contains(d, want) {
+		t.Errorf("docker -v mount %q missing: %s", want, d)
+	}
+	if strings.Contains(d, ".home/.vci") {
+		t.Errorf("docker -v resolved through isolated HOME: %s", d)
+	}
+	for _, want := range []string{"HOME=" + filepath.Join(absWork, ".home"), "TMPDIR=" + filepath.Join(absWork, ".tmp")} {
+		if !strings.Contains(d, want) {
+			t.Errorf("docker runtime isolation missing %q: %s", want, d)
+		}
+	}
+
+	tartData, err := os.ReadFile(tartLog)
+	if err != nil {
+		t.Fatalf("tart stub log missing: %v", err)
+	}
+	vm := string(tartData)
+	if want := absWork + ":/vci/work"; !strings.Contains(vm, want) {
+		t.Errorf("tart --dir mount %q missing: %s", want, vm)
+	}
+	if strings.Contains(vm, ".home/.vci") {
+		t.Errorf("tart --dir resolved through isolated HOME: %s", vm)
+	}
+	for _, want := range []string{"HOME=" + filepath.Join(absWork, ".home"), "TMPDIR=" + filepath.Join(absWork, ".tmp")} {
+		if !strings.Contains(vm, want) {
+			t.Errorf("tart runtime isolation missing %q: %s", want, vm)
+		}
 	}
 }
 

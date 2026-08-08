@@ -5,13 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/hypernewbie/vci/internal/model"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"github.com/hypernewbie/vci/internal/layout"
 )
 
 type Entry struct {
@@ -44,13 +43,8 @@ func Build(root string) (Manifest, map[string][]byte, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		// Skip every .git component at any depth (directory or
-		// file). Submodule .git directories carry the child's
-		// gitdir data; the Plan 11 contract excludes that data
-		// from manifests, snapshots, and cache entries. The
-		// top-level minimal .git markers needed for source.Discover
-		// are produced by the staging path, not the local
-		// manifest, which walks the working tree as-is.
+		// Skip .git components at any depth (dir or file). Manifests ignore
+		// git metadata for staging; required top-level markers are added separately.
 		if isExcludedComponent(rel) {
 			if d.IsDir() {
 				return fs.SkipDir
@@ -111,7 +105,7 @@ func Build(root string) (Manifest, map[string][]byte, error) {
 	return manifest, blobs, nil
 }
 
-type BlobStore struct{ Layout layout.Layout }
+type BlobStore struct{ Layout model.Layout }
 
 func (s BlobStore) PutManifestAndBlobs(manifest Manifest, blobs map[string][]byte) error {
 	if err := s.Layout.Ensure(); err != nil {
@@ -144,9 +138,7 @@ func (s BlobStore) putBlob(digest string, data []byte) error {
 	return atomicWrite(path, data, 0o400)
 }
 
-// isGitComponent reports whether the top-relative path is a .git
-// entry at any depth. The first segment is checked first; nested
-// .git directories inside submodule working trees are also skipped.
+// isGitComponent reports whether any path segment is ".git".
 func isGitComponent(rel string) bool {
 	for _, segment := range strings.Split(rel, "/") {
 		if segment == ".git" {
@@ -156,11 +148,7 @@ func isGitComponent(rel string) bool {
 	return false
 }
 
-// isExcludedComponent reports whether the top-relative path is
-// excluded at every depth: any .git component (directory or file),
-// or a .gitmodules file. .gitmodules is excluded because it can
-// carry remote URLs and embedded credentials; Vci needs gitlinks
-// from index stage records, not checkout URLs.
+// isExcludedComponent skips .git artifacts and .gitmodules files.
 func isExcludedComponent(rel string) bool {
 	if isGitComponent(rel) {
 		return true
@@ -199,22 +187,7 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-// BuildWithValidation builds a manifest from the working tree at
-// root and validates every LFS-attributed regular file against the
-// formal pointer format. The validation runs against the same
-// bytes that become a blob: a typed pointer failure is reported
-// before any blob is published, reservation is taken, or run
-// record is created.
-//
-// `lfsFiles` is the set of LFS-attributed paths declared by the
-// upstream graph collector. The set is consulted via relative path
-// match; an LFS-attributed path that is missing or non-regular in
-// the local working tree is a source-state error rather than a
-// silent skip, because the agent's tool said it was there.
-//
-// Local manifest inclusion rules (ignored files, locally-deleted
-// tracked files, executable modes, symlinks) are unchanged from
-// Build; the only addition is the LFS check at the byte level.
+// BuildWithValidation builds the manifest and validates LFS-attributed files.
 func BuildWithValidation(root string, lfsFiles map[string]bool) (Manifest, map[string][]byte, error) {
 	manifest, blobs, err := Build(root)
 	if err != nil {
@@ -238,4 +211,107 @@ func BuildWithValidation(root string, lfsFiles map[string]bool) (Manifest, map[s
 		}
 	}
 	return manifest, blobs, nil
+}
+
+func (s BlobStore) LoadManifest(digest string) (Manifest, error) {
+	if digest == "" {
+		return Manifest{}, fmt.Errorf("manifest digest is empty")
+	}
+	data, err := os.ReadFile(filepath.Join(s.Layout.ManifestsDir(), digest+".json"))
+	if err != nil {
+		return Manifest{}, err
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Digest != digest {
+		return Manifest{}, fmt.Errorf("manifest digest mismatch: %s", digest)
+	}
+	return manifest, nil
+}
+
+func (s BlobStore) Materialize(manifest Manifest, destination string) error {
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		return err
+	}
+	entries := append([]Entry(nil), manifest.Entries...)
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].Kind == entries[j].Kind {
+			return entries[i].Path < entries[j].Path
+		}
+		if entries[i].Kind == "dir" {
+			return true
+		}
+		if entries[j].Kind == "dir" {
+			return false
+		}
+		return entries[i].Path < entries[j].Path
+	})
+	for _, entry := range entries {
+		path, err := safeJoin(destination, entry.Path)
+		if err != nil {
+			return err
+		}
+		switch entry.Kind {
+		case "dir":
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				return err
+			}
+			if err := os.Chmod(path, os.FileMode(entry.Mode)); err != nil {
+				return err
+			}
+		case "file":
+			data, err := os.ReadFile(filepath.Join(s.Layout.BlobsDir(), entry.Digest))
+			if err != nil {
+				return fmt.Errorf("read blob %s: %w", entry.Digest, err)
+			}
+			sum := sha256.Sum256(data)
+			if hex.EncodeToString(sum[:]) != entry.Digest {
+				return fmt.Errorf("source blob corrupt: %s", entry.Digest)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(path, data, os.FileMode(entry.Mode)); err != nil {
+				return err
+			}
+		case "symlink":
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return err
+			}
+			if err := os.Symlink(entry.Target, path); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported manifest kind %q", entry.Kind)
+		}
+	}
+	actual, _, err := Build(destination)
+	if err != nil {
+		return err
+	}
+	if actual.Digest != manifest.Digest {
+		return fmt.Errorf("materialized workspace does not match manifest")
+	}
+	return nil
+}
+
+func safeJoin(root, rel string) (string, error) {
+	if rel == "" || filepath.IsAbs(rel) || strings.HasPrefix(filepath.ToSlash(rel), "../") || filepath.Clean(rel) == ".." {
+		return "", fmt.Errorf("unsafe source path %q", rel)
+	}
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	cleanRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	cleanPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if cleanPath != cleanRoot && !strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("source path escapes workspace: %q", rel)
+	}
+	return path, nil
 }

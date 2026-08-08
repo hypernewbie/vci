@@ -18,9 +18,6 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	parsed, parseErr := Parse(args)
 	if parseErr != nil {
-		if command == "" {
-			command = ""
-		}
 		if err := Write(stdout, Failure(command, parseErr)); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1

@@ -82,6 +82,37 @@ func TestHostedFallbackRejectsInvalidURLCommit(t *testing.T) {
 	}
 }
 
+// TestHostedFallbackRejectsNoSchemeUserinfo pins that malformed
+// no-scheme values containing "@" are rejected with
+// ErrHostedFallbackInvalid instead of panicking. The password
+// pre-check slices the userinfo between "://" and "@"; when no
+// scheme separator is present (or the "@" precedes it) those slice
+// bounds are invalid, so the guard must let these values fall
+// through to the pattern check.
+func TestHostedFallbackRejectsNoSchemeUserinfo(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"bare_user_at_host", "a@b"},
+		{"user_at_host_with_path", "a@b/c"},
+		{"git_style_no_scheme", "git@github.com"},
+		{"at_before_scheme", "x@y://z"},
+		{"bare_at", "@"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := HostedFallback{
+				URL:    tc.url,
+				Commit: "abc1234567890abcdef1234567890abcdef12345",
+			}.Validate()
+			if !errors.Is(err, ErrHostedFallbackInvalid) {
+				t.Fatalf("url %q: want ErrHostedFallbackInvalid, got %v", tc.url, err)
+			}
+		})
+	}
+}
+
 // TestHostedFallbackRejectsConfigMutationByClient pins that a
 // client root cannot declare hosted_fallback. Client authority is
 // the orchestrator selector; everything else is coordinator-owned.

@@ -2,13 +2,9 @@ package app
 
 // Client/coordinator integration tests.
 //
-// Every test in this file starts the controlled loopback sshd,
-// configures a client root that selects the alias as its
-// orchestrator, configures a coordinator root that owns the
-// projects, machines, and command definitions, and then runs the
-// compiled client binary end-to-end through ordinary system SSH.
-// Each test parses stdout as exactly one Vci JSON envelope and
-// asserts the success-or-failure fact the test names.
+// Each test starts a loopback sshd, configures client and
+// coordinator roots, then runs the client binary end-to-end over
+// system SSH and asserts the single Vci JSON envelope on stdout.
 
 import (
 	"context"
@@ -22,10 +18,7 @@ import (
 	"time"
 )
 
-// phase1Envelope is the minimal Vci response fact shape used by
-// every integration assertion. Production parsing uses internal/cli/Response;
-// tests keep the assertion narrow so the format under test is the
-// schema's, not a wrapper's.
+// phase1Envelope is the minimal Vci response shape used by every integration assertion.
 type phase1Envelope struct {
 	SchemaVersion int             `json:"schema_version"`
 	Command       string          `json:"command"`
@@ -71,10 +64,8 @@ func initCoordinatorRoot(t *testing.T, fixture *SSHFixture, command string, extr
 	initCoordinatorRootWithCapacity(t, fixture, 0, command, extraArgs...)
 }
 
-// initCoordinatorRootWithCapacity writes a coordinator config that
-// declares mac-local with the requested local-slot capacity. A
-// non-positive value omits max_concurrent (the documented default of
-// one slot applies).
+// initCoordinatorRootWithCapacity writes a coordinator config with
+// the requested max_concurrent; non-positive omits it (default one slot).
 func initCoordinatorRootWithCapacity(t *testing.T, fixture *SSHFixture, capacity int, command string, extraArgs ...string) {
 	t.Helper()
 	cfg := filepath.Join(fixture.coordinatorRoot, "config.toml")
@@ -89,8 +80,7 @@ func initCoordinatorRootWithCapacity(t *testing.T, fixture *SSHFixture, capacity
 	}
 }
 
-// tomlSlice returns the TOML inline-array literal for a command +
-// argument list with appropriate quoting.
+// tomlSlice returns the TOML inline-array literal for a command and argument list.
 func tomlSlice(args []string) string {
 	parts := make([]string, 0, len(args))
 	for _, a := range args {
@@ -120,11 +110,7 @@ func initClientRoot(t *testing.T, fixture *SSHFixture, alias string) string {
 	return root
 }
 
-// TestClientMachinesProxiesToCoordinator runs `vci machines`
-// from the client binary and asserts it returns the coordinator's
-// inventory, not the empty client inventory. The coordinator already
-// has `machines.mac-local` configured by the fixture, and the client
-// declares only the orchestrator selector.
+// TestClientMachinesProxiesToCoordinator asserts `vci machines` returns the coordinator's inventory.
 func TestClientMachinesProxiesToCoordinator(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -149,9 +135,7 @@ func TestClientMachinesProxiesToCoordinator(t *testing.T) {
 	}
 }
 
-// TestClientProjectsProxiesToCoordinator runs `vci projects`
-// from the client binary and asserts the coordinator's project list
-// is returned.
+// TestClientProjectsProxiesToCoordinator asserts `vci projects` returns the coordinator's project list.
 func TestClientProjectsProxiesToCoordinator(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -177,8 +161,7 @@ func TestClientProjectsProxiesToCoordinator(t *testing.T) {
 	}
 }
 
-// TestClientBuildRunsRemoteCommand verifies that a client build submission over
-// SSH successfully triggers the detached remote worker on the coordinator.
+// TestClientBuildRunsRemoteCommand verifies a client build triggers the remote worker.
 func TestClientBuildRunsRemoteCommand(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -187,24 +170,18 @@ func TestClientBuildRunsRemoteCommand(t *testing.T) {
 		t.Fatalf("phase1 ssh roundtrip: %v", err)
 	}
 
-	// Coordinator command: write a stamp file inside the workspace
-	// and exit 0. The remote coordinator runs `vci build .` from the
-	// staged source directory; we capture the stamp from the run
-	// record on the remote side.
+	// Coordinator command: write a stamp file in the workspace and exit 0.
 	initCoordinatorRoot(t, fixture, "sh", "-c", "echo hello-stamp > stamp.txt; exit 0")
 	clientRoot := initClientRoot(t, fixture, fixture.SSHAlias())
 
-	// Materialize a tiny source tree at a path the client passes as
-	// its first argument. The directory name `demo` matches the
-	// coordinator's project name so the remote vci can route the
-	// build to the right project.
+	// Materialize a source tree named `demo` to match the coordinator's project.
 	sourceParent := fixture.t.TempDir()
 	sourceDir := filepath.Join(sourceParent, "demo")
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
 		t.Fatalf("mkdir source dir: %v", err)
 	}
 	mustWriteFile(t, filepath.Join(sourceDir, "README.md"), "# demo\n")
-	// Make the source a git repo so the remote can git-rev-parse.
+	// Make the source a git repo for the remote's git-rev-parse.
 	mustGitInit(t, sourceDir)
 	mustWriteFile(t, filepath.Join(sourceDir, "README.md"), "# demo\n")
 	mustGitAddCommit(t, sourceDir, "demo commit")
@@ -224,9 +201,7 @@ func TestClientBuildRunsRemoteCommand(t *testing.T) {
 		t.Fatalf("client returned non-run id %q in %s", data.RunID, pretty(env))
 	}
 
-	// Wait for the detached remote worker to publish its result.
-	// The client already saw the run id; the run record is the
-	// evidence the worker terminated.
+	// Wait for the remote worker to publish its run record.
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if time.Now().After(deadline) {
@@ -242,8 +217,7 @@ func TestClientBuildRunsRemoteCommand(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Confirm the client never created a local run record; only the
-	// coordinator owns run state, the client just proxies the id.
+	// Confirm the client never stored a local run record.
 	if _, err := os.Stat(filepath.Join(clientRoot, "state", "runs")); err == nil {
 		entries, _ := os.ReadDir(filepath.Join(clientRoot, "state", "runs"))
 		if len(entries) > 0 {
@@ -252,12 +226,7 @@ func TestClientBuildRunsRemoteCommand(t *testing.T) {
 	}
 }
 
-// TestClientJobFailureStaysJobFailure exercises a configured
-// command that exits non-zero: the build is registered on the
-// coordinator, the detached worker runs the command, the worker
-// publishes a failed run record, and a subsequent `check` reports
-// the run as failed. The test confirms the entire flow stays a
-// job-failure classification, not infrastructure.
+// TestClientJobFailureStaysJobFailure asserts a non-zero command stays a job failure, not infrastructure.
 func TestClientJobFailureStaysJobFailure(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -299,8 +268,7 @@ func TestClientJobFailureStaysJobFailure(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	// Verify the public client check reports the coordinator's failed run,
-	// rather than relabeling it as an SSH infrastructure error.
+	// The client `check` must report the coordinator's failed run, not an infrastructure error.
 	check := runClientBinary(t, fixture, clientRoot, "check", data.RunID)
 	if !check.OK {
 		t.Fatalf("check must return the failed remote run: %s", pretty(check))
@@ -317,9 +285,7 @@ func TestClientJobFailureStaysJobFailure(t *testing.T) {
 	}
 }
 
-// TestClientUnreachableAliasPropagatesAsInfrastructure routes
-// the client to an SSH destination that nothing is listening on and
-// asserts the envelope classifies the failure as infrastructure.
+// TestClientUnreachableAliasPropagatesAsInfrastructure asserts an unreachable alias is classified as infrastructure.
 func TestClientUnreachableAliasPropagatesAsInfrastructure(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	clientRoot := initClientRoot(t, fixture, "unreachable-alias")
@@ -356,8 +322,7 @@ func envOK(data []byte) bool {
 	return e.OK
 }
 
-// envClass returns the failure class declared in the envelope or
-// "ok" when the envelope is healthy.
+// envClass returns the envelope's failure class, or "ok" when healthy.
 func envClass(data []byte) string {
 	var e phase1Envelope
 	if json.Unmarshal(data, &e) != nil {
@@ -372,10 +337,7 @@ func envClass(data []byte) string {
 	return e.Error.Class
 }
 
-// TestClientMalformedResponseClassifiedAsInfrastructure replaces
-// the coordinator's `vci` with a script that prints invalid JSON and
-// asserts the client classifies the response as infrastructure rather
-// than relabeling it as a job failure.
+// TestClientMalformedResponseClassifiedAsInfrastructure asserts a malformed coordinator response is classified as infrastructure.
 func TestClientMalformedResponseClassifiedAsInfrastructure(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -416,9 +378,7 @@ func TestClientMalformedResponseClassifiedAsInfrastructure(t *testing.T) {
 	}
 }
 
-// TestClientAbortPropagatesRequest submits a slow build to the coordinator
-// via the client, waits for it to start running, issues an abort from the client,
-// and verifies the coordinator run state transitions to aborted.
+// TestClientAbortPropagatesRequest asserts a client abort transitions the coordinator run to aborted.
 func TestClientAbortPropagatesRequest(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -480,10 +440,7 @@ func TestClientAbortPropagatesRequest(t *testing.T) {
 	}
 }
 
-// remoteCheckState queries the coordinator root's run record for a
-// given run id and returns the state string, or "" when there is no
-// record. Used by integration tests to confirm the coordinator owns
-// the run and the client only returns the id.
+// remoteCheckState returns the coordinator run state for runID, or "" if absent.
 func remoteCheckState(t *testing.T, fixture *SSHFixture, runID string) string {
 	t.Helper()
 	dir := filepath.Join(fixture.coordinatorRoot, "state", "runs", runID)

@@ -1,11 +1,5 @@
-// Package host executes project commands on a remote worker host via
-// the ordinary system `ssh`, `tar`, and `scp` executables. No relay,
-// daemon, framed protocol, or Go SSH client is involved: the detached
-// worker stages the materialized workspace into the remote
-// `~/.vci/state/work/<run>` tree, runs the selected runtime there,
-// and fetches the workspace back when artifacts are configured. Only
-// the workspace path and the project's environment map cross the SSH
-// boundary; `~/.vci` state roots, `~/.ssh`, and `VCI_ROOT` never do.
+// Package host transfers workspaces over SSH and runs commands remotely.
+// It stages workspace state and handles remote execution via system tools.
 package host
 
 import (
@@ -21,14 +15,10 @@ import (
 	"strings"
 
 	"github.com/hypernewbie/vci/internal/config"
-	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/model"
 )
 
-// ValidateHost rejects an empty, option-like, whitespace, control-
-// character, scheme, or `..` destination. The value is passed to the
-// system `ssh` executable as a positional destination argument, so it
-// must be safe as one shell word.
+// ValidateHost checks the SSH host argument before use.
 func ValidateHost(host string) error {
 	if host == "" {
 		return fmt.Errorf("remote host is empty")
@@ -36,14 +26,7 @@ func ValidateHost(host string) error {
 	return config.ValidateMachineHost(host)
 }
 
-// ValidateRemotePath enforces the exact Vci-owned remote tree
-// grammar: `~/.vci/state/work/<run_id>`. The four fixed layout
-// segments must appear in order and the trailing segment must be a
-// layout.ValidName (a run id). No whitespace, control characters,
-// option-like prefix, or `..` may appear. The value is embedded into
-// remote `sh`/`scp` command lines, so it must be safe as a single
-// shell word; `~` is the only shell-expanded part and it is a fixed
-// literal.
+// ValidateRemotePath checks remote paths are valid `~/.vci/state/work/<run_id>` values.
 func ValidateRemotePath(p string) error {
 	if p == "" {
 		return fmt.Errorf("remote path is empty")
@@ -65,17 +48,14 @@ func ValidateRemotePath(p string) error {
 			return fmt.Errorf("remote path %q is not under ~/.vci/state/work", p)
 		}
 	}
-	if !layout.ValidName(segments[4]) {
+	if !model.ValidName(segments[4]) {
 		return fmt.Errorf("remote path %q has invalid run segment %q", p, segments[4])
 	}
 	return nil
 }
 
-// RemoteWorkDir returns the deterministic remote tree a run's
-// workspace is staged into on a machine's host: the same
-// `state/work/<run>` layout the coordinator uses, mirrored under the
-// remote session's home. `~` is expanded by the remote shell and by
-// scp's remote-side expansion.
+// RemoteWorkDir returns the remote `~/.vci/state/work/<run>` path for a run.
+// Layout matches the coordinator's local work directory layout.
 func RemoteWorkDir(id model.RunID) (string, error) {
 	if !model.ValidRunID(id) {
 		return "", fmt.Errorf("invalid run id %q", id)
@@ -83,15 +63,8 @@ func RemoteWorkDir(id model.RunID) (string, error) {
 	return "~/.vci/state/work/" + string(id), nil
 }
 
-// RunRemote executes the given argv on the remote host via the
-// ordinary system `ssh` executable: `ssh <host> <sh -c shell>` where
-// `shell` is a single string that cd's into the staged remote
-// workspace, isolates HOME/TMPDIR inside it (mirroring the local
-// executor), exports the project environment, and execs the runtime
-// argv. The exit code of the remote command is returned; ssh-level
-// failures (missing binary, refused connection) are returned as an
-// error. The remote command is cancelled with the context, exactly
-// like a local supervised child.
+// RunRemote executes a remote command over SSH.
+// It returns the remote exit code; transport failures return an error.
 func RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, stdout, stderr io.Writer) (int, error) {
 	if err := ValidateHost(host); err != nil {
 		return 0, err
@@ -117,12 +90,8 @@ func RunRemote(ctx context.Context, host, workDir string, argv []string, env map
 	return 0, nil
 }
 
-// StageRemote streams the materialized local workspace into the
-// remote work dir over ordinary SSH: `tar -cf - -C <workspace> .`
-// piped into `ssh <host> "mkdir -p <workDir> && cd <workDir> &&
-// tar -xpf -"`. The remote command text references only the
-// validated work dir; the project bytes are tar data, never shell
-// text.
+// StageRemote tars a local workspace and streams it to remoteWorkDir over SSH.
+// The command uses tar data only, with no shell content from the workspace payload.
 func StageRemote(ctx context.Context, host, remoteWorkDir, localWorkspace string) error {
 	if err := ValidateHost(host); err != nil {
 		return err
@@ -167,12 +136,8 @@ func StageRemote(ctx context.Context, host, remoteWorkDir, localWorkspace string
 	return nil
 }
 
-// FetchRemote copies the remote work dir back to the coordinator via
-// the system `scp` executable over the same SSH channel:
-// `scp -r -q <host>:<workDir> <localDest>`. scp lays the remote tree
-// at `<localDest>/<run_id>`, exactly like a local `scp -r` of the
-// directory. Only the validated remote path appears in the command;
-// the artifact globs are evaluated later by the local collector.
+// FetchRemote copies remote workdir contents back to the local destination using scp.
+// Command format: `scp -r -q <host>:<workDir> <localDest>`.
 func FetchRemote(ctx context.Context, host, remoteWorkDir, localDest string) error {
 	if err := ValidateHost(host); err != nil {
 		return err
@@ -196,13 +161,9 @@ func FetchRemote(ctx context.Context, host, remoteWorkDir, localDest string) err
 	return nil
 }
 
-// composeShell builds the single `sh -c` string that runs on the
-// remote host. The work dir is a validated Vci-owned path embedded as
-// one shell word (`~` is expanded by the shell); environment keys and
-// values are shell-quoted; argv elements are shell-quoted unless they
-// are a shell-safe word containing the work dir (the docker/tart
-// mount source, which must keep its unquoted `~` so the shell can
-// expand it before the runtime client sees it).
+// composeShell builds a single remote shell command.
+// It validates the workDir, sets HOME/TMPDIR, applies env vars, and execs argv.
+// It preserves safe `~`-based expansion for staged-workspace paths.
 func composeShell(workDir string, argv []string, env map[string]string) (string, error) {
 	if err := ValidateRemotePath(workDir); err != nil {
 		return "", err
@@ -213,7 +174,7 @@ func composeShell(workDir string, argv []string, env map[string]string) (string,
 	var b strings.Builder
 	b.WriteString("cd ")
 	b.WriteString(workDir)
-	b.WriteString(" && export HOME=")
+	b.WriteString(" && __vci_login_home=$HOME && export HOME=")
 	b.WriteString(workDir)
 	b.WriteString("/.home TMPDIR=")
 	b.WriteString(workDir)
@@ -242,7 +203,7 @@ func composeShell(workDir string, argv []string, env map[string]string) (string,
 			b.WriteString(" ")
 		}
 		if strings.Contains(arg, workDir) && shellSafe(arg) {
-			b.WriteString(arg)
+			b.WriteString(remoteWord(arg))
 		} else {
 			b.WriteString(shellQuote(arg))
 		}
@@ -250,11 +211,15 @@ func composeShell(workDir string, argv []string, env map[string]string) (string,
 	return b.String(), nil
 }
 
-// shellSafe reports whether a word is composed only of characters
-// that are inert inside an unquoted shell word (alphanumerics plus
-// `_`, `.`, `/`, `:`, `@`, `~`, `-`). A word that contains the
-// work dir AND passes this check is embedded verbatim so its leading
-// `~` is expanded by the remote shell; anything else is quoted.
+// remoteWord rewrites `~`-prefixed argv words to use captured login home.
+func remoteWord(arg string) string {
+	if !strings.HasPrefix(arg, "~") {
+		return arg
+	}
+	return `"$__vci_login_home"` + strings.TrimPrefix(arg, "~")
+}
+
+// shellSafe checks whether a token is safe to pass unquoted to the remote shell.
 var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_./:@~-]+$`).MatchString
 
 func shellQuote(value string) string {
