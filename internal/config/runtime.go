@@ -44,7 +44,8 @@ var allowedRuntimeImage = regexp.MustCompile(`^([A-Za-z0-9._-]+:[0-9]+/)?[A-Za-z
 //   - empty runtime ⇒ bare host; image and snapshot must be empty;
 //   - docker runtime ⇒ image must be non-empty and pass the
 //     allow-list; snapshot must be empty;
-//   - vm runtime ⇒ reserved for the future slice;
+//   - vm runtime ⇒ snapshot must be non-empty and pass the
+//     allow-list; image must be empty;
 //   - any other runtime ⇒ ErrUnsupportedRuntime.
 //
 // The Machine's name is interpolated into the error so an operator
@@ -71,7 +72,16 @@ func ValidateMachineRuntime(name string, m Machine) error {
 		}
 		return nil
 	case "vm":
-		return fmt.Errorf("%w: machine %q runtime=vm is not supported in this slice", ErrUnsupportedRuntime, name)
+		if m.Image != "" {
+			return fmt.Errorf("machine %q runtime=vm must not set image", name)
+		}
+		if m.Snapshot == "" {
+			return fmt.Errorf("%w: machine %q runtime=vm requires snapshot", ErrRuntimeImageRequired, name)
+		}
+		if err := validateRuntimeImage(m.Snapshot); err != nil {
+			return fmt.Errorf("machine %q snapshot: %w", name, err)
+		}
+		return nil
 	default:
 		return fmt.Errorf("%w: machine %q runtime=%q is not supported", ErrUnsupportedRuntime, name, m.Runtime)
 	}

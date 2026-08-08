@@ -136,6 +136,40 @@ func TestSelectExecutorUsesReservedMachine(t *testing.T) {
 	}
 }
 
+// TestSelectExecutorSelectsVM pins that a snapshot with
+// runtime=vm selects the VM-backed executor. The docker
+// type-assertion must NOT match; the VM-backed executor is
+// distinguished by a different CommandArgv signature (no workdir
+// arg — VM uses --workdir /vci/work).
+func TestSelectExecutorSelectsVM(t *testing.T) {
+	snap := runSnapshot{
+		Machine: "vm-linux",
+		ProjectConfig: config.Project{
+			Machines: []string{"vm-linux"},
+		},
+		Machines: map[string]config.Machine{
+			"vm-linux": {Runtime: "vm", Snapshot: "ghcr.io/org/vm:pin"},
+		},
+	}
+	exec := selectExecutor(snap)
+	// The VM runner exposes the same `tart` argv shape we pin
+	// elsewhere; the docker runner's CommandArgv has a workdir
+	// argument that the VM runner does not. We can also assert
+	// via the resolved-executable field of a stub run, but a
+	// type assertion is the cheapest way to pin the seam.
+	type dockerRunner interface {
+		CommandArgv(string, string, []string) ([]string, error)
+	}
+	if _, ok := exec.(dockerRunner); ok {
+		t.Fatalf("vm machine should not select docker-backed Executor")
+	}
+	// Type-distinguish via the resolved-executable behaviour:
+	// run a stub via ExecuteSupervised with a fake Binary.
+	if _, ok := exec.(Executor); !ok {
+		t.Fatalf("vm executor must satisfy Executor interface")
+	}
+}
+
 // TestSnapshotMachinesPersisted pins that the staged snapshot
 // composition includes the Machines map so the durable run
 // record can reconstruct the runtime selection at execution

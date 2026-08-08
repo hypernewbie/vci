@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"unicode"
@@ -81,6 +82,14 @@ type Project struct {
 	Machines    []string          `toml:"machines" json:"machines"`
 	Command     []string          `toml:"command" json:"command"`
 	Environment map[string]string `toml:"environment" json:"environment,omitempty"`
+	// Artifacts is the optional list of workspace-relative glob
+	// patterns. After the command finishes but before result
+	// publication, each matched regular file is copied to
+	// `state/runs/<run_id>/artifacts/<rel>`. Symlinks, device
+	// files, `..` escapes, and excluded paths (`.git`, `.vci`)
+	// are rejected. The total per-run cap is bounded by the
+	// artifact collector (currently 64 MiB).
+	Artifacts []string `toml:"artifacts,omitempty" json:"artifacts,omitempty"`
 	// HostedFallback is the optional immutable source declaration
 	// for `vci build --hosted <project>`. Either both URL and
 	// Commit are set or the field is treated as absent; partial
@@ -213,6 +222,9 @@ func validateCoordinator(cfg Config) error {
 				return fmt.Errorf("project %q hosted fallback: %w", name, err)
 			}
 		}
+		if err := ValidateProjectArtifacts(name, project.Artifacts); err != nil {
+			return err
+		}
 		seen := map[string]bool{}
 		for _, machine := range project.Machines {
 			if !layout.ValidName(machine) {
@@ -245,6 +257,46 @@ func validateClient(cfg Config) error {
 	}
 	if cfg.LogLimits != DefaultLogLimits {
 		return fmt.Errorf("client root must not set log limits")
+	}
+	return nil
+}
+
+// ValidateProjectArtifacts pins the per-glob rules: not empty, no
+// whitespace or control characters, no leading dash, no scheme, no
+// absolute path, no `..` segment, and a `path.Match`-parseable
+// pattern. The caller is the project-level validator.
+func ValidateProjectArtifacts(name string, globs []string) error {
+	for i, glob := range globs {
+		if err := validateArtifactGlob(glob); err != nil {
+			return fmt.Errorf("project %q artifact[%d]: %w", name, i, err)
+		}
+	}
+	return nil
+}
+
+func validateArtifactGlob(glob string) error {
+	if glob == "" {
+		return fmt.Errorf("artifact glob is empty")
+	}
+	if strings.ContainsAny(glob, " \t\r\n\v\f\x00") {
+		return fmt.Errorf("artifact glob %q contains whitespace or control characters", glob)
+	}
+	if strings.HasPrefix(glob, "-") {
+		return fmt.Errorf("artifact glob %q starts with a flag-like character", glob)
+	}
+	if strings.Contains(glob, "://") {
+		return fmt.Errorf("artifact glob %q must not use a scheme", glob)
+	}
+	if strings.HasPrefix(glob, "/") {
+		return fmt.Errorf("artifact glob %q must not be an absolute path", glob)
+	}
+	for _, segment := range strings.Split(glob, "/") {
+		if segment == ".." {
+			return fmt.Errorf("artifact glob %q must not contain a .. segment", glob)
+		}
+	}
+	if _, err := path.Match(glob, ""); err != nil {
+		return fmt.Errorf("artifact glob %q is not a valid path.Match pattern: %w", glob, err)
 	}
 	return nil
 }

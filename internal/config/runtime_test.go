@@ -116,21 +116,67 @@ image = "ghcr.io/org/ci:latest"
 	}
 }
 
-// TestVMModeNotSupported pins that runtime=vm is reserved for the
-// future slice and is rejected as ErrUnsupportedRuntime at
-// Validate time. The schema is forward-compatible; the executor
-// slice is not.
-func TestVMModeNotSupported(t *testing.T) {
+// TestVMModeRequiresSnapshot pins that a runtime=vm machine must
+// carry a non-empty snapshot reference. The validator uses the
+// same allow-list as runtime=docker images.
+func TestVMModeRequiresSnapshot(t *testing.T) {
+	body := `schema_version = 1
+orchestrator = "self"
+
+[machines.vm-no-snap]
+runtime = "vm"
+`
+	_, err := Decode([]byte(body))
+	if !errors.Is(err, ErrRuntimeImageRequired) {
+		t.Fatalf("expected ErrRuntimeImageRequired, got %v", err)
+	}
+}
+
+// TestVMModeAcceptsValidSnapshot pins the runtime=vm happy path:
+// a verbatim snapshot reference decodes, EffectiveCapacity is
+// unchanged, and the snapshot field round-trips.
+func TestVMModeAcceptsValidSnapshot(t *testing.T) {
 	body := `schema_version = 1
 orchestrator = "self"
 
 [machines.vm-mode]
 runtime = "vm"
-snapshot = "base-snap"
+snapshot = "ghcr.io/org/vm:pin"
+`
+	cfg, err := Decode([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.Machines["vm-mode"]
+	if m.Runtime != "vm" {
+		t.Errorf("runtime: %q", m.Runtime)
+	}
+	if m.Snapshot != "ghcr.io/org/vm:pin" {
+		t.Errorf("snapshot: %q", m.Snapshot)
+	}
+	if EffectiveCapacity(m) != 1 {
+		t.Errorf("capacity: %d", EffectiveCapacity(m))
+	}
+}
+
+// TestVMModeRejectsStrayImage pins that a runtime=vm machine
+// must not carry an `image` field — image is the docker runtime's
+// verbatim reference.
+func TestVMModeRejectsStrayImage(t *testing.T) {
+	body := `schema_version = 1
+orchestrator = "self"
+
+[machines.vm-with-image]
+runtime = "vm"
+snapshot = "ghcr.io/org/vm:pin"
+image = "ghcr.io/org/ci:pin"
 `
 	_, err := Decode([]byte(body))
-	if !errors.Is(err, ErrUnsupportedRuntime) {
-		t.Fatalf("expected ErrUnsupportedRuntime, got %v", err)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "image") {
+		t.Errorf("expected image error, got %v", err)
 	}
 }
 
@@ -236,6 +282,118 @@ image = "` + image + `"
 `
 		if _, err := Decode([]byte(body)); !errors.Is(err, ErrRuntimeImageInvalid) {
 			t.Errorf("image %q should fail as ErrRuntimeImageInvalid, got %v", image, err)
+		}
+	}
+}
+
+// TestVMModeSnapshotAllowList pins that the runtime=vm snapshot
+// is verified by the same allow-list as runtime=docker images.
+func TestVMModeSnapshotAllowList(t *testing.T) {
+	body := `schema_version = 1
+orchestrator = "self"
+
+[machines.vm-bad]
+runtime = "vm"
+snapshot = "--rm-all"
+`
+	_, err := Decode([]byte(body))
+	if !errors.Is(err, ErrRuntimeImageInvalid) {
+		t.Fatalf("expected ErrRuntimeImageInvalid, got %v", err)
+	}
+}
+
+// TestRuntimeSnapshotFieldAccepted pins that a docker machine may
+// carry an empty snapshot field (snapshot is reserved for VM mode).
+// The presence of a stray snapshot for a docker machine is rejected
+// at Validate time.
+func TestRuntimeSnapshotFieldAccepted(t *testing.T) {
+	body := `schema_version = 1
+orchestrator = "self"
+
+[machines.docker-machine]
+runtime = "docker"
+image = "ghcr.io/org/ci:pin"
+`
+	cfg, err := Decode([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Machines["docker-machine"].Snapshot != "" {
+		t.Errorf("snapshot: %q", cfg.Machines["docker-machine"].Snapshot)
+	}
+}
+
+// TestDockerMachineRejectsSnapshot pins that a runtime=docker
+// machine must not carry a `snapshot` field — snapshot is the VM
+// runtime's verbatim reference and is forward-compatible only when
+// VM mode is enabled.
+func TestDockerMachineRejectsSnapshot(t *testing.T) {
+	body := `schema_version = 1
+orchestrator = "self"
+
+[machines.mixed]
+runtime = "docker"
+image = "ghcr.io/org/ci:pin"
+snapshot = "ghcr.io/org/vm:pin"
+`
+	_, err := Decode([]byte(body))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("expected snapshot error, got %v", err)
+	}
+}
+
+// TestProjectAcceptsArtifacts pins that a project may declare a
+// workspace-relative artifact glob list at config load time.
+func TestProjectAcceptsArtifacts(t *testing.T) {
+	body := `schema_version = 1
+orchestrator = "self"
+
+[machines.mac-local]
+
+[projects.demo]
+machines = ["mac-local"]
+command = ["true"]
+artifacts = ["build/*", "dist/*.zip"]
+`
+	cfg, err := Decode([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arts := cfg.Projects["demo"].Artifacts
+	if len(arts) != 2 {
+		t.Fatalf("artifacts: %v", arts)
+	}
+}
+
+// TestProjectRejectsBadArtifacts pins the per-glob rules: empty,
+// absolute path, parent escape, leading dash, scheme, whitespace,
+// and a path.Match failure are all rejected.
+func TestProjectRejectsBadArtifacts(t *testing.T) {
+	for _, glob := range []string{
+		"",
+		"/abs/path",
+		"../escape",
+		"sub/../escape",
+		"--flag",
+		"with space",
+		"https://x",
+		"[unterminated",
+	} {
+		body := `schema_version = 1
+orchestrator = "self"
+
+[machines.mac-local]
+
+[projects.demo]
+machines = ["mac-local"]
+command = ["true"]
+artifacts = ["` + glob + `"]
+`
+		if _, err := Decode([]byte(body)); err == nil {
+			t.Errorf("artifact %q accepted", glob)
 		}
 	}
 }

@@ -25,19 +25,24 @@ type Executor interface {
 // the runtime it was actually launched with.
 //
 // Empty runtime ⇒ bare host (`executor.Local`). docker runtime
-// ⇒ `runtime.Docker` with the snapshot's image. Anything else
-// was rejected at config load time, so the default branch is
-// unreachable in practice. The fallback to ProjectConfig.Machines[0]
-// exists for legacy records that predate the explicit machine
-// field; current writers always populate `machine`.
+// ⇒ `runtime.Docker` with the snapshot's image. vm runtime ⇒
+// `runtime.VM` with the snapshot's snapshot reference. Anything
+// else was rejected at config load time, so the default branch
+// is unreachable in practice. The fallback to
+// ProjectConfig.Machines[0] exists for legacy records that
+// predate the explicit machine field; current writers always
+// populate `machine`.
 func selectExecutor(snapshot runSnapshot) Executor {
 	name := snapshot.Machine
 	if name == "" && len(snapshot.ProjectConfig.Machines) > 0 {
 		name = snapshot.ProjectConfig.Machines[0]
 	}
 	machine := lookupMachine(snapshot, name)
-	if machine.Runtime == "docker" {
+	switch machine.Runtime {
+	case "docker":
 		return runtime.Docker{Image: machine.Image}
+	case "vm":
+		return runtime.VM{Snapshot: machine.Snapshot, Binary: "tart"}
 	}
 	return executor.Local{}
 }

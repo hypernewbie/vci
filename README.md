@@ -229,37 +229,42 @@ coordinator-only; a client root proxies `vci build --hosted
 <project>` through ordinary `RemoteCommand` over SSH and never
 holds a checkout or a run record.
 
-## Container runtime (per-machine, optional)
+## Container and VM runtime (per-machine, optional)
 
-A machine may declare an optional container runtime so the
-project's command runs inside a declared image instead of on the
-coordinator host. The default path is bare execution. The runtime
-selector is read from the durable run snapshot, so a run whose
-machine config changes after submission still publishes the
+A machine may declare an optional runtime so the project's
+command runs inside a declared image or VM snapshot instead of on
+the coordinator host. The default path is bare execution. The
+runtime selector is read from the durable run snapshot, so a run
+whose machine config changes after submission still publishes the
 runtime it was actually launched with.
 
 ```toml
 [machines.linux-docker]
 runtime = "docker"
 image   = "ghcr.io/org/ci@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[machines.vm-linux]
+runtime  = "vm"
+snapshot = "ghcr.io/org/vm:pin"
 ```
 
 ```sh
 vci setup machine add linux-docker --runtime docker --image ghcr.io/org/ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
-vci setup project add lintest --machine linux-docker --command go --arg test --arg ./...
+vci setup machine add vm-linux     --runtime vm --snapshot ghcr.io/org/vm:pin
+vci setup project add lintest --machine linux-docker --machine vm-linux \
+    --command go --arg test --arg ./... \
+    --artifact build/* --artifact dist/*.zip
 vci build .
 ```
 
-The image reference is verbatim — Vci never builds, pulls, or pins
-images from inside Vci. The host `docker` config is used as-is.
-The validator rejects flag-like values, scheme-bearing values,
-paths, whitespace, and an unknown runtime. `runtime = "vm"` is
-reserved for a future slice and is rejected as
-`unsupported_runtime` so the schema is forward-compatible without
-shipping VM execution.
+The image / snapshot reference is verbatim — Vci never builds,
+pulls, or pins images from inside Vci. The host `docker` /
+hypervisor config is used as-is. The validator rejects flag-like
+values, scheme-bearing values, paths, whitespace, and an unknown
+runtime.
 
-The runner shells out to the system `docker` binary without a Go
-SDK. The exact arg slice is:
+The container runner shells out to the system `docker` binary
+without a Go SDK. The exact arg slice is:
 
 ```
 docker run --rm \
@@ -271,18 +276,53 @@ docker run --rm \
     <image> <command...>
 ```
 
-The workspace is bind-mounted read-only at `/vci/work`. Vci never
-mounts `~/.vci`, `state/`, or `~/.ssh`. Only the per-run workspace
-is mounted. The runner respects the caller context for cancellation
-and propagates the docker exit code as a job or infrastructure
-failure. `runtime_unavailable` is an infrastructure retryable
-envelope (docker missing or daemon refuses); `runtime_image_not_found`
-is a configuration non-retryable envelope (docker exit 125).
+The VM runner shells out to the system VM binary (`tart` on
+macOS) without a Go SDK. The exact arg slice is:
 
-VM mode is not executed; the documented error is `unsupported_runtime`
-(configuration). The deferred extensions — image build/push inside
-Vci, automatic registry auth, remote docker, multi-host worker
+```
+tart run --no-gui \
+    --dir <workspace>:/vci/work \
+    --workdir /vci/work \
+    --cpus 2 --memory 4g \
+    <snapshot> -- <command...>
+```
+
+The `--dir` flag is the documented tart directory mount: the host
+workspace is shared read-write with the guest at `/vci/work`. The
+`tart` binary is the host's responsibility, exactly as the `docker`
+binary is for the container runner.
+
+In both runtimes the workspace is the only host path the guest
+sees; Vci never mounts `~/.vci`, `state/`, or `~/.ssh`. Only the
+per-run workspace is exposed. The runner respects the caller
+context for cancellation and propagates the exit code as a job or
+infrastructure failure. `runtime_unavailable` is an infrastructure
+retryable envelope (binary missing or daemon refuses);
+`runtime_image_not_found` is a configuration non-retryable
+envelope (binary reports image-not-found).
+
+The deferred extensions — image build/push inside Vci, automatic
+registry auth, remote docker or remote VM, multi-host worker
 selection — are not part of this release.
+
+## Artifact collection (per-project, optional)
+
+A project may declare workspace-relative glob patterns. Patterns
+are matched per path segment: every segment of the glob except the
+last matches exactly one path segment of the artifact, and the
+final segment must match every remaining path segment. A trailing
+bare `*` therefore collects the whole subtree (`build/*` includes
+`build/sub/file.txt`), while a constrained final segment keeps the
+match single-level (`build/*.bin` collects only files directly
+inside `build/`). `**` has no special recursive meaning; it is
+matched literally as an ordinary segment. After the
+command finishes but before result publication, each matched
+regular file is copied to `state/runs/<run_id>/artifacts/<rel>`
+with the source's permission bits preserved. Symlinks, device
+files, `..` escapes, and `.git`/`.vci` paths are rejected. The
+per-run total byte cap is 64 MiB; matches beyond the cap are
+dropped and `artifacts_truncated` is set on the build envelope.
+`vci check <run_id>` surfaces `artifacts` and `artifacts_truncated`.
 
 ## Build and development
 

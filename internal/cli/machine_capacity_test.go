@@ -232,10 +232,11 @@ func TestSetupMachineAddRejectsBadDockerImage(t *testing.T) {
 	}
 }
 
-// TestSetupMachineAddRejectsVMMode pins that `runtime=vm` is
-// rejected at the CLI surface as configuration. The schema is
-// forward-compatible; the executor slice is not.
-func TestSetupMachineAddRejectsVMMode(t *testing.T) {
+// TestSetupMachineAddAcceptsVMRuntime pins that
+// `setup machine add <name> --runtime vm --snapshot <ref>`
+// persists the VM runtime and snapshot. The CLI surface mirrors
+// the docker path with --snapshot taking the verbatim reference.
+func TestSetupMachineAddAcceptsVMRuntime(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("VCI_ROOT", root)
 	var out, errOut bytes.Buffer
@@ -243,7 +244,141 @@ func TestSetupMachineAddRejectsVMMode(t *testing.T) {
 		t.Fatalf("setup init: %d %s", code, out.String())
 	}
 	out.Reset()
-	if code := Run([]string{"setup", "machine", "add", "vm1", "--runtime", "vm", "--snapshot", "abc"}, &out, &errOut); code == 0 {
-		t.Fatalf("vm mode accepted")
+	if code := Run([]string{"setup", "machine", "add", "vm1",
+		"--runtime", "vm",
+		"--snapshot", "ghcr.io/org/vm:pin",
+	}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add vm: %d %s", code, out.String())
+	}
+	cfgPath := filepath.Join(root, "config.toml")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`runtime = "vm"`)) {
+		t.Errorf("vm runtime missing: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`snapshot = "ghcr.io/org/vm:pin"`)) {
+		t.Errorf("snapshot missing: %s", raw)
+	}
+}
+
+// TestSetupMachineAddRejectsVMWithoutSnapshot pins that
+// `runtime=vm` without `--snapshot` fails at the CLI surface as
+// configuration.
+func TestSetupMachineAddRejectsVMWithoutSnapshot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "vm1", "--runtime", "vm"}, &out, &errOut); code == 0 {
+		t.Fatalf("vm without snapshot accepted")
+	}
+}
+
+// TestSetupProjectAddAcceptsArtifacts pins that
+// `setup project add <name> --machine ... --command ... --artifact <glob>
+// [--artifact <glob>...]` persists the artifact globs into the
+// coordinator root and surfaces them in the projects envelope.
+func TestSetupProjectAddAcceptsArtifacts(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "mac-local"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "project", "add", "demo",
+		"--machine", "mac-local",
+		"--command", "go",
+		"--arg", "test",
+		"--arg", "./...",
+		"--artifact", "build/*",
+		"--artifact", "dist/*.zip",
+	}, &out, &errOut); code != 0 {
+		t.Fatalf("setup project add: %d %s", code, out.String())
+	}
+	// Round-trip: load the on-disk config and confirm artifacts.
+	cfgPath := filepath.Join(root, "config.toml")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`build/*`)) {
+		t.Errorf("artifact missing in config: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`dist/*.zip`)) {
+		t.Errorf("artifact missing in config: %s", raw)
+	}
+	// `vci projects` envelopes the artifact globs.
+	out.Reset()
+	if code := Run([]string{"projects"}, &out, &errOut); code != 0 {
+		t.Fatalf("projects: %d %s", code, out.String())
+	}
+	var resp struct {
+		Data []struct {
+			Name    string         `json:"name"`
+			Project map[string]any `json:"project"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var demo map[string]any
+	for _, p := range resp.Data {
+		if p.Name == "demo" {
+			demo = p.Project
+			break
+		}
+	}
+	if demo == nil {
+		t.Fatalf("demo missing: %s", out.String())
+	}
+	arts, _ := demo["artifacts"].([]any)
+	if len(arts) != 2 {
+		t.Errorf("artifacts count: %d (%v)", len(arts), arts)
+	}
+}
+
+// TestSetupProjectAddRejectsBadArtifact pins that bad globs
+// (absolute, parent escape, scheme, leading dash, whitespace,
+// path.Match failure) are rejected at the CLI surface as
+// `project_update_failed` configuration failure.
+func TestSetupProjectAddRejectsBadArtifact(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "mac-local"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add: %d %s", code, out.String())
+	}
+	out.Reset()
+	bad := []string{
+		"/abs/path",
+		"../escape",
+		"--flag",
+		"with space",
+		"https://x",
+	}
+	for _, glob := range bad {
+		out.Reset()
+		errOut.Reset()
+		if code := Run([]string{"setup", "project", "add", "demo",
+			"--machine", "mac-local",
+			"--command", "true",
+			"--artifact", glob,
+		}, &out, &errOut); code == 0 {
+			t.Errorf("artifact %q accepted", glob)
+		}
 	}
 }

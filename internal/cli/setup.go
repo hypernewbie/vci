@@ -125,7 +125,7 @@ func runSetup(args []string) (any, *model.VciError) {
 			return nil, errMsg
 		}
 		if len(args) < 3 || (args[1] != "add" && args[1] != "hosted") {
-			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> [--machine <name>...] --command <exe> [--arg <arg>].\n       setup project hosted set <name> --url <url> --commit <object-id>\n       setup project hosted clear <name>", false)
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> [--machine <name>...] --command <exe> [--arg <arg>] [--artifact <glob>].\n       setup project hosted set <name> --url <url> --commit <object-id>\n       setup project hosted clear <name>", false)
 		}
 		if args[1] == "hosted" {
 			return runSetupProjectHosted(l, args[2:])
@@ -133,6 +133,7 @@ func runSetup(args []string) (any, *model.VciError) {
 		var machines []string
 		executable := ""
 		commandArgs := []string{}
+		var artifacts []string
 		for i := 3; i < len(args); i++ {
 			switch args[i] {
 			case "--machine":
@@ -153,6 +154,12 @@ func runSetup(args []string) (any, *model.VciError) {
 				}
 				commandArgs = append(commandArgs, args[i+1])
 				i++
+			case "--artifact":
+				if i+1 >= len(args) {
+					return nil, model.NewError("invalid_arguments", model.FailureUsage, "--artifact requires a glob.", false)
+				}
+				artifacts = append(artifacts, args[i+1])
+				i++
 			default:
 				return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown project option %q.", args[i]), false)
 			}
@@ -160,10 +167,14 @@ func runSetup(args []string) (any, *model.VciError) {
 		if len(machines) == 0 || executable == "" {
 			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Project requires --machine and --command.", false)
 		}
-		if err := app.AddProject(l, args[2], config.Project{Machines: machines, Command: append([]string{executable}, commandArgs...)}); err != nil {
+		if err := app.AddProject(l, args[2], config.Project{Machines: machines, Command: append([]string{executable}, commandArgs...), Artifacts: artifacts}); err != nil {
 			return nil, model.NewError("project_update_failed", model.FailureConfiguration, err.Error(), false)
 		}
-		return map[string]any{"project": args[2], "machines": machines, "command": append([]string{executable}, commandArgs...), "updated": true}, nil
+		out := map[string]any{"project": args[2], "machines": machines, "command": append([]string{executable}, commandArgs...), "updated": true}
+		if len(artifacts) > 0 {
+			out["artifacts"] = artifacts
+		}
+		return out, nil
 	default:
 		return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown setup operation %q.", args[0]), false)
 	}

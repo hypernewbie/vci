@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- Plan 14 adds a third executable machine runtime (`runtime = "vm"`)
+  alongside `runtime = "docker"`, and a bounded per-project artifact
+  collection. The VM runner shells out to the system `tart` binary
+  (configurable `Binary` field for tests; default `tart`) without a
+  Go SDK; exact arg slice:
+  `tart run --no-gui --dir <workspace>:/vci/work --workdir
+  /vci/work --cpus 2 --memory 4g <snapshot> -- <command...>`.
+  The `--dir` flag is the documented tart directory mount: the
+  host workspace is shared read-write at `/vci/work`. The
+  workspace is the only host path
+  the guest sees; `~/.vci`, `state/`, and `~/.ssh` are never
+  mounted. The snapshot reference is verbatim and validated through
+  the same allow-list as docker images. `config.ValidateMachineRuntime`
+  rejects `runtime = "vm"` without a snapshot, and rejects a docker
+  machine that carries a stray snapshot field. `selectExecutor`
+  dispatches `runtime = "vm"` to `runtime.VM`; the bare host remains
+  the default when the runtime is empty. Artifact collection adds
+  a `Project.Artifacts []string` field (TOML `artifacts`, JSON
+  `artifacts`); `setup project add` accepts repeated
+  `--artifact <glob>` flags. Globs match per path segment: a
+  trailing bare `*` collects the whole subtree (`build/*` matches
+  `build/sub/file.txt`), while a constrained final segment is
+  single-level (`build/*.bin` matches only files directly inside
+  `build/`); `**` has no special recursive meaning. After the
+  executor returns and before
+  result publication, every matched regular file is copied to
+  `state/runs/<run_id>/artifacts/<rel>` with the source's
+  permission bits; symlinks, `.git`, `.vci`, and `..` paths are
+  rejected. The per-run cap is 64 MiB; matches beyond the cap are
+  dropped and `artifacts_truncated` is set on the build envelope.
+  `vci check <run_id>` surfaces `artifacts` and `artifacts_truncated`.
+  The source-cache identity `(format_version, digest, project)` is
+  unchanged: bare, docker, and VM runners produce byte-equal
+  selected bytes so cache hits are shared. No relay, daemon,
+  custom protocol, source receiver, Docker socket, privileged
+  mount, host network, or VM hypervisor SDK is added; the runner
+  is the host's responsibility.
 - Plan 13 Fix repairs four Plan 13 defects the original tests did
   not pin. (1) `TestDockerRunsViaStub` flagged any `state/`
   substring in the docker `run` arg string as a dangerous mount

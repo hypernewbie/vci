@@ -28,20 +28,22 @@ import (
 )
 
 type BuildResult struct {
-	RunID           model.RunID     `json:"run_id"`
-	Project         string          `json:"project"`
-	Machine         string          `json:"machine"`
-	State           model.RunState  `json:"state"`
-	SourceDigest    string          `json:"source_digest"`
-	ConfigDigest    string          `json:"config_digest"`
-	ConfigSnapshot  json.RawMessage `json:"config_snapshot"`
-	ExitCode        int             `json:"exit_code"`
-	Failure         string          `json:"failure,omitempty"`
-	StdoutPath      string          `json:"stdout_path,omitempty"`
-	StderrPath      string          `json:"stderr_path,omitempty"`
-	StdoutTruncated bool            `json:"stdout_truncated"`
-	StderrTruncated bool            `json:"stderr_truncated"`
-	Executor        executor.Result `json:"executor"`
+	RunID              model.RunID     `json:"run_id"`
+	Project            string          `json:"project"`
+	Machine            string          `json:"machine"`
+	State              model.RunState  `json:"state"`
+	SourceDigest       string          `json:"source_digest"`
+	ConfigDigest       string          `json:"config_digest"`
+	ConfigSnapshot     json.RawMessage `json:"config_snapshot"`
+	ExitCode           int             `json:"exit_code"`
+	Failure            string          `json:"failure,omitempty"`
+	StdoutPath         string          `json:"stdout_path,omitempty"`
+	StderrPath         string          `json:"stderr_path,omitempty"`
+	StdoutTruncated    bool            `json:"stdout_truncated"`
+	StderrTruncated    bool            `json:"stderr_truncated"`
+	Artifacts          []string        `json:"artifacts,omitempty"`
+	ArtifactsTruncated bool            `json:"artifacts_truncated"`
+	Executor           executor.Result `json:"executor"`
 }
 type PreparedRun struct {
 	Record store.RunRecord
@@ -613,6 +615,21 @@ func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (Buil
 		_ = process.RemoveExecution(filepath.Join(runDir, "execution.json"))
 		return BuildResult{}, fmt.Errorf("run %s lost worker ownership", id)
 	}
+	// Collect artifacts before publishing. The run state is
+	// `running`; artifact collection is read-only against the
+	// source workspace and writes only into the run's owned
+	// artifacts directory. The collector caps at 64 MiB and sets
+	// ArtifactsTruncated if any match overflows.
+	var collectedArtifacts []string
+	var artifactsTruncated bool
+	if len(snapshot.ProjectConfig.Artifacts) > 0 {
+		var collectErr error
+		collectedArtifacts, artifactsTruncated, collectErr = CollectArtifacts(workspace, runDir, snapshot.ProjectConfig.Artifacts)
+		if collectErr != nil {
+			_ = removeOwned(workspace)
+			return BuildResult{}, fmt.Errorf("collect artifacts: %w", collectErr)
+		}
+	}
 	latest, loadErr := runStore.Load(id)
 	cancelled := loadErr == nil && latest.CancellationRequestedAt != nil
 	if workerCtx.Err() != nil && cancelled {
@@ -626,7 +643,7 @@ func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (Buil
 	} else if execResult.ExitCode != 0 {
 		state, failure = model.RunFailed, "job"
 	}
-	result := BuildResult{RunID: id, Project: record.Project, Machine: record.Machine, State: state, SourceDigest: record.SourceDigest, ConfigDigest: record.ConfigDigest, ConfigSnapshot: record.ConfigSnapshot, ExitCode: execResult.ExitCode, Failure: failure, StdoutPath: filepath.Join(runDir, "stdout.log"), StderrPath: filepath.Join(runDir, "stderr.log"), StdoutTruncated: pair.Stdout.Truncated(), StderrTruncated: pair.Stderr.Truncated(), Executor: execResult}
+	result := BuildResult{RunID: id, Project: record.Project, Machine: record.Machine, State: state, SourceDigest: record.SourceDigest, ConfigDigest: record.ConfigDigest, ConfigSnapshot: record.ConfigSnapshot, ExitCode: execResult.ExitCode, Failure: failure, StdoutPath: filepath.Join(runDir, "stdout.log"), StderrPath: filepath.Join(runDir, "stderr.log"), StdoutTruncated: pair.Stdout.Truncated(), StderrTruncated: pair.Stderr.Truncated(), Artifacts: collectedArtifacts, ArtifactsTruncated: artifactsTruncated, Executor: execResult}
 	if _, err := runStore.Transition(id, model.RunCommitting, time.Now().UTC()); err != nil {
 		_ = removeOwned(workspace)
 		return BuildResult{}, err
