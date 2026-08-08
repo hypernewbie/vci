@@ -1,0 +1,255 @@
+package host
+
+// Stub-based tests for the remote runner. A fake `ssh`/`scp` in PATH
+// records its argv; no real SSH server, docker, or tart is required.
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// writeStub writes an executable shell stub into dir and prepends dir
+// to PATH for the test.
+func writeStub(t *testing.T, dir, name, body string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+previous)
+}
+
+const recordStub = "#!/bin/sh\necho \"$*\" >> %s\ncat >/dev/null 2>&1\nexit %d\n"
+
+// TestRunRemoteRecordsShell pins that RunRemote invokes
+// `ssh <host> <shell>` where the shell is one `sh -c` string that
+// cd's into the workspace, isolates HOME/TMPDIR inside it, exports
+// the project environment, and execs the runtime argv.
+func TestRunRemoteRecordsShell(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 0\n")
+
+	workDir := "~/.vci/state/work/run_abc"
+	argv := []string{"sh", "-c", "true"}
+	env := map[string]string{"CI": "1", "TOKEN": "semi;colon"}
+	var stdout, stderr bytes.Buffer
+	code, err := RunRemote(context.Background(), "builder", workDir, argv, env, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit: %d", code)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ssh stub log missing: %v", err)
+	}
+	s := string(log)
+	// The host alias is the first argv element.
+	if !strings.HasPrefix(s, "builder ") {
+		t.Errorf("host alias missing: %s", s)
+	}
+	// The workspace appears (cd + HOME/TMPDIR + mkdir).
+	if strings.Count(s, workDir) < 3 {
+		t.Errorf("workspace under-referenced: %s", s)
+	}
+	// The runtime binary and the command appear.
+	for _, want := range []string{"exec ", "'sh'", "'-c'", "'true'"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("shell missing %q: %s", want, s)
+		}
+	}
+	// Project environment is exported, quoted.
+	for _, want := range []string{"export 'CI'='1'", "export 'TOKEN'='semi;colon'"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("shell missing env %q: %s", want, s)
+		}
+	}
+	// No Vci state or ssh leakage beyond the workspace path itself.
+	for _, banned := range []string{"VCI_ROOT", ".ssh", "id_ed25519"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("leaked %q: %s", banned, s)
+		}
+	}
+}
+
+// TestRunRemoteRecordsDockerAndVM pins that the docker and vm runtime
+// argv reach the remote shell with the workspace as the only mount
+// source.
+func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want []string
+	}{
+		{
+			name: "docker",
+			argv: []string{"docker", "run", "--rm", "-v", "~/.vci/state/work/run_abc:/vci/work:ro", "-w", "/vci/work", "ghcr.io/org/ci:pin", "true"},
+			want: []string{"exec", "'docker'", "run", "--rm", "~/.vci/state/work/run_abc:/vci/work:ro", "'ghcr.io/org/ci:pin'"},
+		},
+		{
+			name: "vm",
+			argv: []string{"tart", "run", "--no-gui", "--dir", "~/.vci/state/work/run_abc:/vci/work", "--workdir", "/vci/work", "ghcr.io/org/vm:pin", "--", "true"},
+			want: []string{"exec", "'tart'", "run", "--no-gui", "~/.vci/state/work/run_abc:/vci/work", "'ghcr.io/org/vm:pin'", "--", "'true'"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "ssh.log")
+			writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 0\n")
+			var stdout, stderr bytes.Buffer
+			code, err := RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", tc.argv, nil, &stdout, &stderr)
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if code != 0 {
+				t.Fatalf("exit: %d", code)
+			}
+			log, _ := os.ReadFile(logPath)
+			s := string(log)
+			for _, want := range tc.want {
+				if !strings.Contains(s, want) {
+					t.Errorf("shell missing %q: %s", want, s)
+				}
+			}
+			// Exactly one `-v`/`--dir` mount and it is the workspace.
+			if strings.Count(s, "-v") != 1 && !strings.Contains(s, "--dir") {
+				t.Errorf("mount shape unexpected: %s", s)
+			}
+			if strings.Contains(s, ".ssh") || strings.Contains(s, "VCI_ROOT") {
+				t.Errorf("leak: %s", s)
+			}
+		})
+	}
+}
+
+// TestRunRemoteReturnsExitCode pins that a non-zero remote exit is a
+// job failure code, not an ssh-level error.
+func TestRunRemoteReturnsExitCode(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 7\n")
+	var stdout, stderr bytes.Buffer
+	code, err := RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if code != 7 {
+		t.Fatalf("exit: %d want 7", code)
+	}
+}
+
+// TestRunRemoteRejectsBadInput pins that unsafe hosts and paths are
+// rejected before any subprocess starts.
+func TestRunRemoteRejectsBadInput(t *testing.T) {
+	dir := t.TempDir()
+	writeStub(t, dir, "ssh", "#!/bin/sh\nexit 0\n")
+	for _, tc := range []struct {
+		host, workDir string
+	}{
+		{"", "~/.vci/state/work/run_abc"},
+		{"-flag", "~/.vci/state/work/run_abc"},
+		{"bad host", "~/.vci/state/work/run_abc"},
+		{"builder", ""},
+		{"builder", "/tmp/other"},
+		{"builder", "~/.vci/state/work/.."},
+	} {
+		var stdout, stderr bytes.Buffer
+		if _, err := RunRemote(context.Background(), tc.host, tc.workDir, []string{"true"}, nil, &stdout, &stderr); err == nil {
+			t.Errorf("host %q workDir %q accepted", tc.host, tc.workDir)
+		}
+	}
+}
+
+// TestStageRemoteStreamsWorkspace pins that staging pipes a tar of
+// the local workspace into `ssh <host> "mkdir -p <workDir> && cd
+// <workDir> && tar -xpf -"`.
+func TestStageRemoteStreamsWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\ncat >/dev/null 2>&1\nexit 0\n")
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := StageRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", workspace); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	log, _ := os.ReadFile(logPath)
+	s := string(log)
+	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("stage command missing %q: %s", want, s)
+		}
+	}
+}
+
+// TestStageRemoteRejectsUnsafe pins that staging validates both the
+// host and the remote path before touching the workspace.
+func TestStageRemoteRejectsUnsafe(t *testing.T) {
+	dir := t.TempDir()
+	writeStub(t, dir, "ssh", "#!/bin/sh\nexit 0\n")
+	workspace := t.TempDir()
+	for _, tc := range []struct {
+		host, remote string
+	}{
+		{"", "~/.vci/state/work/run_abc"},
+		{"builder", ""},
+		{"builder", "~/elsewhere"},
+	} {
+		if err := StageRemote(context.Background(), tc.host, tc.remote, workspace); err == nil {
+			t.Errorf("stage host %q remote %q accepted", tc.host, tc.remote)
+		}
+	}
+}
+
+// TestFetchRemoteInvokesScp pins that artifact fetch runs
+// `scp -r -q <host>:<workDir> <localDest>`.
+func TestFetchRemoteInvokesScp(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "scp.log")
+	writeStub(t, dir, "scp", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 0\n")
+	dest := t.TempDir()
+	if err := FetchRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", dest); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	log, _ := os.ReadFile(logPath)
+	s := string(log)
+	for _, want := range []string{"-r", "-q", "builder:~/.vci/state/work/run_abc", dest} {
+		if !strings.Contains(s, want) {
+			t.Errorf("scp args missing %q: %s", want, s)
+		}
+	}
+}
+
+// TestValidateRemotePath pins the remote-tree grammar: only the fixed
+// layout plus a run id.
+func TestValidateRemotePath(t *testing.T) {
+	for _, good := range []string{
+		"~/.vci/state/work/run_abc",
+		"~/.vci/state/work/run_1_2",
+	} {
+		if err := ValidateRemotePath(good); err != nil {
+			t.Errorf("valid path %q rejected: %v", good, err)
+		}
+	}
+	for _, bad := range []string{
+		"",
+		"-flag",
+		"/tmp/x",
+		"~/.vci/state/work",
+		"~/.vci/state/work/..",
+		"~/.vci/state/work/run_x extra",
+		"~/elsewhere",
+	} {
+		if err := ValidateRemotePath(bad); err == nil {
+			t.Errorf("invalid path %q accepted", bad)
+		}
+	}
+}

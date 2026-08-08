@@ -33,11 +33,7 @@ type Executor interface {
 // predate the explicit machine field; current writers always
 // populate `machine`.
 func selectExecutor(snapshot runSnapshot) Executor {
-	name := snapshot.Machine
-	if name == "" && len(snapshot.ProjectConfig.Machines) > 0 {
-		name = snapshot.ProjectConfig.Machines[0]
-	}
-	machine := lookupMachine(snapshot, name)
+	machine := resolvedMachine(snapshot)
 	switch machine.Runtime {
 	case "docker":
 		return runtime.Docker{Image: machine.Image}
@@ -45,6 +41,41 @@ func selectExecutor(snapshot runSnapshot) Executor {
 		return runtime.VM{Snapshot: machine.Snapshot, Binary: "tart"}
 	}
 	return executor.Local{}
+}
+
+// resolvedMachine returns the machine the durable snapshot reserved,
+// falling back to ProjectConfig.Machines[0] for legacy records that
+// predate the explicit machine field. It is the single name
+// resolution shared by the local executor selection and the remote
+// host branch.
+func resolvedMachine(snapshot runSnapshot) config.Machine {
+	name := snapshot.Machine
+	if name == "" && len(snapshot.ProjectConfig.Machines) > 0 {
+		name = snapshot.ProjectConfig.Machines[0]
+	}
+	return lookupMachine(snapshot, name)
+}
+
+// remoteArgv composes the argv the remote host executes for a machine
+// with a non-empty Host. The runtime selection mirrors selectExecutor:
+// docker and vm reuse the runtime packages' CommandArgvRemote (the
+// exact documented arg shape with the workspace used verbatim — it
+// names a path on the remote host, so no local filepath.Abs), and the
+// bare host runs the project command directly. The docker argv is
+// prefixed with the `docker` binary name so the remote shell can exec
+// it; VM's argv already carries its binary.
+func remoteArgv(machine config.Machine, remoteWorkDir string, command []string) ([]string, error) {
+	switch machine.Runtime {
+	case "docker":
+		args, err := (runtime.Docker{Image: machine.Image}).CommandArgvRemote(remoteWorkDir, command)
+		if err != nil {
+			return nil, err
+		}
+		return append([]string{"docker"}, args...), nil
+	case "vm":
+		return (runtime.VM{Snapshot: machine.Snapshot, Binary: "tart"}).CommandArgvRemote(remoteWorkDir, command)
+	}
+	return command, nil
 }
 
 // lookupMachine returns the resolved machineconfig struct for the

@@ -33,6 +33,9 @@ func AddMachine(l layout.Layout, name string, machine config.Machine) error {
 	if machine.MaxConcurrent < 0 {
 		return fmt.Errorf("machine %q has negative max_concurrent", name)
 	}
+	if err := config.ValidateMachineHost(machine.Host); err != nil {
+		return err
+	}
 	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
 		if _, exists := cfg.Machines[name]; exists {
 			return fmt.Errorf("machine %q already exists", name)

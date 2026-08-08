@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Plan 15 lets a machine declare a remote worker host. A machine
+  gains an optional `host` field — a strict system `ssh` destination
+  (alias or `user@host`; no leading `-`, no whitespace/control
+  characters, no `://` scheme, no `..` segment). Empty means the
+  worker runs on the coordinator host. `setup machine add --host`
+  accepts only validated values, and `vci machines` surfaces `host`
+  in the JSON envelope. Bare, docker, and vm runtimes all work
+  locally or on the named host: the detached worker stages the
+  materialized workspace into the remote
+  `~/.vci/state/work/<run>` tree via the existing `tar | ssh`
+  channel, runs the same runtime argv there via `ssh <host>
+  <sh -c ...>`, and fetches artifacts back with `scp` over the same
+  ssh channel before the coordinator's own collector publishes the
+  matches. Only the workspace path and the project environment
+  cross the ssh boundary. No relay, daemon, framed protocol, Go SSH
+  client, or new subcommand is introduced; `orchestrator` still
+  selects the single coordinator, and client roots still reject all
+  `[machines.*]` tables. The reaper owns every temp root: it sweeps
+  per-run `state/work/<run>/.tmp` and `.home` older than 30 minutes
+  and removes the whole workspace once the run is terminal and its
+  lease is gone, and `reaper.CleanupRemote` removes the mirrored
+  remote `~/.vci/state/work/<run>` tree via `ssh <host> rm -rf`.
+  `scripts/self-check.sh` and `scripts/detach-check.sh` now wait,
+  bounded, for the detached worker to release its owned state
+  (workspace, lease, scheduler claim) before the EXIT trap runs, so
+  the trap's `chmod -R u+rwx` + `rm -rf` (with `|| true`) can never
+  race a still-writing worker and leave a `.../state: Directory not
+  empty` turd.
 - Plan 14 adds a third executable machine runtime (`runtime = "vm"`)
   alongside `runtime = "docker"`, and a bounded per-project artifact
   collection. The VM runner shells out to the system `tart` binary

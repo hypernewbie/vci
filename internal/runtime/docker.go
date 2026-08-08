@@ -65,20 +65,38 @@ func DefaultResources() Resources {
 // exact arg slice. The function is exported so tests can pin the
 // shape without re-implementing the runner.
 func (d Docker) CommandArgv(workspace, workdir string, argv []string) ([]string, error) {
+	return d.commandArgv(workspace, true, argv)
+}
+
+// CommandArgvRemote is the remote-host mirror of CommandArgv: the
+// exact same arg shape, but the workspace path is used verbatim
+// instead of being resolved with filepath.Abs, because the path names
+// a directory on the remote host (reached via ssh), not the
+// coordinator. The remote shell expands the unquoted `~` before the
+// docker client sees the mount source.
+func (d Docker) CommandArgvRemote(workspace string, argv []string) ([]string, error) {
+	return d.commandArgv(workspace, false, argv)
+}
+
+func (d Docker) commandArgv(workspace string, abs bool, argv []string) ([]string, error) {
 	if d.Image == "" {
 		return nil, fmt.Errorf("%w: image is empty", ErrRuntimeUnavailable)
 	}
 	if workspace == "" {
 		return nil, fmt.Errorf("%w: workspace is empty", ErrRuntimeUnavailable)
 	}
-	absWorkspace, err := filepath.Abs(workspace)
-	if err != nil {
-		return nil, fmt.Errorf("%w: resolve workspace: %v", ErrRuntimeUnavailable, err)
+	ws := workspace
+	if abs {
+		resolved, err := filepath.Abs(workspace)
+		if err != nil {
+			return nil, fmt.Errorf("%w: resolve workspace: %v", ErrRuntimeUnavailable, err)
+		}
+		ws = resolved
 	}
 	uid, gid := currentUIDGID()
 	args := []string{
 		"run", "--rm",
-		"-v", absWorkspace + ":/vci/work:ro",
+		"-v", ws + ":/vci/work:ro",
 		"-w", "/vci/work",
 		"--network", "none",
 		"--user", fmt.Sprintf("%d:%d", uid, gid),

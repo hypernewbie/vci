@@ -253,3 +253,32 @@ func TestDockerUIDGIDMatchesHost(t *testing.T) {
 		t.Fatalf("argv missing --user %s: %s", want, joined)
 	}
 }
+
+// TestDockerCommandArgvRemoteVerbatimWorkspace pins that the
+// remote-host mirror of CommandArgv uses the workspace path verbatim
+// (no local filepath.Abs), because the path names a directory on the
+// remote host reached via ssh. Every other arg matches the local
+// shape.
+func TestDockerCommandArgvRemoteVerbatimWorkspace(t *testing.T) {
+	d := Docker{Image: "ghcr.io/org/ci:pin"}
+	argv, err := d.CommandArgvRemote("~/.vci/state/work/run_abc", []string{"go", "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+	for _, want := range []string{
+		"run --rm",
+		"-v ~/.vci/state/work/run_abc:/vci/work:ro",
+		"-w /vci/work",
+		"--network none",
+		"ghcr.io/org/ci:pin",
+		"go test",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("argv missing %q: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, filepath.Join(t.TempDir(), "..")) || strings.HasPrefix(joined, "/") {
+		t.Errorf("remote argv was locally Abs-resolved: %s", joined)
+	}
+}

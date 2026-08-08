@@ -59,15 +59,33 @@ func NewVM(snapshot string) VM {
 // `/vci/work` is the workspace. The runner never opens any host
 // path other than the workspace.
 func (v VM) CommandArgv(workspace string, argv []string) ([]string, error) {
+	return v.commandArgv(workspace, true, argv)
+}
+
+// CommandArgvRemote is the remote-host mirror of CommandArgv: the
+// exact same arg shape, but the workspace path is used verbatim
+// instead of being resolved with filepath.Abs, because the path names
+// a directory on the remote host (reached via ssh), not the
+// coordinator. The remote shell expands the unquoted `~` before the
+// VM client sees the `--dir` mount source.
+func (v VM) CommandArgvRemote(workspace string, argv []string) ([]string, error) {
+	return v.commandArgv(workspace, false, argv)
+}
+
+func (v VM) commandArgv(workspace string, abs bool, argv []string) ([]string, error) {
 	if v.Snapshot == "" {
 		return nil, fmt.Errorf("%w: snapshot is empty", ErrRuntimeUnavailable)
 	}
 	if workspace == "" {
 		return nil, fmt.Errorf("%w: workspace is empty", ErrRuntimeUnavailable)
 	}
-	absWorkspace, err := filepath.Abs(workspace)
-	if err != nil {
-		return nil, fmt.Errorf("%w: resolve workspace: %v", ErrRuntimeUnavailable, err)
+	ws := workspace
+	if abs {
+		resolved, err := filepath.Abs(workspace)
+		if err != nil {
+			return nil, fmt.Errorf("%w: resolve workspace: %v", ErrRuntimeUnavailable, err)
+		}
+		ws = resolved
 	}
 	binary := v.Binary
 	if binary == "" {
@@ -76,7 +94,7 @@ func (v VM) CommandArgv(workspace string, argv []string) ([]string, error) {
 	res := v.resourcesOrDefault()
 	args := []string{
 		"run", "--no-gui",
-		"--dir", absWorkspace + ":/vci/work",
+		"--dir", ws + ":/vci/work",
 		"--workdir", "/vci/work",
 		"--cpus", fmt.Sprintf("%d", res.CPUs),
 		"--memory", res.Memory,

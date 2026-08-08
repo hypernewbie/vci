@@ -45,23 +45,34 @@ type Retention struct {
 	SourceCacheBytes int64 `toml:"source_cache_bytes"`
 }
 
-// Machine is the coordinator-owned inventory entry. Transport endpoints are
-// not part of the machine definition; the orchestrator selector above is the
-// only place a remote target appears. MaxConcurrent is the optional
-// local-slot capacity for coordinator-owned parallel runs on this machine.
-// Zero is the compatibility default of one slot.
+// Machine is the coordinator-owned inventory entry. MaxConcurrent is the
+// optional local-slot capacity for coordinator-owned parallel runs on this
+// machine. Zero is the compatibility default of one slot.
+//
+// Host is the optional SSH destination that selects the worker host for
+// this machine. Empty means the machine runs on the coordinator host
+// (local). Any other value must pass ValidateMachineHost and is passed to
+// the ordinary system `ssh` executable as a destination argument: the
+// detached worker stages the workspace into the remote
+// `~/.vci/state/work/<run>` tree and runs the selected runtime there. The
+// orchestrator selector above remains the only client-side remote target;
+// Host is coordinator-owned per-slot routing and never appears on a client
+// root.
 //
 // Runtime, Image, and Snapshot are the optional container/VM runtime
 // declaration. The default Runtime is empty (bare host): the project's
-// command runs directly on the coordinator host, exactly as before. A
+// command runs directly on the machine's host, exactly as before. A
 // `runtime = "docker"` Machine mounts the per-run workspace read-only into
 // the container at /vci/work and runs the command inside it. The image
 // reference is verbatim (the coordinator never builds, pulls, or pins from
 // inside Vci); a digest-shaped value is preferred but tags are accepted as
-// documented. VM mode is reserved for the future slice; the current
-// validator rejects it as `unsupported_runtime`.
+// documented. A `runtime = "vm"` Machine shares the per-run workspace
+// read-write with the guest via the system VM binary at /vci/work. Host
+// and Runtime are orthogonal: bare, docker, and vm all run on either the
+// coordinator host or the named remote host.
 type Machine struct {
 	MaxConcurrent int    `toml:"max_concurrent" json:"max_concurrent,omitempty"`
+	Host          string `toml:"host" json:"host,omitempty"`
 	Runtime       string `toml:"runtime" json:"runtime,omitempty"`
 	Image         string `toml:"image" json:"image,omitempty"`
 	Snapshot      string `toml:"snapshot" json:"snapshot,omitempty"`
@@ -162,6 +173,35 @@ func Validate(cfg Config) error {
 	return validateClient(cfg)
 }
 
+// ValidateMachineHost enforces the documented machine `host` rules: the
+// value may be empty (the machine runs on the coordinator host) or a strict
+// SSH destination — no whitespace or control characters, no leading `-`
+// (option-like), no `://` scheme, no `..` path segment. The value is passed
+// to the system `ssh` executable as a destination argument, so it must be
+// safe as a positional argument, exactly like ValidateOrchestrator.
+func ValidateMachineHost(host string) error {
+	if host == "" {
+		return nil
+	}
+	if strings.HasPrefix(host, "-") {
+		return fmt.Errorf("machine host %q looks like an option flag", host)
+	}
+	for _, r := range host {
+		if unicode.IsSpace(r) || r < 0x20 || r == 0x7f {
+			return fmt.Errorf("machine host %q contains whitespace or control characters", host)
+		}
+	}
+	if strings.Contains(host, "://") {
+		return fmt.Errorf("machine host %q must not use a scheme", host)
+	}
+	for _, segment := range strings.Split(host, "/") {
+		if segment == ".." {
+			return fmt.Errorf("machine host %q must not contain a .. segment", host)
+		}
+	}
+	return nil
+}
+
 // ValidateOrchestrator rejects empty, option-like, whitespace, or control-
 // character values. The string is passed to the system `ssh` executable, so
 // it must be safe as a destination argument.
@@ -199,6 +239,9 @@ func validateCoordinator(cfg Config) error {
 		}
 		if machine.MaxConcurrent < 0 {
 			return fmt.Errorf("machine %q has negative max_concurrent", name)
+		}
+		if err := ValidateMachineHost(machine.Host); err != nil {
+			return err
 		}
 		if err := ValidateMachineRuntime(name, machine); err != nil {
 			return err

@@ -599,16 +599,31 @@ func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (Buil
 		project.Command = record.Command
 	}
 	execRunner := selectExecutor(snapshot)
-	execResult, execErr := execRunner.ExecuteSupervised(workerCtx, executor.Request{Executable: project.Command[0], Args: project.Command[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
-		execution := process.Execution{SchemaVersion: model.SchemaVersion, RunID: id, Owner: owner, PID: running.PID, PGID: running.PGID, StartedAt: running.StartedAt, CancellationPhase: process.CancellationNone}
-		return process.WriteExecution(filepath.Join(runDir, "execution.json"), execution)
-	})
-	// The child has been waited/reaped before this point. No external process is
-	// ever signalled; only Native's retained child supervisor can do that.
-	executionPath := filepath.Join(runDir, "execution.json")
-	if execution, readErr := process.ReadExecution(executionPath, id); readErr == nil {
-		execution.CancellationPhase = process.CancellationReaped
-		_ = process.WriteExecution(executionPath, execution)
+	machine := resolvedMachine(snapshot)
+	var execResult executor.Result
+	var execErr error
+	var collectedArtifacts []string
+	var artifactsTruncated bool
+	if machine.Host != "" {
+		// Remote host execution: the detached worker delegates to the
+		// machine's host via the ordinary system `ssh`. The remote
+		// lifecycle (stage, run, fetch artifacts, cleanup) lives in
+		// executeRemote; the local executor and its execution.json
+		// bookkeeping are skipped because the supervised child is the
+		// ssh process, not a locally-retained process.
+		execResult, collectedArtifacts, artifactsTruncated, execErr = executeRemote(workerCtx, l, id, runDir, machine, workspace, project, pair)
+	} else {
+		execResult, execErr = execRunner.ExecuteSupervised(workerCtx, executor.Request{Executable: project.Command[0], Args: project.Command[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
+			execution := process.Execution{SchemaVersion: model.SchemaVersion, RunID: id, Owner: owner, PID: running.PID, PGID: running.PGID, StartedAt: running.StartedAt, CancellationPhase: process.CancellationNone}
+			return process.WriteExecution(filepath.Join(runDir, "execution.json"), execution)
+		})
+		// The child has been waited/reaped before this point. No external process is
+		// ever signalled; only Native's retained child supervisor can do that.
+		executionPath := filepath.Join(runDir, "execution.json")
+		if execution, readErr := process.ReadExecution(executionPath, id); readErr == nil {
+			execution.CancellationPhase = process.CancellationReaped
+			_ = process.WriteExecution(executionPath, execution)
+		}
 	}
 	if ownershipLost.Load() {
 		_ = removeOwned(workspace)
@@ -619,10 +634,10 @@ func ExecutePrepared(ctx context.Context, l layout.Layout, id model.RunID) (Buil
 	// `running`; artifact collection is read-only against the
 	// source workspace and writes only into the run's owned
 	// artifacts directory. The collector caps at 64 MiB and sets
-	// ArtifactsTruncated if any match overflows.
-	var collectedArtifacts []string
-	var artifactsTruncated bool
-	if len(snapshot.ProjectConfig.Artifacts) > 0 {
+	// ArtifactsTruncated if any match overflows. Local runs only:
+	// the remote path already fetched and collected inside
+	// executeRemote.
+	if machine.Host == "" && len(snapshot.ProjectConfig.Artifacts) > 0 {
 		var collectErr error
 		collectedArtifacts, artifactsTruncated, collectErr = CollectArtifacts(workspace, runDir, snapshot.ProjectConfig.Artifacts)
 		if collectErr != nil {

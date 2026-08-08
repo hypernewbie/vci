@@ -46,7 +46,7 @@ func runSetup(args []string) (any, *model.VciError) {
 			return nil, errMsg
 		}
 		if len(args) < 3 {
-			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add|remove <name> [--capacity <positive-int>].", false)
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add|remove <name> [--capacity <positive-int>] [--host <ssh-destination>] [--runtime <docker|vm>] [--image <ref>] [--snapshot <ref>].", false)
 		}
 		switch args[1] {
 		case "add":
@@ -54,7 +54,7 @@ func runSetup(args []string) (any, *model.VciError) {
 			machine := config.Machine{}
 			i := 2
 			if i >= len(args) {
-				return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add <name> [--capacity <positive-int>].", false)
+				return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add <name> [--capacity <positive-int>] [--host <ssh-destination>] [--runtime <docker|vm>] [--image <ref>] [--snapshot <ref>].", false)
 			}
 			name = args[i]
 			i++
@@ -69,6 +69,15 @@ func runSetup(args []string) (any, *model.VciError) {
 						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--capacity must be a positive integer.", false)
 					}
 					machine.MaxConcurrent = n
+					i++
+				case "--host":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--host requires an ssh destination.", false)
+					}
+					machine.Host = args[i+1]
+					if err := config.ValidateMachineHost(machine.Host); err != nil {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, err.Error(), false)
+					}
 					i++
 				case "--runtime":
 					if i+1 >= len(args) {
@@ -98,6 +107,9 @@ func runSetup(args []string) (any, *model.VciError) {
 			result := map[string]any{"machine": name, "updated": true}
 			if machine.MaxConcurrent > 0 {
 				result["max_concurrent"] = machine.MaxConcurrent
+			}
+			if machine.Host != "" {
+				result["host"] = machine.Host
 			}
 			if machine.Runtime != "" {
 				result["runtime"] = machine.Runtime

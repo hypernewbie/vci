@@ -54,8 +54,11 @@ symlink, wrong-body, or future-dated claim surfaces as a hard error
 from `Status`, `Reap`, and `ReserveAndPublish`; only
 `ReserveAndPublish` may create a claim, and only with a publish
 callback that persists a real run record. There is no queue, no
-wait, no remote worker, no Docker, no VM — slots are local capacity
-on this coordinator host.
+wait, no relay, and no daemon. Slots are per-machine capacity. A
+machine without a `host` runs its worker on this coordinator host —
+bare, or inside the machine's declared docker/VM runtime; a machine
+with a `host` runs its worker on that host through ordinary `ssh`
+(see Remote host below).
 
 ## First commands — client
 
@@ -107,6 +110,9 @@ max_bytes = 536870912
 
 [machines.mac-local]
 
+[machines.mac-remote]
+host = "builder"          # system ssh alias; empty means local
+
 [projects.Vci]
 machines = ["mac-local"]
 command = ["go", "test", "./..."]
@@ -120,6 +126,17 @@ The orchestrator selector is strict: it must not be empty, may not
 begin with `-`, and may not contain whitespace or control characters.
 A missing selector decodes as `self` for compatibility with existing
 local roots; `setup init` writes it explicitly.
+
+A machine may declare a `host` — a strict system `ssh` destination
+(an alias such as `builder`, or `user@host`). Empty means the worker
+runs on the coordinator host itself. `setup machine add --host`
+accepts only values that pass the same validation as the
+orchestrator: no leading `-`, no whitespace or control characters,
+no `://` scheme, and no `..` path segment. `host` is optional for
+every runtime — bare, docker, and vm all run locally when it is
+empty and on the named host via `ssh` when it is set. Client roots
+reject every `[machines.*]` table, including one that only sets
+`host`.
 
 Run workspaces are temporary and deleted after result publication.
 Source blobs and manifests are content-addressed. Logs and byte-based
@@ -302,8 +319,42 @@ retryable envelope (binary missing or daemon refuses);
 envelope (binary reports image-not-found).
 
 The deferred extensions — image build/push inside Vci, automatic
-registry auth, remote docker or remote VM, multi-host worker
-selection — are not part of this release.
+registry auth, and multi-host worker selection — are not part of
+this release. Remote execution exists only through a machine's
+`host` field (a system `ssh` destination): the coordinator stages
+the workspace into the host's `~/.vci/state/work/<run>` tree and
+runs the same bare/docker/vm path there via ordinary `ssh` — no
+relay, daemon, framed protocol, or Go SSH client.
+
+## Remote host (per-machine, optional)
+
+A machine may declare a `host` — a strict system `ssh` destination
+(an alias such as `builder`, or `user@host`) — that the coordinator
+reaches with the ordinary `ssh` executable. Empty means the worker
+runs on the coordinator host itself. Bare, docker, and vm machines
+all work on either side: the detached worker stages the materialized
+workspace into the remote `~/.vci/state/work/<run>` tree over the
+existing `tar | ssh` channel, runs the selected runtime there via
+`ssh <host> <sh -c ...>` (docker run, tart run, or a bare shell
+command, exactly as locally), and — when the project declares
+artifacts — fetches the remote tree back with `scp` over the same
+ssh channel before the coordinator's own collector publishes the
+matches into `state/runs/<run_id>/artifacts/`. Only the workspace
+path and the project's environment map cross the ssh boundary;
+`~/.vci` state roots, `~/.ssh`, and `VCI_ROOT` never do.
+
+```sh
+vci setup machine add mac-remote --host builder --runtime vm --snapshot ghcr.io/org/vm:pin
+```
+
+No new protocol or subcommand is introduced: `orchestrator` still
+selects the single coordinator, and `host` selects the worker host
+for that machine's slot. The reaper owns every temp root —
+coordinator `state/tmp` staging, per-run `state/work/<run>/.tmp`
+and `.home`, the whole workspace once a terminal run's lease is
+gone, and the mirrored remote `~/.vci/state/work/<run>` tree via
+`ssh <host> rm -rf -- <path>` — so neither a local nor a remote run
+can leave a `.../state: Directory not empty` turd behind.
 
 ## Artifact collection (per-project, optional)
 
@@ -323,6 +374,11 @@ files, `..` escapes, and `.git`/`.vci` paths are rejected. The
 per-run total byte cap is 64 MiB; matches beyond the cap are
 dropped and `artifacts_truncated` is set on the build envelope.
 `vci check <run_id>` surfaces `artifacts` and `artifacts_truncated`.
+For a machine with a remote `host`, the matches are copied back from
+the host's staged workspace with `scp` over the same ssh channel
+before the same collector publishes them locally, so the durable
+artifact root is always `state/runs/<run_id>/artifacts/` on the
+coordinator.
 
 ## Build and development
 

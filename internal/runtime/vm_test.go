@@ -368,3 +368,28 @@ exit 0
 		}
 	}
 }
+
+// TestVMCommandArgvRemoteVerbatimWorkspace pins that the remote-host
+// mirror of CommandArgv uses the workspace path verbatim (no local
+// filepath.Abs), because the path names a directory on the remote
+// host reached via ssh. Every other arg matches the local shape.
+func TestVMCommandArgvRemoteVerbatimWorkspace(t *testing.T) {
+	v := VM{Snapshot: "ghcr.io/org/vm:pin", Binary: "tart"}
+	argv, err := v.CommandArgvRemote("~/.vci/state/work/run_abc", []string{"go", "test", "./..."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := []string{
+		"tart", "run", "--no-gui",
+		"--dir", "~/.vci/state/work/run_abc:/vci/work",
+		"--workdir", "/vci/work",
+		"--cpus", "2",
+		"--memory", "4g",
+		"ghcr.io/org/vm:pin",
+		"--",
+		"go", "test", "./...",
+	}
+	if !equalSlice(argv, wantPrefix) {
+		t.Fatalf("argv: got %v want %v", argv, wantPrefix)
+	}
+}

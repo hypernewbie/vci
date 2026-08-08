@@ -160,6 +160,7 @@ func TestCompiledBinaryContractsAndAbort(t *testing.T) {
 	for time.Now().Before(deadline) {
 		response := invoke(t, bin, root, "check", id)
 		if state, _ := objectData(t, response)["state"].(string); state == "succeeded" {
+			waitWorkerSettled(t, root, id)
 			goto abortCase
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -186,11 +187,62 @@ abortCase:
 	for time.Now().Before(deadline) {
 		response := invoke(t, bin, root, "check", id)
 		if state, _ := objectData(t, response)["state"].(string); state == "aborted" {
+			waitWorkerSettled(t, root, id)
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal(fmt.Sprintf("abort did not converge for %s", id))
+}
+
+// waitWorkerSettled waits (bounded) for the detached worker of a
+// terminal run to release its owned state. The CLI publishes the
+// terminal record before the worker finishes removing its workspace,
+// releasing its lease, and releasing its scheduler claim; a test that
+// returns at the terminal state would race the framework's TempDir
+// cleanup against a still-writing worker and leave a
+// `.../state: Directory not empty` turd under VCI_ROOT. Each predicate
+// is a path the worker removes itself, so once all three hold no worker
+// write can still land under state/. (state/locks/scheduler.lock and
+// state/runs/<run>/run.lock are persistent by design and are not
+// predicates; the scheduler claim removal is the worker's last write.)
+func waitWorkerSettled(t *testing.T, root, id string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		workGone := !pathExists(filepath.Join(root, "state", "work", id))
+		leaseGone := !pathExists(filepath.Join(root, "state", "runs", id, "lease.json"))
+		claimGone := !runClaimExists(root, id)
+		if workGone && leaseGone && claimGone {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("worker state did not settle for %s", id)
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// runClaimExists reports whether any scheduler claim file for the run
+// id remains under state/machine-claims/<machine>/.
+func runClaimExists(root, id string) bool {
+	claims := filepath.Join(root, "state", "machine-claims")
+	entries, err := os.ReadDir(claims)
+	if err != nil {
+		return false
+	}
+	for _, machineDir := range entries {
+		if !machineDir.IsDir() {
+			continue
+		}
+		if pathExists(filepath.Join(claims, machineDir.Name(), id+".json")) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCompiledBinaryUnknownCommandIsJSON(t *testing.T) {

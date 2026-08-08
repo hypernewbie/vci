@@ -1,12 +1,18 @@
 package reaper
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/hypernewbie/vci/internal/config"
+	"github.com/hypernewbie/vci/internal/host"
 	"github.com/hypernewbie/vci/internal/layout"
 	"github.com/hypernewbie/vci/internal/lease"
 	"github.com/hypernewbie/vci/internal/model"
@@ -21,6 +27,9 @@ type Report struct {
 	MarkedLost                int   `json:"marked_lost"`
 	QueuedAborted             int   `json:"queued_aborted"`
 	TransferRemoved           int   `json:"transfer_removed"`
+	PerRunTmpRemoved          int   `json:"per_run_tmp_removed"`
+	WorkspacesRemoved         int   `json:"workspaces_removed"`
+	RemoteCleaned             int   `json:"remote_cleaned"`
 	SourceCacheRemoved        int   `json:"source_cache_removed"`
 	SourceCacheScratchRemoved int   `json:"source_cache_scratch_removed"`
 	SourceCacheBytes          int64 `json:"source_cache_bytes"`
@@ -166,6 +175,18 @@ func Run(l layout.Layout, now time.Time) (Report, error) {
 		report.TransferRemoved = removed
 	}
 
+	// Per-run workspace and remote turd ownership. The reaper owns
+	// state/work/<run>/.tmp, .home, and the workspace itself after a
+	// terminal run's lease is gone, plus the mirrored remote tree for
+	// host machines. See reapWorkDirs and reapRemoteTurds.
+	if tmpRemoved, workspacesRemoved, err := reapWorkDirs(l, now); err != nil {
+		return report, err
+	} else {
+		report.PerRunTmpRemoved = tmpRemoved
+		report.WorkspacesRemoved = workspacesRemoved
+	}
+	report.RemoteCleaned = reapRemoteTurds(l, now)
+
 	if removed, scratch, bytes, total, rejected, err := ReapSourceCache(l.SourceCacheDir(), sourceCacheQuota(l)); err != nil {
 		return report, err
 	} else {
@@ -277,4 +298,170 @@ func reapTransferDirs(tempDir string, now time.Time) (int, error) {
 
 func removeTree(path string) error {
 	return os.RemoveAll(path)
+}
+
+// isTerminal reports whether a run state is final and immutable.
+func isTerminal(state model.RunState) bool {
+	return state == model.RunSucceeded || state == model.RunFailed || state == model.RunLost || state == model.RunAborted
+}
+
+// reapWorkDirs owns per-run workspace cleanup under state/work:
+//   - `.tmp`/`.home` subdirs inside a workspace that is no longer
+//     protected by a live worker lease are removed when older than
+//     transferStaleAge (a live run owns its temp roots);
+//   - a whole workspace is removed when its run record is terminal
+//     and its worker lease is gone — the worker already released the
+//     lease only after removeOwned, so a terminal record with no
+//     live lease cannot race a live worker.
+//
+// Returns the number of per-run temp roots removed and the number of
+// whole workspaces removed.
+func reapWorkDirs(l layout.Layout, now time.Time) (int, int, error) {
+	entries, err := os.ReadDir(l.WorkDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	runStore := store.Store{Layout: l}
+	tmpRemoved, workspacesRemoved := 0, 0
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasSuffix(entry.Name(), ".partial") {
+			continue
+		}
+		id := model.RunID(entry.Name())
+		if !model.ValidRunID(id) {
+			continue
+		}
+		record, loadErr := runStore.Load(id)
+		leaseRecord, leaseErr := lease.Read(l, id)
+		liveLease := leaseErr == nil && leaseRecord.ExpiresAt.After(now.Add(-renewalGrace))
+		terminal := loadErr == nil && isTerminal(record.State)
+		workDir := filepath.Join(l.WorkDir(), entry.Name())
+		// 1. Stale per-run temp roots. Only when no live lease: a
+		// live worker owns .tmp/.home and may still be writing them.
+		if !liveLease {
+			for _, sub := range []string{".tmp", ".home"} {
+				p := filepath.Join(workDir, sub)
+				info, statErr := os.Stat(p)
+				if statErr != nil {
+					continue
+				}
+				if info.ModTime().After(now.Add(-transferStaleAge)) {
+					continue
+				}
+				if err := removeTree(p); err == nil {
+					tmpRemoved++
+				}
+			}
+		}
+		// 2. Whole workspace: terminal run, lease gone.
+		if terminal && !liveLease {
+			if err := removeTree(workDir); err != nil {
+				return tmpRemoved, workspacesRemoved, err
+			}
+			workspacesRemoved++
+		}
+	}
+	return tmpRemoved, workspacesRemoved, nil
+}
+
+// reapRemoteTurds sweeps the mirrored remote workspace trees of
+// terminal runs whose reserved machine declared a remote host. A
+// terminal run whose worker lease is gone cannot have a live remote
+// worker, so the remote `~/.vci/state/work/<run>` tree is a turd
+// owned by the reaper. Cleanup is best-effort: an unreachable or
+// misconfigured host counts as nothing to report, and every ssh call
+// is bounded by CleanupRemote's timeout.
+func reapRemoteTurds(l layout.Layout, now time.Time) int {
+	runStore := store.Store{Layout: l}
+	entries, err := os.ReadDir(l.RunsDir())
+	if err != nil {
+		return 0
+	}
+	cleaned := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := model.RunID(entry.Name())
+		if !model.ValidRunID(id) {
+			continue
+		}
+		record, loadErr := runStore.Load(id)
+		if loadErr != nil || !isTerminal(record.State) {
+			continue
+		}
+		leaseRecord, leaseErr := lease.Read(l, id)
+		if leaseErr == nil && leaseRecord.ExpiresAt.After(now.Add(-renewalGrace)) {
+			// The worker may still be terminalizing; its lease is
+			// released only after removeOwned completes.
+			continue
+		}
+		hostName, ok := remoteHostFor(record)
+		if !ok {
+			continue
+		}
+		remoteWorkDir, err := host.RemoteWorkDir(id)
+		if err != nil {
+			continue
+		}
+		if err := CleanupRemote(context.Background(), hostName, remoteWorkDir); err == nil {
+			cleaned++
+		}
+	}
+	return cleaned
+}
+
+// remoteHostFor returns the machine host of a run's reserved machine
+// by decoding the durable config snapshot. A missing or malformed
+// snapshot, an unknown machine, or an empty host yields ok=false: the
+// reaper never invokes ssh on guesswork.
+func remoteHostFor(record store.RunRecord) (string, bool) {
+	var snap struct {
+		Machine  string                    `json:"machine"`
+		Machines map[string]config.Machine `json:"machines"`
+	}
+	if err := json.Unmarshal(record.ConfigSnapshot, &snap); err != nil {
+		return "", false
+	}
+	name := snap.Machine
+	if name == "" {
+		return "", false
+	}
+	machine, ok := snap.Machines[name]
+	if !ok || machine.Host == "" {
+		return "", false
+	}
+	return machine.Host, true
+}
+
+// CleanupRemote removes a Vci-owned remote tree via the ordinary
+// system `ssh` executable: `ssh <host> rm -rf -- <path>`. Both the
+// host and the path are strictly validated before any subprocess
+// runs, and the validated path is embedded as exactly one shell word
+// (a fixed layout plus a validated run id), so a crafted machine host
+// or run id can never inject shell text. The call is bounded by a
+// 30-second timeout so an unreachable host cannot wedge maintenance.
+func CleanupRemote(ctx context.Context, hostName, remotePath string) error {
+	if err := host.ValidateHost(hostName); err != nil {
+		return err
+	}
+	if err := host.ValidateRemotePath(remotePath); err != nil {
+		return err
+	}
+	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cleanupCtx, "ssh", hostName, "rm -rf -- "+remotePath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("cleanup remote %s: %s", hostName, message)
+	}
+	return nil
 }
