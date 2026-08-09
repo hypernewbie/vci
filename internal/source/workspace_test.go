@@ -191,6 +191,43 @@ func TestReconstructSeedlessFromFullBundle(t *testing.T) {
 	}
 }
 
+func TestReconstructInitsSubmodules(t *testing.T) {
+	// Git blocks the file:// transport by default; allow it so the test can
+	// clone a local submodule. Production submodules use https or ssh.
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+	sub := t.TempDir()
+	runGit(t, sub, "init", "-q")
+	if err := os.WriteFile(filepath.Join(sub, "vendored.txt"), []byte("from-sub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, sub, "add", "vendored.txt")
+	runGit(t, sub, "commit", "-q", "-m", "submodule base")
+
+	mainRepo := t.TempDir()
+	runGit(t, mainRepo, "init", "-q")
+	runGit(t, mainRepo, "submodule", "add", sub, "vendor/sub")
+	runGit(t, mainRepo, "commit", "-q", "-m", "with submodule")
+	head := gitSha(t, mainRepo, "HEAD")
+
+	bundle, err := CreateBundle(context.Background(), mainRepo, "", head, process.Native{})
+	if err != nil {
+		t.Fatalf("bundle: %v", err)
+	}
+	w := t.TempDir()
+	if err := ReconstructWorkspace(context.Background(), "", w, head, bundle, LocalChanges{}, nil, process.Native{}); err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(w, "vendor", "sub", "vendored.txt"))
+	if err != nil {
+		t.Fatalf("submodule content missing: %v", err)
+	}
+	if string(got) != "from-sub" {
+		t.Fatalf("submodule content = %q, want from-sub", got)
+	}
+}
+
 func TestReconstructWorkspaceAppliesExclusions(t *testing.T) {
 	seed := t.TempDir()
 	runGit(t, seed, "init", "-q")

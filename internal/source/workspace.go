@@ -124,8 +124,21 @@ func ReconstructWorkspace(ctx context.Context, seedPath, workspace, head string,
 			return err
 		}
 	}
+	if err := initSubmodules(ctx, workspace, runner); err != nil {
+		return err
+	}
 	if err := ApplyLC(ctx, workspace, lc, runner); err != nil {
 		return err
 	}
 	return ApplyExclusions(workspace, exclusions)
+}
+
+// initSubmodules materializes a workspace's submodules at the committed gitlinks.
+// A workspace without submodules is a no-op. Submodule content is not carried by
+// the Git bundle, so the coordinator clones it from the configured remotes.
+func initSubmodules(ctx context.Context, workspace string, runner process.Runner) error {
+	if _, err := runGitOutput(ctx, runner, workspace, "submodule", "update", "--init", "--recursive"); err != nil {
+		return fmt.Errorf("init submodules: %w", err)
+	}
+	return nil
 }
