@@ -112,3 +112,40 @@ func TestApplyLCRejectsUnsafePaths(t *testing.T) {
 		}
 	}
 }
+
+func TestPackageUnpackageLCRoundTrip(t *testing.T) {
+	src := t.TempDir()
+	runGit(t, src, "init", "-q")
+	lcWriteFile(t, src, "keep.txt", "v")
+	runGit(t, src, "add", "keep.txt")
+	runGit(t, src, "commit", "-q", "-m", "base")
+	lcWriteFile(t, src, "keep.txt", "changed")
+	lcWriteFile(t, src, "untracked.txt", "new")
+	if err := os.Symlink("/tmp/p", filepath.Join(src, "sym")); err != nil {
+		t.Fatal(err)
+	}
+
+	original, err := CaptureLocalChanges(context.Background(), src, process.Native{})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	rc, err := PackageLC(original)
+	if err != nil {
+		t.Fatalf("package: %v", err)
+	}
+	got, err := UnpackageLC(rc)
+	if err != nil {
+		t.Fatalf("unpackage: %v", err)
+	}
+
+	dst := t.TempDir()
+	lcCloneInto(t, src, dst)
+	if err := ApplyLC(context.Background(), dst, got, process.Native{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	lcAssertContent(t, dst, "keep.txt", "changed")
+	lcAssertContent(t, dst, "untracked.txt", "new")
+	if target, err := os.Readlink(filepath.Join(dst, "sym")); err != nil || target != "/tmp/p" {
+		t.Fatalf("sym = %q, %v", target, err)
+	}
+}

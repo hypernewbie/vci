@@ -1,9 +1,11 @@
 package source
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -146,4 +148,83 @@ func runGitBytes(ctx context.Context, runner process.Runner, repoRoot string, ar
 		return nil, fmt.Errorf("git %s exited %d", strings.Join(args, " "), res.ExitCode)
 	}
 	return buf.Bytes(), nil
+}
+
+// PackageLC serializes local changes into a deterministic tar: a "patch" entry
+// for the tracked-change bytes and one "f/"-prefixed entry per untracked file.
+// The prefix keeps untracked paths from colliding with the reserved patch name.
+// UnpackageLC is the inverse and is safe on untrusted input: it reads entries
+// into memory and never writes to disk.
+func PackageLC(lc LocalChanges) (io.ReadCloser, error) {
+	var buf bytes.Buffer
+	if err := writeLCTar(&buf, lc); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+}
+
+func writeLCTar(w io.Writer, lc LocalChanges) error {
+	tw := tar.NewWriter(w)
+	if len(lc.Patch) > 0 {
+		if err := tw.WriteHeader(&tar.Header{Name: "patch", Mode: 0o644, Size: int64(len(lc.Patch)), Typeflag: tar.TypeReg}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(lc.Patch); err != nil {
+			return err
+		}
+	}
+	files := append([]UntrackedFile(nil), lc.Untracked...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	for _, f := range files {
+		name := "f/" + f.Path
+		if f.Symlink {
+			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: int64(f.Mode.Perm()), Typeflag: tar.TypeSymlink, Linkname: f.Link}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: int64(f.Mode.Perm()), Size: int64(len(f.Content)), Typeflag: tar.TypeReg}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(f.Content); err != nil {
+			return err
+		}
+	}
+	return tw.Close()
+}
+
+func UnpackageLC(r io.Reader) (LocalChanges, error) {
+	tr := tar.NewReader(r)
+	var lc LocalChanges
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return LocalChanges{}, fmt.Errorf("read local-changes tar: %w", err)
+		}
+		switch {
+		case h.Name == "patch":
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return LocalChanges{}, err
+			}
+			lc.Patch = data
+		case strings.HasPrefix(h.Name, "f/"):
+			path := strings.TrimPrefix(h.Name, "f/")
+			if h.Typeflag == tar.TypeSymlink {
+				lc.Untracked = append(lc.Untracked, UntrackedFile{Path: path, Mode: os.FileMode(h.Mode).Perm(), Symlink: true, Link: h.Linkname})
+				continue
+			}
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return LocalChanges{}, err
+			}
+			lc.Untracked = append(lc.Untracked, UntrackedFile{Path: path, Mode: os.FileMode(h.Mode).Perm(), Content: data})
+		default:
+			return LocalChanges{}, fmt.Errorf("unexpected local-changes tar entry %q", h.Name)
+		}
+	}
+	return lc, nil
 }
