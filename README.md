@@ -41,6 +41,7 @@ The agent can now run the job:
 
 ```sh
 vci build .
+vci watch <run-id>
 vci check <run-id>
 vci logs <run-id> --tail 100
 ```
@@ -79,6 +80,7 @@ The agent reads durable results from the coordinator:
 
 ```sh
 vci check <run-id>
+vci watch <run-id> [--interval <seconds>] [--exit-status]
 vci logs <run-id> [--stderr] [--tail <n>]
 vci artifacts ls <run-id>
 vci artifacts get <run-id> <path>

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `vci watch <run-id>` to poll a run until it reaches a terminal
+  state. State changes are written to stderr and the final result is
+  emitted as one JSON envelope on stdout. `--interval` controls the
+  polling period (1..3600 seconds, default 3); `--exit-status` returns
+  exit code 1 for failed, lost, or aborted runs.
 - Plan 17 adds a read-only run log CLI. `vci logs <run-id>` streams
   the run's durable `stdout.log` bytes to stdout (binary-safe);
   `vci logs <run-id> --stderr` selects `stderr.log`; `--tail <n>`

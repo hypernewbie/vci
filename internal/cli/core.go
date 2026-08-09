@@ -26,7 +26,7 @@ func Parse(args []string) (Command, *model.VciError) {
 	}
 	name := args[0]
 	switch name {
-	case "build", "check", "abort", "projects", "machines", "setup", "internal-run", "artifacts", "logs":
+	case "build", "check", "watch", "abort", "projects", "machines", "setup", "internal-run", "artifacts", "logs":
 		return Command{Name: name, Args: append([]string(nil), args[1:]...)}, nil
 	default:
 		return Command{}, model.NewError("unknown_command", model.FailureUsage, fmt.Sprintf("Command %q is not recognized.", name), false)

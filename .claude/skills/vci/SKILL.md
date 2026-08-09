@@ -87,17 +87,31 @@ also includes exit code, failure category, truncation flags, and artifact
 fields. A `lost` or early-aborted run can have only its terminal record;
 treat absent result fields as unavailable.
 
-### 3. Wait / watch (bounded polling)
+### 3. Wait / watch
 
-There is no `--follow`, `--watch`, or streaming mode. Poll `check` at a
-modest interval (every 5–10 seconds) until `data.state` is terminal or a
-deadline passes:
+Use the built-in watcher when you want Vci to wait for completion:
+
+```sh
+vci watch <run-id>
+vci watch <run-id> --interval 5
+vci watch <run-id> --exit-status
+```
+
+`watch` writes state changes to stderr and emits one final JSON envelope on
+stdout. The default interval is 3 seconds and valid values are 1–3600
+seconds. `--exit-status` returns exit code 1 when the final state is `failed`,
+`lost`, or `aborted`.
+
+For agents that need bounded control, poll `check` at a modest interval
+every 5–10 seconds until `data.state` is terminal or a deadline passes:
 
 - Active states: `queued`, `staging`, `running`, `committing`
 - **Terminal states: `succeeded`, `failed`, `lost`, `aborted`**
 
 Stop polling on any terminal state or when the deadline (for example 30
-minutes, or a user-given cap) is hit; never busy-loop.
+minutes, or a user-given cap) is hit; never busy-loop. `watch` itself has no
+deadline; interrupt it or use bounded `check` polling when a deadline is
+required.
 
 ### 4. Read logs
 
@@ -149,8 +163,8 @@ explicitly with `vci build .` and treat the new run ID as authoritative.
   (exit 2).
 - Diagnostics and progress go to **stderr**; ignore them for result
   parsing.
-- Do not add a `--json` flag — JSON is the default and flags like
-  `--watch`/`--follow` do not exist.
+- Do not add a `--json` flag — JSON is the default. `watch` is the polling
+  command; there is no `logs --follow` stream.
 
 ## What a build tests
 

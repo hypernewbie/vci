@@ -38,6 +38,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	if parsed.Name == "logs" {
 		return runLogs(parsed.Args, stdout, stderr)
 	}
+	if parsed.Name == "watch" {
+		return runWatch(parsed.Args, stdout, stderr)
+	}
 	response, exitCode := dispatch(parsed.Name, parsed.Args)
 	if err := Write(stdout, response); err != nil {
 		fmt.Fprintln(stderr, err)
@@ -146,29 +149,7 @@ func dispatch(command string, args []string) (Response, int) {
 		}
 		return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
 	case "check":
-		if len(args) != 1 || !model.ValidRunID(model.RunID(args[0])) {
-			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: check <run-id>.", false)), 2
-		}
-		l, err := resolveLayout()
-		if err != nil {
-			return appFailure(command, err), 2
-		}
-		remoteConfigured, remoteErr := app.RemoteConfigured(l)
-		if remoteErr != nil {
-			return appFailure(command, remoteErr), 2
-		}
-		if remoteConfigured {
-			if raw, remote, remoteErr := app.RemoteCheck(context.Background(), l, model.RunID(args[0])); remoteErr != nil {
-				return appFailure(command, remoteErr), 2
-			} else if remote {
-				return decodeRemoteResponse(command, raw)
-			}
-		}
-		result, err := app.Check(l, model.RunID(args[0]))
-		if err != nil {
-			return appFailure(command, err), 2
-		}
-		return Success(command, result), 0
+		return checkRun(context.Background(), args)
 	case "abort":
 		if len(args) != 1 || !model.ValidRunID(model.RunID(args[0])) {
 			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: abort <run-id>.", false)), 2
@@ -215,6 +196,33 @@ func dispatch(command string, args []string) (Response, int) {
 	default:
 		return Failure(command, model.NewError("unknown_command", model.FailureUsage, fmt.Sprintf("Command %q is not recognized.", command), false)), 2
 	}
+}
+
+func checkRun(ctx context.Context, args []string) (Response, int) {
+	const command = "check"
+	if len(args) != 1 || !model.ValidRunID(model.RunID(args[0])) {
+		return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: check <run-id>.", false)), 2
+	}
+	l, err := resolveLayout()
+	if err != nil {
+		return appFailure(command, err), 2
+	}
+	remoteConfigured, remoteErr := app.RemoteConfigured(l)
+	if remoteErr != nil {
+		return appFailure(command, remoteErr), 2
+	}
+	if remoteConfigured {
+		if raw, remote, remoteErr := app.RemoteCheck(ctx, l, model.RunID(args[0])); remoteErr != nil {
+			return appFailure(command, remoteErr), 2
+		} else if remote {
+			return decodeRemoteResponse(command, raw)
+		}
+	}
+	result, err := app.Check(l, model.RunID(args[0]))
+	if err != nil {
+		return appFailure(command, err), 2
+	}
+	return Success(command, result), 0
 }
 
 func decodeRemoteResponse(command string, raw []byte) (Response, int) {
