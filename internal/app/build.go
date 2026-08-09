@@ -16,7 +16,6 @@ import (
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/process"
-	"github.com/hypernewbie/vci/internal/reaper"
 	"github.com/hypernewbie/vci/internal/runtime"
 	"github.com/hypernewbie/vci/internal/scheduler"
 	"github.com/hypernewbie/vci/internal/source"
@@ -81,61 +80,24 @@ func Prepare(ctx context.Context, l model.Layout, sourcePath string) (PreparedRu
 		return PreparedRun{}, fmt.Errorf("project %q has no attached machines", projectName)
 	}
 
-	// Source-cache is local-only; claims persist only through publish.
-	releaseClaim, err := reconcileSourceCache(ctx, l, reaper.SourceCacheQuota(cfg), repo.Root, projectName)
-	if err != nil {
+	// Reject uninitialized submodules and bad LFS pointers before staging.
+	if _, err := source.SelectBuildInput(ctx, repo.Root, process.Native{}); err != nil {
 		return PreparedRun{}, err
-	}
-	if releaseClaim != nil {
-		defer releaseClaim()
-	}
-
-	// Reject uninitialized submodules and bad LFS pointers.
-	graph, err := source.SelectBuildInput(ctx, repo.Root, process.Native{})
-	if err != nil {
-		return PreparedRun{}, err
-	}
-	// A source that is not a Vci staging tree or cache entry is reconstructed
-	// into the run workspace at execution time and needs no manifest.
-	localReconstruct := !isManagedSource(l, repo.Root, projectName)
-	var sourceDigest string
-	if !localReconstruct {
-		snapParent, err := os.MkdirTemp(l.TempDir(), source.SnapshotPrefix)
-		if err != nil {
-			return PreparedRun{}, fmt.Errorf("prepare local snapshot dir: %w", err)
-		}
-		defer os.RemoveAll(snapParent)
-		if _, err := source.MaterializeSnapshot(graph, snapParent); err != nil {
-			return PreparedRun{}, err
-		}
-
-		// Generate the manifest and blobs, validating LFS pointers.
-		manifest, blobs, err := source.BuildWithValidation(repo.Root, graph.LFSFiles)
-		if err != nil {
-			return PreparedRun{}, err
-		}
-		blobStore := source.BlobStore{Layout: l}
-		if err := blobStore.PutManifestAndBlobs(manifest, blobs); err != nil {
-			return PreparedRun{}, err
-		}
-		sourceDigest = manifest.Digest
 	}
 	now := time.Now().UTC()
 	runStore := store.Store{Layout: l}
 	// Reserve one machine and publish a staged run atomically.
-	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, sourceDigest, buildDraftSnapshot(projectName, project, cfg), now)
+	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, "", buildDraftSnapshot(projectName, project, cfg), now)
 	if err != nil {
 		return PreparedRun{}, err
 	}
 	var staged store.RunRecord
 	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
-		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, sourceDigest, buildStagedSnapshot(projectName, project, machineName, cfg, nil), now)
+		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, "", buildStagedSnapshot(projectName, project, machineName, cfg, nil), now)
 		if buildErr != nil {
 			return buildErr
 		}
-		if localReconstruct {
-			record.SourcePath = repo.Root
-		}
+		record.SourcePath = repo.Root
 		if saveErr := runStore.Save(record); saveErr != nil {
 			return saveErr
 		}
@@ -534,16 +496,6 @@ func cleanReconstructStaging(l model.Layout, sourcePath string) {
 		return
 	}
 	_ = os.RemoveAll(parent)
-}
-
-// isManagedSource reports whether repoRoot is a Vci staging tree or cache
-// entry, which follow the manifest path rather than workspace reconstruction.
-func isManagedSource(l model.Layout, repoRoot, projectName string) bool {
-	if _, ok := cacheEntryDigestAt(l, repoRoot, projectName); ok {
-		return true
-	}
-	_, ok := stagingMetaPathAt(l, repoRoot)
-	return ok
 }
 
 // populateWorkspace fills a partial workspace directory for a run. A run with a
