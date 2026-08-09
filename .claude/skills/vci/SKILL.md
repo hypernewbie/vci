@@ -32,7 +32,8 @@ Use this branch only for a request such as “configure this client to use
 `jupiter.local`.” Do not use it to initialize or administer a coordinator.
 
 1. Use the user-specified client root, or `~/.vci` when none is specified.
-2. Create or replace only `<client-root>/config.toml` with:
+2. Inspect the target first: if `<client-root>/config.toml` already exists and is a coordinator root (`orchestrator = "self"` or any `[machines]`/`[projects]`), **stop and ask**. That path owns coordinator state — do not overwrite it. Offer a distinct client root such as `~/.vci-client` or `VCI_ROOT=/tmp/vci-client` instead. Only proceed when the target is absent or already a client profile.
+3. Create or replace only `<client-root>/config.toml` with:
 
    ```toml
    schema_version = 1
@@ -41,7 +42,7 @@ Use this branch only for a request such as “configure this client to use
 
    Preserve normal private file permissions. The destination is an opaque,
    already-working SSH alias or `user@host`; do not test or alter it.
-3. Do not run inventory or build commands as bootstrap validation because they
+4. Do not run inventory or build commands as bootstrap validation because they
    contact the coordinator. Report the configured client root and destination.
 
 If the user does not explicitly provide both client intent and a coordinator
