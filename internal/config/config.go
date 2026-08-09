@@ -54,6 +54,27 @@ type Machine struct {
 	Runtime       string `toml:"runtime" json:"runtime,omitempty"`
 	Image         string `toml:"image" json:"image,omitempty"`
 	Snapshot      string `toml:"snapshot" json:"snapshot,omitempty"`
+	// SourcePaths maps a project name to a local source checkout that seeds
+	// builds on this machine. An absent or empty value means the project has
+	// no local seed on this machine.
+	SourcePaths map[string]string `toml:"source_paths,omitempty" json:"source_paths,omitempty"`
+	// BundleCache bounds this machine's reusable Git-bundle cache.
+	BundleCache BundleCachePolicy `toml:"bundle_cache" json:"bundle_cache,omitempty"`
+}
+
+// BundleCachePolicy bounds a machine's reusable Git-bundle cache.
+// Zero values mean "use the default" and are resolved by the consumer;
+// Validate only rejects negative values.
+type BundleCachePolicy struct {
+	MaxEntries     int   `toml:"max_entries,omitempty" json:"max_entries,omitempty"`
+	MaxBytes       int64 `toml:"max_bytes,omitempty" json:"max_bytes,omitempty"`
+	AdmissionBytes int64 `toml:"admission_bytes,omitempty" json:"admission_bytes,omitempty"`
+}
+
+// DefaultBundleCache returns the policy a machine uses when bundle_cache is
+// omitted or a field is zero: at most 5 entries, 5 GiB bytes, 50 MiB admission.
+func DefaultBundleCache() BundleCachePolicy {
+	return BundleCachePolicy{MaxEntries: 5, MaxBytes: 5 << 30, AdmissionBytes: 50 << 20}
 }
 
 // EffectiveCapacity returns local slot capacity, treating 0 or missing as one.
@@ -72,6 +93,10 @@ type Project struct {
 	// Matching regular files are copied into run artifacts; symlinks, devices,
 	// `..`, `.git`, and `.vci` entries are rejected.
 	Artifacts []string `toml:"artifacts,omitempty" json:"artifacts,omitempty"`
+	// ExcludedPaths are hard coordinator-owned workspace exclusions. They are
+	// applied above repository .gitignore to every workspace, transfer, and
+	// cache path and cannot be bypassed by a client submission or build mode.
+	ExcludedPaths []string `toml:"excluded_paths,omitempty" json:"excluded_paths,omitempty"`
 	// HostedFallback is optional source data for `vci build --hosted`.
 	// URL and Commit must both be set or both be empty.
 	HostedFallback HostedFallback `toml:"hosted_fallback" json:"hosted_fallback,omitempty"`
@@ -203,6 +228,20 @@ func validateCoordinator(cfg Config) error {
 		if err := ValidateMachineRuntime(name, machine); err != nil {
 			return err
 		}
+		for project, src := range machine.SourcePaths {
+			if !model.ValidName(project) {
+				return fmt.Errorf("machine %q source path key %q is not a valid name", name, project)
+			}
+			if _, ok := cfg.Projects[project]; !ok {
+				return fmt.Errorf("machine %q source path references unknown project %q", name, project)
+			}
+			if err := validateSourcePath(name, project, src); err != nil {
+				return err
+			}
+		}
+		if machine.BundleCache.MaxEntries < 0 || machine.BundleCache.MaxBytes < 0 || machine.BundleCache.AdmissionBytes < 0 {
+			return fmt.Errorf("machine %q has negative bundle-cache policy", name)
+		}
 	}
 	for name, project := range cfg.Projects {
 		if !model.ValidName(name) {
@@ -226,6 +265,9 @@ func validateCoordinator(cfg Config) error {
 		if err := ValidateProjectArtifacts(name, project.Artifacts); err != nil {
 			return err
 		}
+		if err := ValidateExcludedPaths(name, project.ExcludedPaths); err != nil {
+			return err
+		}
 		seen := map[string]bool{}
 		for _, machine := range project.Machines {
 			if !model.ValidName(machine) {
@@ -238,6 +280,51 @@ func validateCoordinator(cfg Config) error {
 			if _, ok := cfg.Machines[machine]; !ok {
 				return fmt.Errorf("project %q references missing machine %q", name, machine)
 			}
+		}
+	}
+	return nil
+}
+
+// validateSourcePath rejects empty values and control characters in a
+// configured machine source path. It does not expand ~ or require the path to
+// exist; that is the consumer's responsibility.
+func validateSourcePath(machine, project, value string) error {
+	if value == "" {
+		return fmt.Errorf("machine %q source path for project %q is empty", machine, project)
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("machine %q source path for project %q contains control characters", machine, project)
+		}
+	}
+	return nil
+}
+
+// ValidateExcludedPaths checks that each hard workspace-exclusion glob compiles
+// and rejects reserved, absolute, parent-reference, and control-bearing
+// patterns. Matching semantics belong to the consumer; this only validates the
+// configured shape.
+func ValidateExcludedPaths(project string, globs []string) error {
+	for _, g := range globs {
+		if g == "" {
+			return fmt.Errorf("project %q has an empty excluded path", project)
+		}
+		if g == ".git" || g == ".vci" {
+			return fmt.Errorf("project %q reserved path %q cannot be an exclusion", project, g)
+		}
+		if strings.HasPrefix(g, "/") {
+			return fmt.Errorf("project %q excluded path %q must not be absolute", project, g)
+		}
+		if strings.Contains(g, "..") {
+			return fmt.Errorf("project %q excluded path %q must not contain a parent reference", project, g)
+		}
+		for _, r := range g {
+			if r < 0x20 || r == 0x7f {
+				return fmt.Errorf("project %q excluded path %q contains control characters", project, g)
+			}
+		}
+		if _, err := path.Match(g, ""); err != nil {
+			return fmt.Errorf("project %q excluded path %q is not a valid glob: %w", project, g, err)
 		}
 	}
 	return nil
