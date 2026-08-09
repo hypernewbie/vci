@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/process"
+	"github.com/hypernewbie/vci/internal/source"
 	"github.com/hypernewbie/vci/internal/store"
 )
 
@@ -188,5 +191,105 @@ func TestLocalBuildReconstructsAndAppliesExclusions(t *testing.T) {
 	}
 	if result.State != model.RunSucceeded {
 		t.Fatalf("expected reconstructed workspace without secret.env; state=%s failure=%s", result.State, result.Failure)
+	}
+}
+
+func TestBuildFromSubmissionReconstructsFromSeedBundleAndLocalChanges(t *testing.T) {
+	seed := filepath.Join(t.TempDir(), "sub-seed")
+	if err := os.MkdirAll(seed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGitIn := func(dir string, args ...string) {
+		t.Helper()
+		cmd := process.Command{Executable: "git", Args: append([]string{"-C", dir}, args...)}
+		if _, err := (process.Native{}).Run(context.Background(), cmd); err != nil {
+			t.Fatalf("git -C %s %v: %v", dir, args, err)
+		}
+	}
+	runGitIn(seed, "init", "-q")
+	runGitIn(seed, "config", "user.email", "vci-test@example.com")
+	runGitIn(seed, "config", "user.name", "vci-test")
+	if err := os.WriteFile(filepath.Join(seed, "app.txt"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seed, "secret.env"), []byte("leak"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seed, ".gitignore"), []byte("build.out\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitIn(seed, "add", "app.txt", "secret.env", ".gitignore")
+	runGitIn(seed, "commit", "-q", "-m", "base")
+	if err := os.WriteFile(filepath.Join(seed, "build.out"), []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := filepath.Join(t.TempDir(), "sub-client")
+	if _, err := (process.Native{}).Run(context.Background(), process.Command{Executable: "git", Args: []string{"clone", "-q", seed, client}}); err != nil {
+		t.Fatal(err)
+	}
+	runGitIn(client, "config", "user.email", "vci-test@example.com")
+	runGitIn(client, "config", "user.name", "vci-test")
+	if err := os.WriteFile(filepath.Join(client, "app.txt"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitIn(client, "add", "app.txt")
+	runGitIn(client, "commit", "-q", "-m", "head")
+	if err := os.WriteFile(filepath.Join(client, "note.txt"), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var baseOut strings.Builder
+	if _, err := (process.Native{}).Run(context.Background(), process.Command{Executable: "git", Args: []string{"-C", seed, "rev-parse", "HEAD"}, Stdout: &baseOut}); err != nil {
+		t.Fatal(err)
+	}
+	base := strings.TrimSpace(baseOut.String())
+
+	id, err := source.CaptureIdentity(context.Background(), client, process.Native{})
+	if err != nil {
+		t.Fatalf("capture identity: %v", err)
+	}
+	lc, err := source.CaptureLocalChanges(context.Background(), client, process.Native{})
+	if err != nil {
+		t.Fatalf("capture local changes: %v", err)
+	}
+	bundleRC, err := source.CreateBundle(context.Background(), client, base, id.Head, process.Native{})
+	if err != nil {
+		t.Fatalf("create bundle: %v", err)
+	}
+	bundle, err := io.ReadAll(bundleRC)
+	_ = bundleRC.Close()
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	subReader, err := source.PackageSubmission(source.Submission{Head: id.Head, Base: id.Base, RemoteURL: id.RemoteURL, Have: base, Bundle: bundle, LocalChanges: lc})
+	if err != nil {
+		t.Fatalf("package submission: %v", err)
+	}
+
+	l := model.Layout{Root: filepath.Join(t.TempDir(), ".vci")}
+	if err := Initialize(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddMachine(l, "mac-local", config.Machine{}); err != nil {
+		t.Fatal(err)
+	}
+	command := []string{"sh", "-c", "grep -q '^head$' app.txt && test -f note.txt && test -f build.out && test ! -e secret.env"}
+	if err := AddProject(l, "sub-seed", config.Project{Machines: []string{"mac-local"}, Command: command, ExcludedPaths: []string{"*.env"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateMachine(l, "mac-local", func(m *config.Machine) error {
+		m.SourcePaths = map[string]string{"sub-seed": seed}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := BuildFromSubmission(context.Background(), l, "sub-seed", subReader)
+	if err != nil {
+		t.Fatalf("build from submission: %v", err)
+	}
+	if result.State != model.RunSucceeded {
+		t.Fatalf("expected reconstructed build to succeed; state=%s failure=%s", result.State, result.Failure)
 	}
 }

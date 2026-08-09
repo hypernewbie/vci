@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -256,6 +258,72 @@ func PrepareHosted(ctx context.Context, l model.Layout, projectName string) (Pre
 		return PreparedRun{}, err
 	}
 	return PreparedRun{Record: staged}, nil
+}
+
+// BuildFromSubmission drives a build from a framed client submission. It
+// reconstructs a workspace from the coordinator's local seed plus the
+// submission's Git bundle and local changes, then runs the configured command
+// through the normal build lifecycle. The submission tar is read from r.
+func BuildFromSubmission(ctx context.Context, l model.Layout, projectName string, r io.Reader) (BuildResult, error) {
+	if err := l.Ensure(); err != nil {
+		return BuildResult{}, err
+	}
+	cfg, err := config.Load(l.ConfigPath())
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if cfg.Orchestrator != config.OrchestratorSelf {
+		return BuildResult{}, fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
+	}
+	project, ok := cfg.Projects[projectName]
+	if !ok {
+		return BuildResult{}, fmt.Errorf("project %q is not configured", projectName)
+	}
+	if len(project.Machines) == 0 {
+		return BuildResult{}, fmt.Errorf("project %q has no attached machines", projectName)
+	}
+	seed, err := localSeed(cfg, projectName)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	sub, err := source.UnpackageSubmission(r)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	tempRoot, err := os.MkdirTemp(l.TempDir(), "vci-recon-*")
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("create reconstruction dir: %w", err)
+	}
+	defer os.RemoveAll(tempRoot)
+	reconDir := filepath.Join(tempRoot, projectName)
+	var bundle io.Reader
+	if len(sub.Bundle) > 0 {
+		bundle = bytes.NewReader(sub.Bundle)
+	}
+	if err := source.ReconstructWorkspace(ctx, seed, reconDir, sub.Head, bundle, sub.LocalChanges, project.ExcludedPaths, process.Native{}); err != nil {
+		return BuildResult{}, fmt.Errorf("reconstruct workspace: %w", err)
+	}
+	prepared, err := Prepare(ctx, l, reconDir)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return ExecutePrepared(ctx, l, prepared.Record.ID)
+}
+
+// localSeed returns the configured local source checkout for a project: the
+// SourcePaths entry of the project's first hostless machine. It is the
+// reconstruction seed for submission-driven builds.
+func localSeed(cfg config.Config, projectName string) (string, error) {
+	for _, name := range cfg.Projects[projectName].Machines {
+		machine := cfg.Machines[name]
+		if machine.Host != "" {
+			continue
+		}
+		if path := machine.SourcePaths[projectName]; path != "" {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("no local source path configured for project %q", projectName)
 }
 
 func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (BuildResult, error) {
