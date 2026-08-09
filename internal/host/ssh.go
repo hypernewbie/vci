@@ -5,7 +5,6 @@ package host
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/process"
 )
 
 // ValidateHost checks the SSH host argument before use.
@@ -63,9 +63,15 @@ func RemoteWorkDir(id model.RunID) (string, error) {
 	return "~/.vci/state/work/" + string(id), nil
 }
 
+// Client runs remote commands over SSH through a process.Runner.
+// Callers must set Runner; the zero value has no runner to invoke.
+type Client struct {
+	Runner process.Runner
+}
+
 // RunRemote executes a remote command over SSH.
 // It returns the remote exit code; transport failures return an error.
-func RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, stdout, stderr io.Writer) (int, error) {
+func (c Client) RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, stdout, stderr io.Writer) (int, error) {
 	if err := ValidateHost(host); err != nil {
 		return 0, err
 	}
@@ -73,21 +79,25 @@ func RunRemote(ctx context.Context, host, workDir string, argv []string, env map
 	if err != nil {
 		return 0, err
 	}
-	cmd := exec.CommandContext(ctx, "ssh", host, shell)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	err = cmd.Run()
+	if c.Runner == nil {
+		return 0, fmt.Errorf("ssh runner is required")
+	}
+	result, err := c.Runner.Run(ctx, process.Command{Executable: "ssh", Args: []string{host, shell}, Stdout: stdout, Stderr: stderr})
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode(), nil
+		if result.ExitCode != 0 {
+			return result.ExitCode, nil
 		}
 		return 0, fmt.Errorf("ssh %s: %w", host, err)
 	}
-	return 0, nil
+	return result.ExitCode, nil
+}
+
+// RunRemote executes a remote command over SSH with the native runner.
+func RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, stdout, stderr io.Writer) (int, error) {
+	return (Client{Runner: process.Native{}}).RunRemote(ctx, host, workDir, argv, env, stdout, stderr)
 }
 
 // StageRemote tars a local workspace and streams it to remoteWorkDir over SSH.

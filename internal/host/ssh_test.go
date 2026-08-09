@@ -6,12 +6,16 @@ package host
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/hypernewbie/vci/internal/process"
 )
 
 // writeStub writes an executable shell stub into dir and prepends dir
@@ -336,6 +340,88 @@ func TestFetchRemoteInvokesScp(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("scp args missing %q: %s", want, s)
 		}
+	}
+}
+
+// scriptRunner is a process.Runner that records every Command and
+// replays a scripted result, exercising Client.RunRemote without an
+// ssh binary or PATH stubs.
+type scriptRunner struct {
+	commands []process.Command
+	result   process.Result
+	err      error
+}
+
+func (r *scriptRunner) Run(_ context.Context, command process.Command) (process.Result, error) {
+	r.commands = append(r.commands, command)
+	return r.result, r.err
+}
+
+// TestClientRunRemoteInvokesRunner pins that Client.RunRemote validates
+// and composes before handing `ssh <host> <shell>` and the supplied
+// stdout/stderr writers to Runner.Run.
+func TestClientRunRemoteInvokesRunner(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	workDir := "~/.vci/state/work/run_abc"
+	argv := []string{"sh", "-c", "echo ok"}
+	env := map[string]string{"CI": "1"}
+	var stdout, stderr bytes.Buffer
+	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", workDir, argv, env, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit: %d", code)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("runner invoked %d times", len(runner.commands))
+	}
+	cmd := runner.commands[0]
+	if cmd.Executable != "ssh" {
+		t.Errorf("executable: %q", cmd.Executable)
+	}
+	if len(cmd.Args) != 2 || cmd.Args[0] != "builder" {
+		t.Fatalf("args: %q", cmd.Args)
+	}
+	shell := cmd.Args[1]
+	for _, want := range []string{"cd " + workDir, "export 'CI'='1'", "exec 'sh' '-c' 'echo ok'"} {
+		if !strings.Contains(shell, want) {
+			t.Errorf("shell missing %q: %s", want, shell)
+		}
+	}
+	if cmd.Stdout != io.Writer(&stdout) || cmd.Stderr != io.Writer(&stderr) {
+		t.Errorf("stdout/stderr writers not propagated")
+	}
+}
+
+// TestClientRunRemoteNonzeroExit pins that a non-zero remote exit is
+// surfaced as the exit code with no transport error.
+func TestClientRunRemoteNonzeroExit(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 9}, err: errors.New("exit status 9")}
+	var stdout, stderr bytes.Buffer
+	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if code != 9 {
+		t.Fatalf("exit: %d want 9", code)
+	}
+}
+
+// TestClientRunRemoteTransportError pins that a runner failure without
+// a non-zero exit is an ssh transport error, not an exit code.
+func TestClientRunRemoteTransportError(t *testing.T) {
+	runner := &scriptRunner{err: errors.New("connection refused")}
+	var stdout, stderr bytes.Buffer
+	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("transport error not reported")
+	}
+	if code != 0 {
+		t.Fatalf("exit: %d want 0", code)
+	}
+	if !strings.Contains(err.Error(), "ssh builder") || !errors.Is(err, runner.err) {
+		t.Errorf("error: %v", err)
 	}
 }
 
