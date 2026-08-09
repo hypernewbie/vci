@@ -522,3 +522,195 @@ func TestSetupProjectAddRejectsBadArtifact(t *testing.T) {
 		}
 	}
 }
+
+// TestSetupMachineUpdateSourcePath pins that `setup machine update
+// <name> --source-path <project>=<path>` persists the source path for
+// an existing machine once the referenced project exists.
+func TestSetupMachineUpdateSourcePath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "charon"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "project", "add", "vidl", "--machine", "charon", "--command", "true"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup project add: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "update", "charon", "--source-path", "vidl=/code/vidl"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine update: %d %s", code, out.String())
+	}
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("setup machine update failed: %+v", resp.Error)
+	}
+	cfg := loadTestConfig(t, root)
+	if got := cfg.Machines["charon"].SourcePaths["vidl"]; got != "/code/vidl" {
+		t.Errorf("source path: %q", got)
+	}
+}
+
+// TestSetupMachineUpdateRejectsUnknownProject pins that a source path
+// key referencing a project that does not exist is rejected by
+// re-validation before any write.
+func TestSetupMachineUpdateRejectsUnknownProject(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "charon"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add: %d %s", code, out.String())
+	}
+	out.Reset()
+	code := Run([]string{"setup", "machine", "update", "charon", "--source-path", "nope=/code/nope"}, &out, &errOut)
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if code == 0 && resp.OK {
+		t.Fatalf("source path referencing unknown project accepted")
+	}
+}
+
+// TestSetupMachineUpdateRejectsMalformedSourcePath pins that a
+// --source-path value without a project=path separator is rejected as
+// a usage error before any mutation.
+func TestSetupMachineUpdateRejectsMalformedSourcePath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "charon"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add: %d %s", code, out.String())
+	}
+	out.Reset()
+	code := Run([]string{"setup", "machine", "update", "charon", "--source-path", "noseparator"}, &out, &errOut)
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if code == 0 && resp.OK {
+		t.Fatalf("malformed --source-path accepted")
+	}
+	if resp.Error == nil || resp.Error.Code != "invalid_arguments" {
+		t.Fatalf("expected invalid_arguments, got %+v", resp.Error)
+	}
+}
+
+// TestSetupMachineUpdateMissingMachine pins that updating a machine
+// that does not exist fails without mutating the config.
+func TestSetupMachineUpdateMissingMachine(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	code := Run([]string{"setup", "machine", "update", "ghost", "--source-path", "vidl=/code/vidl"}, &out, &errOut)
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if code == 0 && resp.OK {
+		t.Fatalf("update of missing machine accepted")
+	}
+}
+
+// TestSetupProjectUpdateExclude pins that `setup project update
+// <name> --exclude <glob> [--exclude <glob>...]` replaces the
+// project's excluded paths in the coordinator root.
+func TestSetupProjectUpdateExclude(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "m1"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "project", "add", "p1", "--machine", "m1", "--command", "true"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup project add: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "project", "update", "p1", "--exclude", "*.env", "--exclude", "secrets"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup project update: %d %s", code, out.String())
+	}
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("setup project update failed: %+v", resp.Error)
+	}
+	cfg := loadTestConfig(t, root)
+	got := cfg.Projects["p1"].ExcludedPaths
+	if len(got) != 2 || got[0] != "*.env" || got[1] != "secrets" {
+		t.Errorf("excluded paths: %v", got)
+	}
+}
+
+// TestSetupProjectUpdateRejectsBadGlob pins that a malformed glob is
+// rejected by re-validation before any write.
+func TestSetupProjectUpdateRejectsBadGlob(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "m1"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "project", "add", "p1", "--machine", "m1", "--command", "true"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup project add: %d %s", code, out.String())
+	}
+	out.Reset()
+	code := Run([]string{"setup", "project", "update", "p1", "--exclude", "["}, &out, &errOut)
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if code == 0 && resp.OK {
+		t.Fatalf("malformed glob accepted")
+	}
+}
+
+// TestSetupProjectUpdateMissingProject pins that updating a project
+// that does not exist fails without mutating the config.
+func TestSetupProjectUpdateMissingProject(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	code := Run([]string{"setup", "project", "update", "ghost", "--exclude", "*.env"}, &out, &errOut)
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if code == 0 && resp.OK {
+		t.Fatalf("update of missing project accepted")
+	}
+}

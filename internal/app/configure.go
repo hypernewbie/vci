@@ -45,6 +45,26 @@ func AddMachine(l model.Layout, name string, machine config.Machine) error {
 	})
 }
 
+// UpdateMachine applies mutate to an existing machine and persists the result.
+// The whole config is re-validated on save, so a source-path or bundle-cache
+// change that breaks a cross-reference is rejected before any write.
+func UpdateMachine(l model.Layout, name string, mutate func(*config.Machine) error) error {
+	if !model.ValidName(name) {
+		return fmt.Errorf("invalid machine name %q", name)
+	}
+	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
+		machine, ok := cfg.Machines[name]
+		if !ok {
+			return fmt.Errorf("machine %q does not exist", name)
+		}
+		if err := mutate(&machine); err != nil {
+			return err
+		}
+		cfg.Machines[name] = machine
+		return nil
+	})
+}
+
 func RemoveMachine(l model.Layout, name string) error {
 	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
 		if _, exists := cfg.Machines[name]; !exists {
@@ -69,6 +89,24 @@ func AddProject(l model.Layout, name string, project config.Project) error {
 	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
 		if _, exists := cfg.Projects[name]; exists {
 			return fmt.Errorf("project %q already exists", name)
+		}
+		cfg.Projects[name] = project
+		return nil
+	})
+}
+
+// UpdateProject applies mutate to an existing project and persists the result.
+func UpdateProject(l model.Layout, name string, mutate func(*config.Project) error) error {
+	if !model.ValidName(name) {
+		return fmt.Errorf("invalid project name %q", name)
+	}
+	return config.Mutate(l.ConfigPath(), func(cfg *config.Config) error {
+		project, ok := cfg.Projects[name]
+		if !ok {
+			return fmt.Errorf("project %q does not exist", name)
+		}
+		if err := mutate(&project); err != nil {
+			return err
 		}
 		cfg.Projects[name] = project
 		return nil

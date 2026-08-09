@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/hypernewbie/vci/internal/app"
 	"github.com/hypernewbie/vci/internal/config"
@@ -127,19 +128,81 @@ func runSetup(args []string) (any, *model.VciError) {
 			if err := app.RemoveMachine(l, args[2]); err != nil {
 				return nil, model.NewError("machine_update_failed", model.FailureConfiguration, err.Error(), false)
 			}
+		case "update":
+			name := args[2]
+			sourcePaths := map[string]string{}
+			seen := false
+			for i := 3; i < len(args); i++ {
+				switch args[i] {
+				case "--source-path":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--source-path requires project=path.", false)
+					}
+					project, p, ok := strings.Cut(args[i+1], "=")
+					if !ok || project == "" {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("--source-path %q must be project=path.", args[i+1]), false)
+					}
+					sourcePaths[project] = p
+					seen = true
+					i++
+				default:
+					return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown machine option %q.", args[i]), false)
+				}
+			}
+			if !seen {
+				return nil, model.NewError("invalid_arguments", model.FailureUsage, "setup machine update requires at least one --source-path.", false)
+			}
+			if err := app.UpdateMachine(l, name, func(m *config.Machine) error {
+				if m.SourcePaths == nil {
+					m.SourcePaths = map[string]string{}
+				}
+				for k, v := range sourcePaths {
+					m.SourcePaths[k] = v
+				}
+				return nil
+			}); err != nil {
+				return nil, model.NewError("machine_update_failed", model.FailureConfiguration, err.Error(), false)
+			}
+			return map[string]any{"machine": name, "updated": true}, nil
 		default:
-			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Machine operation must be add or remove.", false)
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Machine operation must be add, remove, or update.", false)
 		}
 		return map[string]any{"machine": args[2], "updated": true}, nil
 	case "project":
 		if errMsg := requireCoordinatorRole(l); errMsg != nil {
 			return nil, errMsg
 		}
-		if len(args) < 3 || (args[1] != "add" && args[1] != "hosted") {
+		if len(args) < 3 || (args[1] != "add" && args[1] != "hosted" && args[1] != "update") {
 			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup project add <name> --machine <name> [--machine <name>...] --command <exe> [--arg <arg>] [--artifact <glob>].\n       setup project hosted set <name> --url <url> --commit <object-id>\n       setup project hosted clear <name>", false)
 		}
 		if args[1] == "hosted" {
 			return runSetupProjectHosted(l, args[2:])
+		}
+		if args[1] == "update" {
+			name := args[2]
+			var excluded []string
+			for i := 3; i < len(args); i++ {
+				switch args[i] {
+				case "--exclude":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--exclude requires a glob.", false)
+					}
+					excluded = append(excluded, args[i+1])
+					i++
+				default:
+					return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown project option %q.", args[i]), false)
+				}
+			}
+			if excluded == nil {
+				return nil, model.NewError("invalid_arguments", model.FailureUsage, "setup project update requires at least one --exclude.", false)
+			}
+			if err := app.UpdateProject(l, name, func(p *config.Project) error {
+				p.ExcludedPaths = excluded
+				return nil
+			}); err != nil {
+				return nil, model.NewError("project_update_failed", model.FailureConfiguration, err.Error(), false)
+			}
+			return map[string]any{"project": name, "updated": true}, nil
 		}
 		var machines []string
 		executable := ""
