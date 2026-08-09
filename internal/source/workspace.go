@@ -96,16 +96,28 @@ func AdvanceToHead(ctx context.Context, workspace, head string, bundle io.Reader
 	return nil
 }
 
-// ReconstructWorkspace builds a buildable workspace from a coordinator seed and
-// a client submission. It copies the seed read-only, advances the copy to the
-// client head through the supplied bundle, applies the client local changes,
-// then prunes coordinator-owned exclusions. The seed is never mutated. bundle
-// is nil for a submission that needs no Git advance; head is used only when
-// bundle is non-nil.
+// ReconstructWorkspace builds a buildable workspace for a run. With a seed it
+// copies the seed read-only and advances the copy to the client head through the
+// bundle; without a seed it initializes an empty repository and imports the
+// bundle, which must then cover the full reachable history. It then applies the
+// client local changes and prunes coordinator-owned exclusions. A seed is never
+// mutated. bundle is nil only for a seeded submission that needs no Git advance.
 func ReconstructWorkspace(ctx context.Context, seedPath, workspace, head string, bundle io.Reader, lc LocalChanges, exclusions []string, runner process.Runner) error {
-	skipVCI := func(name string) bool { return name == ".vci" }
-	if err := CopyWorkspace(seedPath, workspace, skipVCI); err != nil {
-		return fmt.Errorf("copy seed: %w", err)
+	if seedPath == "" {
+		if bundle == nil {
+			return fmt.Errorf("cannot reconstruct without a seed or a bundle")
+		}
+		if err := os.MkdirAll(workspace, 0o755); err != nil {
+			return err
+		}
+		if _, err := runGitOutput(ctx, runner, workspace, "init", "-q"); err != nil {
+			return fmt.Errorf("init workspace: %w", err)
+		}
+	} else {
+		skipVCI := func(name string) bool { return name == ".vci" }
+		if err := CopyWorkspace(seedPath, workspace, skipVCI); err != nil {
+			return fmt.Errorf("copy seed: %w", err)
+		}
 	}
 	if bundle != nil {
 		if err := AdvanceToHead(ctx, workspace, head, bundle, runner); err != nil {

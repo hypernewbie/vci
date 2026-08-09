@@ -283,9 +283,10 @@ func BuildFromSubmission(ctx context.Context, l model.Layout, projectName string
 	if len(project.Machines) == 0 {
 		return BuildResult{}, fmt.Errorf("project %q has no attached machines", projectName)
 	}
-	seed, err := localSeed(cfg, projectName)
-	if err != nil {
-		return BuildResult{}, err
+	seed, seedErr := localSeed(cfg, projectName)
+	if seedErr != nil {
+		// No local seed configured: reconstruct from the bundle alone.
+		seed = ""
 	}
 	sub, err := source.UnpackageSubmission(r)
 	if err != nil {

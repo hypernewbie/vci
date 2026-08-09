@@ -137,6 +137,60 @@ func TestReconstructSeededReproducesClientState(t *testing.T) {
 	}
 }
 
+func TestReconstructSeedlessFromFullBundle(t *testing.T) {
+	client := t.TempDir()
+	runGit(t, client, "init", "-q")
+	if err := os.WriteFile(filepath.Join(client, "src.txt"), []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(client, "secret.env"), []byte("leak"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, client, "add", "src.txt", "secret.env")
+	runGit(t, client, "commit", "-q", "-m", "base")
+	if err := os.WriteFile(filepath.Join(client, "src.txt"), []byte("head"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, client, "add", "src.txt")
+	runGit(t, client, "commit", "-q", "-m", "head")
+	head := gitSha(t, client, "HEAD")
+	if err := os.WriteFile(filepath.Join(client, "note.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lc, err := CaptureLocalChanges(context.Background(), client, process.Native{})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	// No coordinator seed: the client sends its whole history as the bundle.
+	bundle, err := CreateBundle(context.Background(), client, "", head, process.Native{})
+	if err != nil {
+		t.Fatalf("bundle: %v", err)
+	}
+
+	w := t.TempDir()
+	if err := ReconstructWorkspace(context.Background(), "", w, head, bundle, lc, []string{"*.env"}, process.Native{}); err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	mustRead := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(w, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(b)
+	}
+	if got := mustRead("src.txt"); got != "head" {
+		t.Fatalf("src.txt = %q, want head", got)
+	}
+	if got := mustRead("note.txt"); got != "new" {
+		t.Fatalf("note.txt = %q, want new", got)
+	}
+	if _, err := os.Stat(filepath.Join(w, "secret.env")); !os.IsNotExist(err) {
+		t.Fatalf("secret.env should be excluded: %v", err)
+	}
+}
+
 func TestReconstructWorkspaceAppliesExclusions(t *testing.T) {
 	seed := t.TempDir()
 	runGit(t, seed, "init", "-q")
