@@ -1,15 +1,14 @@
 package app
 
 // ssh_transport_suite_test.go consolidates the direct SSH transport
-// test suite across four domains:
+// test suite across three domains:
 //
 //   - direct_build_input_integration_test.go: end-to-end SSH path
 //     verifying content, mode, symlink target, and path exclusion;
 //   - direct_staging_integrity_test.go: the staged tree received by
 //     the remote public command when `source.Discover` runs;
 //   - remote_exec_test.go: fake ssh/scp stubs plus a loopback sshd
-//     remote-bare build;
-//   - remote_transfer_test.go: rejects failed tar transfers.
+//     remote-bare build.
 
 import (
 	"context"
@@ -22,7 +21,6 @@ import (
 
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
-	"github.com/hypernewbie/vci/internal/source"
 )
 
 // findStagingArtifacts lists staging dirs left under a coordinator
@@ -519,31 +517,5 @@ func TestRemoteBareBuildViaSSHDFixture(t *testing.T) {
 	remoteWork := filepath.Join(fixture.homeDir, ".vci", "state", "work", string(prep.Record.ID))
 	if _, err := os.Stat(remoteWork); !os.IsNotExist(err) {
 		t.Errorf("remote workspace turd remains: %v", err)
-	}
-}
-
-// ---- Remote-transfer failure rejection (remote_transfer_test.go) ----
-
-func TestBuildOverStagingRejectsTarFailureAfterRemoteResponse(t *testing.T) {
-	bin := t.TempDir()
-	writeExecutable(t, filepath.Join(bin, "tar"), "#!/bin/sh\nexit 7\n")
-	writeExecutable(t, filepath.Join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"schema_version\":1,\"command\":\"build\",\"ok\":true,\"data\":{}}'\n")
-	t.Setenv("PATH", bin)
-
-	input := source.SourceInput{Root: t.TempDir(), ProjectName: "demo", Files: []string{"README.md"}}
-	key := safeTestKey("demo", "sha256-0000000000000000000000000000000000000000000000000000000000000000")
-	raw, remote, _, err := buildOverStaging(context.Background(), "coordinator", input, t.TempDir(), key)
-	if !remote || err == nil {
-		t.Fatalf("tar failure must reject the transfer: remote=%v err=%v", remote, err)
-	}
-	if raw != nil || !strings.Contains(err.Error(), "archive source") {
-		t.Fatalf("tar failure must not return a remote response: raw=%q err=%v", raw, err)
-	}
-}
-
-func writeExecutable(t *testing.T, path, body string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
-		t.Fatalf("write executable %s: %v", path, err)
 	}
 }

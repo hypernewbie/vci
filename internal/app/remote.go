@@ -146,69 +146,6 @@ func deltaBase(ctx context.Context, repoRoot, have, head string) string {
 	return have
 }
 
-// buildOverStaging uploads the tar stream over SSH, runs the remote build,
-// and returns output plus tar bytes sent.
-func buildOverStaging(ctx context.Context, host string, input source.SourceInput, snapshotRoot string, key safeCacheKey) ([]byte, bool, int64, error) {
-	if !model.ValidName(input.ProjectName) {
-		return nil, true, 0, fmt.Errorf("repository name %q cannot name a remote project", input.ProjectName)
-	}
-
-	tarCmd := exec.CommandContext(ctx, "tar", "-cf", "-", "-C", snapshotRoot, "--no-recursion", "--null", "-T", "-")
-	var pathBuf bytes.Buffer
-	for _, p := range input.Files {
-		pathBuf.WriteString(p)
-		pathBuf.WriteByte(0)
-	}
-	tarCmd.Stdin = &pathBuf
-
-	script := stagingShellScript(key)
-	sshCmd := exec.CommandContext(ctx, "ssh", host, script)
-	tarOut, err := tarCmd.StdoutPipe()
-	if err != nil {
-		return nil, true, 0, fmt.Errorf("tar stdout: %w", err)
-	}
-	counter := &countingReader{r: tarOut}
-	sshCmd.Stdin = counter
-	var stdout, stderr bytes.Buffer
-	sshCmd.Stdout = &stdout
-	sshCmd.Stderr = &stderr
-	if err := tarCmd.Start(); err != nil {
-		return nil, true, 0, fmt.Errorf("start tar: %w", err)
-	}
-	sshErr := sshCmd.Run()
-	tarErr := tarCmd.Wait()
-	if tarErr != nil {
-		return nil, true, counter.n, fmt.Errorf("archive source: %w", tarErr)
-	}
-	if sshErr != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = sshErr.Error()
-		}
-		if validEnvelope(stdout.Bytes()) {
-			return stdout.Bytes(), true, counter.n, nil
-		}
-		return nil, true, counter.n, fmt.Errorf("ssh %s: %s", host, message)
-	}
-	if !validEnvelope(stdout.Bytes()) {
-		return nil, true, counter.n, fmt.Errorf("remote vci returned invalid JSON")
-	}
-	return stdout.Bytes(), true, counter.n, nil
-}
-
-// countingReader counts bytes read from an underlying reader.
-// Used to measure exact tar bytes sent to SSH.
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
-}
-
 // RemoteCheck and RemoteAbort forward the remote run ID unchanged.
 // Caller context controls timeout.
 func RemoteCheck(ctx context.Context, l model.Layout, id model.RunID) ([]byte, bool, error) {
