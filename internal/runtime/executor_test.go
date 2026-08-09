@@ -137,8 +137,9 @@ exit 0
 	// any context. The per-run workspace (state/work/<run>) and
 	// per-run TMPDIR (state/work/<run>/.tmp) are allowed because
 	// they are the only paths the runner ever mounts.
+	rest := strings.ReplaceAll(s, workspace, "")
 	for _, banned := range []string{".vci/", ":/home/", ":/root/", ".ssh/"} {
-		if strings.Contains(s, banned) {
+		if strings.Contains(rest, banned) {
 			t.Errorf("dangerous mount leaked: %s in %s", banned, s)
 		}
 	}
@@ -404,8 +405,9 @@ exit 0
 	// The runner never mounts ~/.vci or ~/.ssh. Snapshot is a
 	// positional argument; the only workspace path that appears
 	// is the one the runner forwards (--workdir /vci/work).
+	rest := strings.ReplaceAll(s, workspace, "")
 	for _, banned := range []string{".vci/", ".ssh/"} {
-		if strings.Contains(s, banned) {
+		if strings.Contains(rest, banned) {
 			t.Errorf("dangerous path leaked: %s in %s", banned, s)
 		}
 	}
