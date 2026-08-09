@@ -88,15 +88,26 @@ func dispatch(command string, args []string) (Response, int) {
 		// "build --hosted <project>" (2 args, first is the flag).
 		// Every other shape is a usage error.
 		hostedShape := len(args) == 2 && args[0] == "--hosted"
-		if len(args) != 1 && !hostedShape {
-			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: build <path> | build --hosted <project>.", false)), 2
+		submissionShape := len(args) == 2 && args[0] == "--from-submission"
+		if len(args) != 1 && !hostedShape && !submissionShape {
+			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: build <path> | build --hosted <project> | build --from-submission <project>.", false)), 2
 		}
-		if len(args) == 1 && args[0] == "--hosted" {
-			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: build <path> | build --hosted <project>.", false)), 2
+		if len(args) == 1 && (args[0] == "--hosted" || args[0] == "--from-submission") {
+			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: build <path> | build --hosted <project> | build --from-submission <project>.", false)), 2
 		}
 		l, err := resolveLayout()
 		if err != nil {
 			return appFailure(command, err), 2
+		}
+		// The --from-submission form reconstructs a workspace from a submission
+		// tar read on stdin and runs the build to completion. It is the
+		// coordinator-side receiver for a remote client build.
+		if submissionShape {
+			result, err := app.BuildFromSubmission(context.Background(), l, args[1], os.Stdin)
+			if err != nil {
+				return appFailure(command, err), 2
+			}
+			return Success(command, result), 0
 		}
 		// `build --hosted <project>` is a coordinator-only source
 		// mode. A client root proxies the command through ordinary
