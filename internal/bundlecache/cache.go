@@ -29,7 +29,7 @@ const Version = "v1"
 type Policy struct {
 	MaxEntries     int   // per project; <=0 means unlimited
 	MaxBytes       int64 // total bundle bytes per project; <=0 means unlimited
-	AdmissionBytes int64 // bundles larger than this are not admitted; <=0 admits all
+	AdmissionBytes int64 // minimum size a bundle must have to be admitted; <=0 admits all
 }
 
 // Entry describes one complete cached bundle.
@@ -100,14 +100,16 @@ func IsHit(cacheRoot, project, base string) (bool, error) {
 }
 
 // Admit stores bundle under project/base and marks the entry complete. A bundle
-// larger than policy.AdmissionBytes (when positive) is rejected without error.
-// The complete marker is written last so an interrupted admission is never a hit.
+// smaller than policy.AdmissionBytes (when positive) is not admitted: it is
+// transferred one-shot instead of entering the cache. A bundle equal to the
+// threshold is admitted. The complete marker is written last so an interrupted
+// admission is never a hit.
 func Admit(cacheRoot, project, base string, bundle []byte, policy Policy, now time.Time) (admitted bool, err error) {
 	dir, err := entryDir(cacheRoot, project, base)
 	if err != nil {
 		return false, err
 	}
-	if policy.AdmissionBytes > 0 && int64(len(bundle)) > policy.AdmissionBytes {
+	if policy.AdmissionBytes > 0 && int64(len(bundle)) < policy.AdmissionBytes {
 		return false, nil
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {

@@ -55,16 +55,16 @@ func TestAdmitWritesHitAndMeta(t *testing.T) {
 	}
 }
 
-func TestAdmitRejectsOversizedBundle(t *testing.T) {
+func TestAdmitRejectsBelowThresholdBundle(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2025, 6, 1, 10, 30, 0, 0, time.UTC)
 
-	admitted, err := Admit(root, "proj", "base1", []byte("12345"), Policy{AdmissionBytes: 4}, now)
+	admitted, err := Admit(root, "proj", "base1", []byte("123"), Policy{AdmissionBytes: 4}, now)
 	if err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
 	if admitted {
-		t.Fatal("Admit: oversized bundle must not be admitted")
+		t.Fatal("Admit: below-threshold bundle must not be admitted")
 	}
 	hit, err := IsHit(root, "proj", "base1")
 	if err != nil {
@@ -72,6 +72,26 @@ func TestAdmitRejectsOversizedBundle(t *testing.T) {
 	}
 	if hit {
 		t.Fatal("IsHit: nothing was admitted, so no hit")
+	}
+}
+
+func TestAdmitAcceptsBundleAtThreshold(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2025, 6, 1, 10, 30, 0, 0, time.UTC)
+
+	admitted, err := Admit(root, "proj", "base1", []byte("1234"), Policy{AdmissionBytes: 4}, now)
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if !admitted {
+		t.Fatal("Admit: bundle equal to AdmissionBytes must be admitted")
+	}
+	hit, err := IsHit(root, "proj", "base1")
+	if err != nil {
+		t.Fatalf("IsHit: %v", err)
+	}
+	if !hit {
+		t.Fatal("IsHit: admitted bundle should be a hit")
 	}
 }
 
