@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -32,6 +33,9 @@ const recordStub = "#!/bin/sh\necho \"$*\" >> %s\ncat >/dev/null 2>&1\nexit %d\n
 // cd's into the workspace, isolates HOME/TMPDIR inside it, exports
 // the project environment, and execs the runtime argv.
 func TestRunRemoteRecordsShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "ssh.log")
 	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 0\n")
@@ -86,6 +90,9 @@ func TestRunRemoteRecordsShell(t *testing.T) {
 // captured login home (`"$__vci_login_home"`) instead of being left
 // for the shell to expand against the isolated runtime HOME.
 func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	for _, tc := range []struct {
 		name string
 		argv []string
@@ -147,6 +154,9 @@ func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
 // runtime HOME (`.home`) tree. It also pins that the runtime still
 // receives the isolated HOME/TMPDIR.
 func TestRemoteRuntimeMountUsesLoginHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	loginHome := filepath.Join(t.TempDir(), "home")
 	workDir := "~/.vci/state/work/run_abc"
 	absWork := filepath.Join(loginHome, ".vci", "state", "work", "run_abc")
@@ -218,6 +228,9 @@ func TestRemoteRuntimeMountUsesLoginHome(t *testing.T) {
 // TestRunRemoteReturnsExitCode pins that a non-zero remote exit is a
 // job failure code, not an ssh-level error.
 func TestRunRemoteReturnsExitCode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "ssh.log")
 	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 7\n")
@@ -234,6 +247,9 @@ func TestRunRemoteReturnsExitCode(t *testing.T) {
 // TestRunRemoteRejectsBadInput pins that unsafe hosts and paths are
 // rejected before any subprocess starts.
 func TestRunRemoteRejectsBadInput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	dir := t.TempDir()
 	writeStub(t, dir, "ssh", "#!/bin/sh\nexit 0\n")
 	for _, tc := range []struct {
@@ -257,6 +273,9 @@ func TestRunRemoteRejectsBadInput(t *testing.T) {
 // the local workspace into `ssh <host> "mkdir -p <workDir> && cd
 // <workDir> && tar -xpf -"`.
 func TestStageRemoteStreamsWorkspace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "ssh.log")
 	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\ncat >/dev/null 2>&1\nexit 0\n")
@@ -279,6 +298,9 @@ func TestStageRemoteStreamsWorkspace(t *testing.T) {
 // TestStageRemoteRejectsUnsafe pins that staging validates both the
 // host and the remote path before touching the workspace.
 func TestStageRemoteRejectsUnsafe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	dir := t.TempDir()
 	writeStub(t, dir, "ssh", "#!/bin/sh\nexit 0\n")
 	workspace := t.TempDir()
@@ -298,6 +320,9 @@ func TestStageRemoteRejectsUnsafe(t *testing.T) {
 // TestFetchRemoteInvokesScp pins that artifact fetch runs
 // `scp -r -q <host>:<workDir> <localDest>`.
 func TestFetchRemoteInvokesScp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "scp.log")
 	writeStub(t, dir, "scp", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 0\n")
@@ -317,6 +342,9 @@ func TestFetchRemoteInvokesScp(t *testing.T) {
 // TestValidateRemotePath pins the remote-tree grammar: only the fixed
 // layout plus a run id.
 func TestValidateRemotePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
 	for _, good := range []string{
 		"~/.vci/state/work/run_abc",
 		"~/.vci/state/work/run_1_2",

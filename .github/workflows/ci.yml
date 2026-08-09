@@ -58,3 +58,40 @@ jobs:
       - name: Detach check
         run: ./scripts/detach-check.sh
         timeout-minutes: 15
+
+  windows:
+    name: Windows client build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l cmd/ internal/)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt found unformatted files:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+        shell: bash
+        timeout-minutes: 5
+
+      - name: go vet (windows)
+        run: go vet ./...
+        timeout-minutes: 10
+
+      - name: go test (windows - client packages)
+        run: go test -p 2 ./internal/config ./internal/store ./internal/process ./internal/runtime ./internal/scheduler ./internal/sourcecache ./internal/model -count=1
+        timeout-minutes: 10
+
+      - name: go build (windows)
+        run: go build ./...
+        timeout-minutes: 5

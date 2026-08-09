@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -694,6 +695,9 @@ func TestReapWorkDirsKeepsFreshTmpHome(t *testing.T) {
 // `ssh <host> rm -rf -- <path>` with a fake ssh stub and validates
 // both arguments first.
 func TestCleanupRemoteInvokesSSHRm(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-specific")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "ssh.log")
 	script := "#!/bin/sh\necho \"$*\" >> " + logPath + "\nexit 0\n"
@@ -746,6 +750,9 @@ func TestCleanupRemoteRejectsUnsafe(t *testing.T) {
 // whose reserved machine declared a remote host gets its mirrored
 // remote workspace swept via ssh, and that the report counts it.
 func TestReapRemoteTurdsCleansTerminalHostRuns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-specific")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "ssh.log")
 	script := "#!/bin/sh\necho \"$*\" >> " + logPath + "\nexit 0\n"

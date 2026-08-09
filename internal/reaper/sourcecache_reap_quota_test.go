@@ -5,6 +5,7 @@ package reaper
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -235,6 +236,9 @@ func TestCoordinatorSourceCacheQuotaAcceptsReasonableValue(t *testing.T) {
 // matching the vci-source. prefix and older than the threshold are
 // removed.
 func TestReapTransferDirsRemovesStale(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-specific")
+	}
 	dir := t.TempDir()
 	stale := filepath.Join(dir, "vci-source.stale123")
 	if err := os.Mkdir(stale, 0o700); err != nil {
@@ -259,6 +263,9 @@ func TestReapTransferDirsRemovesStale(t *testing.T) {
 // TestReapTransferDirsLeavesFresh asserts that staging directories
 // inside the age threshold are not removed.
 func TestReapTransferDirsLeavesFresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-specific")
+	}
 	dir := t.TempDir()
 	fresh := filepath.Join(dir, "vci-source.fresh456")
 	if err := os.Mkdir(fresh, 0o700); err != nil {
@@ -325,6 +332,9 @@ func TestReapTransferDirsHonoursPrefix(t *testing.T) {
 // symlink to an external sentinel file leaves the sentinel file, its mode,
 // and its content completely intact after reaping.
 func TestReapTransferDirsPreservesSymlinkSentinelTarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-specific")
+	}
 	tempDir := t.TempDir()
 	sentinelDir := t.TempDir()
 	sentinelFile := filepath.Join(sentinelDir, "sentinel.txt")

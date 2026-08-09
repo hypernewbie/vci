@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -141,6 +142,9 @@ func TestLegacyRunRecordFieldsAreTolerated(t *testing.T) {
 }
 
 func TestConcurrentClaimsHaveOneWinner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock not enforced on Windows (coordinator not supported)")
+	}
 	l := model.Layout{Root: filepath.Join(t.TempDir(), ".vci")}
 	if err := l.Ensure(); err != nil {
 		t.Fatal(err)

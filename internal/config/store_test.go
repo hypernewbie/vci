@@ -3,11 +3,15 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
 
 func TestMutateRoundTripsAndProtectsFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file permissions/locking not enforced on Windows")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	if err := Initialize(path); err != nil {
@@ -49,6 +53,9 @@ func TestMutateRoundTripsAndProtectsFile(t *testing.T) {
 }
 
 func TestMutateSerializesCompatibleUpdates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock not enforced on Windows")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	if err := Initialize(path); err != nil {

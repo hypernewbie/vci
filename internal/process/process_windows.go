@@ -1,9 +1,8 @@
-//go:build !windows
+//go:build windows
 
-// Package process runs supervised external commands.
-// Each command gets its own process group, supports context
-// cancellation (TERM then bounded KILL), limits captured output,
-// and persists execution metadata for cancellation tracking.
+// Package process runs supervised external commands on Windows.
+// Windows has no process groups or Unix signals, so the runner starts
+// the command without SysProcAttr and cancels by killing the process.
 package process
 
 import (
@@ -17,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/hypernewbie/vci/internal/model"
@@ -58,14 +56,13 @@ func (Native) RunSupervised(ctx context.Context, command Command, onStart func(R
 	cmd := exec.Command(command.Executable, command.Args...)
 	cmd.Dir, cmd.Env = command.Dir, command.Env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = command.Stdin, command.Stdout, command.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return Result{}, err
 	}
 	running := Running{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, StartedAt: time.Now().UTC()}
 	if onStart != nil {
 		if err := onStart(running); err != nil {
-			terminate(cmd.Process.Pid)
+			_ = cmd.Process.Kill()
 			_, _ = cmd.Process.Wait()
 			return Result{}, err
 		}
@@ -75,7 +72,7 @@ func (Native) RunSupervised(ctx context.Context, command Command, onStart func(R
 	go func() {
 		select {
 		case <-ctx.Done():
-			terminate(cmd.Process.Pid)
+			_ = cmd.Process.Kill()
 		case <-cancelDone:
 		}
 	}()
@@ -87,10 +84,6 @@ func (Native) RunSupervised(ctx context.Context, command Command, onStart func(R
 	result := Result{ExitCode: 0}
 	if cmd.ProcessState != nil {
 		result.ExitCode = cmd.ProcessState.ExitCode()
-		if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-			result.Signaled = true
-			result.Signal = status.Signal().String()
-		}
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return result, err
@@ -102,11 +95,9 @@ func (Native) RunSupervised(ctx context.Context, command Command, onStart func(R
 }
 
 func terminate(pid int) {
-	// Worker owns the process group and sends TERM then bounded KILL on cancellation.
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	timer := time.NewTimer(500 * time.Millisecond)
-	<-timer.C
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	if proc, err := os.FindProcess(pid); err == nil {
+		_ = proc.Kill()
+	}
 }
 
 type LimitWriter struct {
@@ -153,10 +144,7 @@ const (
 	CancellationRequested   CancellationPhase = "requested"
 	CancellationTerminating CancellationPhase = "terminating"
 	CancellationReaped      CancellationPhase = "reaped"
-	// CancellationKilled is legacy VCI (`006ae53`) metadata for forcibly-killed
-	// runs, accepted only when loading old execution records.
-	// Workers never emit this phase; active runs stay requested→terminating→reaped.
-	CancellationKilled CancellationPhase = "killed"
+	CancellationKilled      CancellationPhase = "killed"
 )
 
 type Execution struct {
@@ -268,5 +256,6 @@ func atomicPrivateJSON(path string, data []byte) error {
 		return err
 	}
 	defer dir.Close()
-	return dir.Sync()
+	_ = dir.Sync()
+	return nil
 }

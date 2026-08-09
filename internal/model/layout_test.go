@@ -3,10 +3,14 @@ package model
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestEnsureCreatesPrivateLayout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permissions not enforced on Windows")
+	}
 	l := Layout{Root: filepath.Join(t.TempDir(), ".vci")}
 	if err := l.Ensure(); err != nil {
 		t.Fatal(err)

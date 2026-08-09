@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -274,6 +275,9 @@ func TestMaterializeSnapshotKeepsMinimalGitMarkers(t *testing.T) {
 
 // TestPortableToolCapabilities verifies exact behavior of git and tar on macOS.
 func TestPortableToolCapabilities(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tar with Windows paths")
+	}
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git tool not available")
 	}

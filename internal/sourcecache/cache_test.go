@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -237,6 +238,9 @@ func TestActiveClaimProtectsEntry(t *testing.T) {
 // driven by the recorded last_use metadata, not file mtimes inside
 // the project tree.
 func TestLastUseOrderingRespectsUpdateLastUse(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("last_use ordering relies on Unix file time granularity")
+	}
 	root := t.TempDir()
 	type fixture struct {
 		digest  string

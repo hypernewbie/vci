@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -238,5 +239,8 @@ func atomicWriteClaim(l model.Layout, machine string, claim Claim) error {
 		return err
 	}
 	defer parent.Close()
-	return parent.Sync()
+	if err := parent.Sync(); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+	return nil
 }

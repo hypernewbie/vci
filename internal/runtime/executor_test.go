@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -13,6 +14,9 @@ import (
 )
 
 func TestLocalCapturesJobExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires /bin/sh")
+	}
 	var out, errOut bytes.Buffer
 	result, err := (Local{}).ExecuteSupervised(context.Background(), Request{Executable: "/bin/sh", Args: []string{"-c", "printf ok; printf bad >&2; exit 7"}, Workspace: t.TempDir(), Stdout: &out, Stderr: &errOut}, nil)
 	if err != nil {
@@ -27,6 +31,9 @@ func TestLocalCapturesJobExit(t *testing.T) {
 // the docker executor shells out. The order, mounts, network,
 // user, cgroup limits, and image position are the contract.
 func TestDockerCommandArgvShape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("path shape is unix-specific")
+	}
 	d := Docker{Image: "ghcr.io/org/ci:pin"}
 	argv, err := d.CommandArgv("/tmp/work", "/vci/work", []string{"go", "test", "./..."})
 	if err != nil {
@@ -73,6 +80,9 @@ func TestDockerMissingWorkspaceRejected(t *testing.T) {
 // fixture writes a script that echoes the args to a log file so
 // the test can assert the exact arg shape.
 func TestDockerRunsViaStub(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix shell stub")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
 	script := `#!/bin/sh
@@ -141,6 +151,9 @@ exit 0
 // docker invocation is a job failure, not an infrastructure
 // failure. The build path uses ExitCode to classify the result.
 func TestDockerNonZeroExitReturnsJobFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix shell stub")
+	}
 	dir := t.TempDir()
 	script := "#!/bin/sh\nexit 1\n"
 	dockerPath := filepath.Join(dir, "docker")
@@ -187,6 +200,9 @@ func TestDockerMissingBinaryIsUnavailable(t *testing.T) {
 // passes the supervised process group's start signal to the
 // caller, matching the executor.Local contract.
 func TestDockerRunnerPassesThroughOnStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix shell stub")
+	}
 	dir := t.TempDir()
 	script := "#!/bin/sh\nexit 0\n"
 	dockerPath := filepath.Join(dir, "docker")
@@ -297,6 +313,9 @@ func TestDockerCommandArgvRemoteVerbatimWorkspace(t *testing.T) {
 // VM executor shells out. The order, workdir, cgroup limits,
 // snapshot position, and `--` separator are the contract.
 func TestVMCommandArgvShape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("path shape is unix-specific")
+	}
 	v := VM{Snapshot: "ghcr.io/org/vm:pin", Binary: "tart"}
 	argv, err := v.CommandArgv("/tmp/work", []string{"go", "test", "./..."})
 	if err != nil {
@@ -340,6 +359,9 @@ func TestVMMissingWorkspaceRejected(t *testing.T) {
 // writes a script that echoes the args to a log file so the test
 // can assert the exact arg shape.
 func TestVMRunsViaStub(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix shell stub")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
 	script := `#!/bin/sh
@@ -393,6 +415,9 @@ exit 0
 // invocation is a job failure, not an infrastructure failure. The
 // build path uses ExitCode to classify the result.
 func TestVMNonZeroExitReturnsJobFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix shell stub")
+	}
 	dir := t.TempDir()
 	script := "#!/bin/sh\nexit 1\n"
 	tartPath := filepath.Join(dir, "tart")
@@ -439,6 +464,9 @@ func TestVMMissingBinaryIsUnavailable(t *testing.T) {
 // the supervised process group's start signal to the caller,
 // matching the executor.Local contract.
 func TestVMRunnerPassesThroughOnStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix shell stub")
+	}
 	dir := t.TempDir()
 	script := "#!/bin/sh\nexit 0\n"
 	tartPath := filepath.Join(dir, "tart")
@@ -586,6 +614,9 @@ func TestVMCommandArgvIncludesWorkspaceMount(t *testing.T) {
 // `state/`, or `~/.ssh`. The stub `tart` records its argv so the
 // test can assert the mount source appears verbatim.
 func TestVMExecuteSupervisedMountsWorkspace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix shell stub")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
 	script := `#!/bin/sh
