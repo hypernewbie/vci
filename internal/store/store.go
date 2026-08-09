@@ -30,6 +30,7 @@ type RunRecord struct {
 	Machine                 string          `json:"machine"`
 	State                   model.RunState  `json:"state"`
 	SourceDigest            string          `json:"source_digest,omitempty"`
+	SourcePath              string          `json:"source_path,omitempty"`
 	ConfigDigest            string          `json:"config_digest,omitempty"`
 	ConfigSnapshot          json.RawMessage `json:"config_snapshot,omitempty"`
 	Command                 []string        `json:"command"`

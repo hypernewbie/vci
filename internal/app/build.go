@@ -92,36 +92,46 @@ func Prepare(ctx context.Context, l model.Layout, sourcePath string) (PreparedRu
 	if err != nil {
 		return PreparedRun{}, err
 	}
-	snapParent, err := os.MkdirTemp(l.TempDir(), source.SnapshotPrefix)
-	if err != nil {
-		return PreparedRun{}, fmt.Errorf("prepare local snapshot dir: %w", err)
-	}
-	defer os.RemoveAll(snapParent)
-	if _, err := source.MaterializeSnapshot(graph, snapParent); err != nil {
-		return PreparedRun{}, err
-	}
+	// A source that is not a Vci staging tree or cache entry is reconstructed
+	// into the run workspace at execution time and needs no manifest.
+	localReconstruct := !isManagedSource(l, repo.Root, projectName)
+	var sourceDigest string
+	if !localReconstruct {
+		snapParent, err := os.MkdirTemp(l.TempDir(), source.SnapshotPrefix)
+		if err != nil {
+			return PreparedRun{}, fmt.Errorf("prepare local snapshot dir: %w", err)
+		}
+		defer os.RemoveAll(snapParent)
+		if _, err := source.MaterializeSnapshot(graph, snapParent); err != nil {
+			return PreparedRun{}, err
+		}
 
-	// Generate the manifest and blobs, validating LFS pointers.
-	manifest, blobs, err := source.BuildWithValidation(repo.Root, graph.LFSFiles)
-	if err != nil {
-		return PreparedRun{}, err
-	}
-	blobStore := source.BlobStore{Layout: l}
-	if err := blobStore.PutManifestAndBlobs(manifest, blobs); err != nil {
-		return PreparedRun{}, err
+		// Generate the manifest and blobs, validating LFS pointers.
+		manifest, blobs, err := source.BuildWithValidation(repo.Root, graph.LFSFiles)
+		if err != nil {
+			return PreparedRun{}, err
+		}
+		blobStore := source.BlobStore{Layout: l}
+		if err := blobStore.PutManifestAndBlobs(manifest, blobs); err != nil {
+			return PreparedRun{}, err
+		}
+		sourceDigest = manifest.Digest
 	}
 	now := time.Now().UTC()
 	runStore := store.Store{Layout: l}
 	// Reserve one machine and publish a staged run atomically.
-	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, manifest.Digest, buildDraftSnapshot(projectName, project, cfg), now)
+	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, sourceDigest, buildDraftSnapshot(projectName, project, cfg), now)
 	if err != nil {
 		return PreparedRun{}, err
 	}
 	var staged store.RunRecord
 	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
-		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, buildStagedSnapshot(projectName, project, machineName, cfg, nil), now)
+		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, sourceDigest, buildStagedSnapshot(projectName, project, machineName, cfg, nil), now)
 		if buildErr != nil {
 			return buildErr
+		}
+		if localReconstruct {
+			record.SourcePath = repo.Root
 		}
 		if saveErr := runStore.Save(record); saveErr != nil {
 			return saveErr
@@ -288,11 +298,6 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 	if err := json.Unmarshal(record.ConfigSnapshot, &snapshot); err != nil {
 		return BuildResult{}, fmt.Errorf("decode run configuration snapshot: %w", err)
 	}
-	manifest, err := (source.BlobStore{Layout: l}).LoadManifest(record.SourceDigest)
-	if err != nil {
-		return BuildResult{}, err
-	}
-
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var ownershipLost atomic.Bool
@@ -306,10 +311,9 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		_, _ = runStore.Transition(id, model.RunAborted, time.Now().UTC())
 		return BuildResult{}, fmt.Errorf("run %s was cancelled before execution", id)
 	}
-	blobStore := source.BlobStore{Layout: l}
 	partial := filepath.Join(l.WorkDir(), string(record.ID)+".partial")
 	workspace := filepath.Join(l.WorkDir(), string(record.ID))
-	if err := blobStore.Materialize(manifest, partial); err != nil {
+	if err := populateWorkspace(l, record, snapshot.ProjectConfig, partial); err != nil {
 		_ = removeOwned(partial)
 		if cancellationRequested(runStore, id) {
 			_, _ = runStore.Transition(id, model.RunAborted, time.Now().UTC())
@@ -413,6 +417,35 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		_ = os.WriteFile(filepath.Join(runDir, "cleanup.pending"), []byte(err.Error()), 0o600)
 	}
 	return result, nil
+}
+
+// isManagedSource reports whether repoRoot is a Vci staging tree or cache
+// entry, which follow the manifest path rather than workspace reconstruction.
+func isManagedSource(l model.Layout, repoRoot, projectName string) bool {
+	if _, ok := cacheEntryDigestAt(l, repoRoot, projectName); ok {
+		return true
+	}
+	_, ok := stagingMetaPathAt(l, repoRoot)
+	return ok
+}
+
+// populateWorkspace fills a partial workspace directory for a run. A run with a
+// recorded source path is reconstructed by copying that source and pruning
+// coordinator-owned exclusions; otherwise it is materialized from its manifest.
+func populateWorkspace(l model.Layout, record store.RunRecord, project config.Project, partial string) error {
+	if record.SourcePath != "" {
+		skip := func(name string) bool { return name == ".vci" || name == ".git" }
+		if err := source.CopyWorkspace(record.SourcePath, partial, skip); err != nil {
+			return err
+		}
+		return source.ApplyExclusions(partial, project.ExcludedPaths)
+	}
+	blobStore := source.BlobStore{Layout: l}
+	manifest, err := blobStore.LoadManifest(record.SourceDigest)
+	if err != nil {
+		return err
+	}
+	return blobStore.Materialize(manifest, partial)
 }
 
 func Check(l model.Layout, id model.RunID) (any, error) {

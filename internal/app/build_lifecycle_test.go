@@ -146,3 +146,47 @@ func TestBuildFixtureFailureIsAJobFailure(t *testing.T) {
 		t.Fatalf("result: %+v", result)
 	}
 }
+
+func TestLocalBuildReconstructsAndAppliesExclusions(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "excl-fixture")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module fixture/excl\n\ngo 1.26\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "secret.env"), []byte("leak"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (process.Native{}).Run(context.Background(), process.Command{Executable: "git", Args: []string{"init", "-q", repo}}); err != nil {
+		t.Fatal(err)
+	}
+	l := model.Layout{Root: filepath.Join(t.TempDir(), ".vci")}
+	if err := Initialize(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddMachine(l, "mac-local", config.Machine{}); err != nil {
+		t.Fatal(err)
+	}
+	command := []string{"sh", "-c", "test ! -e secret.env && test -f main.go"}
+	if err := AddProject(l, "excl-fixture", config.Project{Machines: []string{"mac-local"}, Command: command, ExcludedPaths: []string{"*.env"}}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := Prepare(context.Background(), l, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Record.SourcePath == "" {
+		t.Fatalf("local run should record a source path for reconstruction")
+	}
+	result, err := ExecutePrepared(context.Background(), l, prepared.Record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != model.RunSucceeded {
+		t.Fatalf("expected reconstructed workspace without secret.env; state=%s failure=%s", result.State, result.Failure)
+	}
+}
