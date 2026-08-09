@@ -95,3 +95,25 @@ func AdvanceToHead(ctx context.Context, workspace, head string, bundle io.Reader
 	}
 	return nil
 }
+
+// ReconstructWorkspace builds a buildable workspace from a coordinator seed and
+// a client submission. It copies the seed read-only, advances the copy to the
+// client head through the supplied bundle, applies the client local changes,
+// then prunes coordinator-owned exclusions. The seed is never mutated. bundle
+// is nil for a submission that needs no Git advance; head is used only when
+// bundle is non-nil.
+func ReconstructWorkspace(ctx context.Context, seedPath, workspace, head string, bundle io.Reader, lc LocalChanges, exclusions []string, runner process.Runner) error {
+	skipVCI := func(name string) bool { return name == ".vci" }
+	if err := CopyWorkspace(seedPath, workspace, skipVCI); err != nil {
+		return fmt.Errorf("copy seed: %w", err)
+	}
+	if bundle != nil {
+		if err := AdvanceToHead(ctx, workspace, head, bundle, runner); err != nil {
+			return err
+		}
+	}
+	if err := ApplyLC(ctx, workspace, lc, runner); err != nil {
+		return err
+	}
+	return ApplyExclusions(workspace, exclusions)
+}
