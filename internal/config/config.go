@@ -40,9 +40,6 @@ type LogLimits struct {
 
 type Retention struct {
 	MaxBytes int64 `toml:"max_bytes"`
-	// SourceCacheBytes overrides cache quota.
-	// Omitted uses default and is disallowed on client roots.
-	SourceCacheBytes int64 `toml:"source_cache_bytes"`
 }
 
 // Machine defines one executable slot.
@@ -209,12 +206,6 @@ func validateCoordinator(cfg Config) error {
 	if cfg.Retention.MaxBytes <= 0 {
 		return fmt.Errorf("retention is invalid")
 	}
-	if cfg.Retention.SourceCacheBytes < 0 {
-		return fmt.Errorf("source cache quota is invalid")
-	}
-	if cfg.Retention.SourceCacheBytes > 0 && cfg.Retention.SourceCacheBytes < 4096 {
-		return fmt.Errorf("source cache quota is below minimum 4 KB")
-	}
 	for name, machine := range cfg.Machines {
 		if !model.ValidName(name) {
 			return fmt.Errorf("invalid machine name %q", name)
@@ -336,9 +327,6 @@ func validateClient(cfg Config) error {
 	}
 	if len(cfg.Projects) != 0 {
 		return fmt.Errorf("client root must not declare projects")
-	}
-	if cfg.Retention.SourceCacheBytes != 0 {
-		return fmt.Errorf("client root must not set source-cache quota")
 	}
 	if cfg.Retention.MaxBytes != DefaultRetention.MaxBytes {
 		return fmt.Errorf("client root must not set retention policy")

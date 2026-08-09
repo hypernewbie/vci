@@ -19,28 +19,20 @@ import (
 )
 
 type Report struct {
-	Removed                   int   `json:"removed"`
-	MarkedLost                int   `json:"marked_lost"`
-	QueuedAborted             int   `json:"queued_aborted"`
-	TransferRemoved           int   `json:"transfer_removed"`
-	PerRunTmpRemoved          int   `json:"per_run_tmp_removed"`
-	WorkspacesRemoved         int   `json:"workspaces_removed"`
-	RemoteCleaned             int   `json:"remote_cleaned"`
-	SourceCacheRemoved        int   `json:"source_cache_removed"`
-	SourceCacheScratchRemoved int   `json:"source_cache_scratch_removed"`
-	SourceCacheBytes          int64 `json:"source_cache_bytes"`
-	SourceCacheLimitBytes     int64 `json:"source_cache_limit_bytes"`
-	SourceCacheRejected       int   `json:"source_cache_rejected"`
-	SchedulerClaimsReleased   int   `json:"scheduler_claims_released"`
-	ArtifactsReaped           int   `json:"artifacts_reaped"`
+	Removed                 int `json:"removed"`
+	MarkedLost              int `json:"marked_lost"`
+	QueuedAborted           int `json:"queued_aborted"`
+	TransferRemoved         int `json:"transfer_removed"`
+	PerRunTmpRemoved        int `json:"per_run_tmp_removed"`
+	WorkspacesRemoved       int `json:"workspaces_removed"`
+	RemoteCleaned           int `json:"remote_cleaned"`
+	SchedulerClaimsReleased int `json:"scheduler_claims_released"`
+	ArtifactsReaped         int `json:"artifacts_reaped"`
 }
 
 const (
 	renewalGrace     = 10 * time.Minute
 	transferStaleAge = 30 * time.Minute
-	// DefaultSourceCacheBytes is the documented default quota used
-	// when no coordinator-owned retention setting supplies one.
-	DefaultSourceCacheBytes = 500 * 1024 * 1024
 	// preStartGrace is the short wait after staging publish for a worker lease.
 	// If no lease appears in this window, the run is marked lost.
 	preStartGrace = 60 * time.Second
@@ -167,16 +159,6 @@ func Run(l model.Layout, now time.Time) (Report, error) {
 		report.WorkspacesRemoved = workspacesRemoved
 	}
 	report.RemoteCleaned = reapRemoteTurds(l, now)
-
-	if removed, scratch, bytes, total, rejected, err := ReapSourceCache(l.SourceCacheDir(), sourceCacheQuota(l)); err != nil {
-		return report, err
-	} else {
-		report.SourceCacheRemoved = removed
-		report.SourceCacheScratchRemoved = scratch
-		report.SourceCacheBytes = bytes
-		report.SourceCacheLimitBytes = total
-		report.SourceCacheRejected = rejected
-	}
 
 	if released, err := scheduler.Reap(l, runStore); err != nil {
 		return report, err

@@ -181,24 +181,3 @@ func CanonicalDigest(canonical []CanonicalInput) string {
 	}
 	return "sha256-" + hex.EncodeToString(h.Sum(nil))
 }
-
-// ComputeSnapshotDigest computes the canonical snapshot digest for cache validation.
-func ComputeSnapshotDigest(root string) (string, error) {
-	canonical, err := CanonicalizeSnapshot(root)
-	if err != nil {
-		return "", err
-	}
-	return CanonicalDigest(canonical), nil
-}
-
-// VerifySnapshot recomputes and checks a snapshot digest against the expected value.
-func VerifySnapshot(root string, expected string) error {
-	got, err := ComputeSnapshotDigest(root)
-	if err != nil {
-		return err
-	}
-	if got != expected {
-		return fmt.Errorf("snapshot digest mismatch: want %s got %s", expected, got)
-	}
-	return nil
-}
