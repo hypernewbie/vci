@@ -29,6 +29,11 @@ repository. Treat every mutation as an administrator action.
    and project definitions; a client root only selects its orchestrator.
 4. Use an inline `VCI_ROOT=<absolute-path>` for every command when the root is
    not the default `~/.vci`. Do not persist that environment variable yourself.
+5. A remote coordinator must be able to run `vci` from a **non-interactive SSH
+   session**. Its non-interactive PATH must include the Vci binary, and shell
+   startup files must not emit output that corrupts Vci's JSON response. Ask
+   the user to establish this prerequisite before client use; do not edit PATH,
+   shell startup files, SSH configuration, or host keys yourself.
 
 Vci accepts names matching `[A-Za-z0-9][A-Za-z0-9._-]*`. A project name must
 match its checkout directory basename (case-insensitive fallback exists).

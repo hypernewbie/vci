@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -186,6 +187,45 @@ func TestMaterializeUsesIndependentWorkspaceFiles(t *testing.T) {
 	}
 	if string(data) == "changed" {
 		t.Fatal("workspace mutation changed blob")
+	}
+}
+
+// TestMaterializeRestoresModeAfterUmask proves a source captured on a host
+// with group/world-writable files can run on a Unix coordinator whose umask
+// would otherwise silently change the manifest's mode and lose the run.
+func TestMaterializeRestoresModeAfterUmask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not preserve Unix permission modes")
+	}
+	sourceRoot := t.TempDir()
+	file := filepath.Join(sourceRoot, "shared.txt")
+	if err := os.WriteFile(file, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	manifest, blobs, err := Build(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := manifestEntry(manifest, "shared.txt").Mode; got != 0o666 {
+		t.Fatalf("source mode = %o, want 666", got)
+	}
+	store := BlobStore{Layout: model.Layout{Root: t.TempDir()}}
+	if err := store.PutManifestAndBlobs(manifest, blobs); err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	if err := store.Materialize(manifest, workspace); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(workspace, "shared.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o666 {
+		t.Fatalf("materialized mode = %o, want 666", got)
 	}
 }
 

@@ -276,6 +276,12 @@ func (s BlobStore) Materialize(manifest Manifest, destination string) error {
 			if err := os.WriteFile(path, data, os.FileMode(entry.Mode)); err != nil {
 				return err
 			}
+			// os.WriteFile applies the process umask. Restore the manifest mode
+			// explicitly so a Windows 0666 source materializes identically on a
+			// Unix coordinator with umask 022.
+			if err := os.Chmod(path, os.FileMode(entry.Mode)); err != nil {
+				return err
+			}
 		case "symlink":
 			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 				return err
