@@ -1,8 +1,11 @@
 package source
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -147,5 +150,89 @@ func TestPackageUnpackageLCRoundTrip(t *testing.T) {
 	lcAssertContent(t, dst, "untracked.txt", "new")
 	if target, err := os.Readlink(filepath.Join(dst, "sym")); err != nil || target != "/tmp/p" {
 		t.Fatalf("sym = %q, %v", target, err)
+	}
+}
+
+func TestPackageLCAppliesToCleanCheckoutAtHead(t *testing.T) {
+	src := t.TempDir()
+	runGit(t, src, "init", "-q")
+	lcWriteFile(t, src, "keep.txt", "original")
+	lcWriteFile(t, src, "del.txt", "gone")
+	runGit(t, src, "add", "-A")
+	runGit(t, src, "commit", "-q", "-m", "base")
+
+	// Client change set against HEAD: tracked modification and deletion plus
+	// untracked regular, executable, and symlink entries.
+	lcWriteFile(t, src, "keep.txt", "modified")
+	if err := os.Remove(filepath.Join(src, "del.txt")); err != nil {
+		t.Fatal(err)
+	}
+	lcWriteFile(t, src, "new.txt", "untracked")
+	lcWriteFile(t, src, "exec.sh", "#!/bin/sh\necho hi\n")
+	if err := os.Chmod(filepath.Join(src, "exec.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target.txt", filepath.Join(src, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	lc, err := CaptureLocalChanges(context.Background(), src, process.Native{})
+	if err != nil {
+		t.Fatalf("CaptureLocalChanges: %v", err)
+	}
+	rc, err := PackageLC(lc)
+	if err != nil {
+		t.Fatalf("PackageLC: %v", err)
+	}
+	packed, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatalf("read packaged LC: %v", err)
+	}
+
+	ws := t.TempDir()
+	lcCloneInto(t, src, ws)
+
+	// Worker-compatible apply: extract lc.tar into a private staging dir, run
+	// git apply on staging/patch, then restore the f/ archive into the
+	// workspace, stripping its leading component.
+	staging := filepath.Join(t.TempDir(), "staging")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lcTar := filepath.Join(t.TempDir(), "lc.tar")
+	if err := os.WriteFile(lcTar, packed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("tar", "-xpf", lcTar, "-C", staging).CombinedOutput(); err != nil {
+		t.Fatalf("extract lc.tar: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "patch")); err != nil {
+		t.Fatalf("staging/patch: %v", err)
+	}
+	runGit(t, ws, "apply", "--binary", "--whitespace=nowarn", filepath.Join(staging, "patch"))
+	archive, err := exec.Command("tar", "-C", staging, "-cf", "-", "f").Output()
+	if err != nil {
+		t.Fatalf("archive staging/f: %v", err)
+	}
+	restore := exec.Command("tar", "-C", ws, "-xpf", "-", "--strip-components=1")
+	restore.Stdin = bytes.NewReader(archive)
+	if out, err := restore.CombinedOutput(); err != nil {
+		t.Fatalf("restore f/ into workspace: %v\n%s", err, out)
+	}
+
+	lcAssertContent(t, ws, "keep.txt", "modified")
+	if _, err := os.Stat(filepath.Join(ws, "del.txt")); !os.IsNotExist(err) {
+		t.Fatalf("del.txt should be absent, stat err = %v", err)
+	}
+	lcAssertContent(t, ws, "new.txt", "untracked")
+	lcAssertContent(t, ws, "exec.sh", "#!/bin/sh\necho hi\n")
+	if fi, err := os.Stat(filepath.Join(ws, "exec.sh")); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("exec.sh mode = %o, want 755", fi.Mode().Perm())
+	}
+	if target, err := os.Readlink(filepath.Join(ws, "link")); err != nil || target != "target.txt" {
+		t.Fatalf("link = %q, %v; want target.txt", target, err)
 	}
 }
