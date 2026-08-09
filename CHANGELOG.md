@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Source transfer uses Git reconciliation instead of whole-tree snapshots.
+  A remote build sends its Git identity and local changes plus a Git bundle of
+  the objects the coordinator lacks; the coordinator reconstructs a workspace
+  from its configured local seed (or the bundle alone when no seed is
+  configured), advances it to the client HEAD, applies the local changes,
+  initializes submodules, and prunes coordinator-owned exclusions. A local
+  build copies the working tree and prunes exclusions. Adds `vci probe-seed
+  <project>` (the coordinator reports its seed commit) and `vci build
+  --from-submission <project>` (the coordinator receiver, reading a submission
+  tar on stdin). The whole-tree snapshot, digest, and source cache no longer
+  participate in the client-to-coordinator path.
 - Add `vci watch <run-id>` to poll a run until it reaches a terminal
   state. State changes are written to stderr and the final result is
   emitted as one JSON envelope on stdout. `--interval` controls the

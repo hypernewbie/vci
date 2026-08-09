@@ -64,15 +64,21 @@ Each machine gets one slot by default. Use `--capacity` for parallel jobs. When 
 
 ## Keep source under control
 
-Vci captures the current working tree, including changes beyond `HEAD`. It includes tracked changes, staged changes, untracked non-ignored files, executable bits, symlinks, and initialized submodule files.
+A build runs against a reconstructed workspace, never the live checkout. A
+local build copies the current working tree -- tracked changes, staged changes,
+untracked files, executable bits, symlinks, and submodule content -- then prunes
+coordinator-owned exclusions. The source checkout is never mutated.
 
-Ignored files, deleted tracked files, `.gitmodules`, and private Git data stay behind. Vci rejects uninitialized submodules and unresolved Git LFS pointers. It never fetches either one.
+A remote build sends its Git identity (remote URL, HEAD, base) and local changes
+plus a Git bundle of the objects the coordinator lacks. The coordinator
+reconstructs a workspace from its configured local seed (or from the bundle
+alone when no seed is configured), advances it to the client HEAD, applies the
+local changes, initializes submodules, and prunes exclusions. Only the delta
+bundle and the local changes cross the wire.
 
-Before transfer, Vci copies the selected bytes into a private snapshot and checks its digest. Later edits cannot change an accepted run.
-
-The coordinator reuses snapshots from a bounded cache. Vci protects active entries and removes inactive entries in least-recently-used order.
-
-For a build without a local checkout, Vci can use one configured Git commit. Hosted builds require a full object ID. Vci rejects branches, tags, short hashes, and `HEAD`.
+For a build without a local checkout, Vci can use one configured Git commit.
+Hosted builds require a full object ID. Vci rejects branches, tags, short
+hashes, and `HEAD`.
 
 ## Read the result
 
