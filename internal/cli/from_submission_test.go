@@ -170,8 +170,8 @@ func TestBuildFromSubmissionReconstructsOverStdin(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected object data: %#v", resp.Data)
 	}
-	if data["state"] != string(model.RunSucceeded) {
-		t.Fatalf("expected succeeded; data=%+v", data)
+	if data["run_id"] == nil || data["run_id"] == "" {
+		t.Fatalf("expected a staged run id; data=%+v", data)
 	}
 }
 

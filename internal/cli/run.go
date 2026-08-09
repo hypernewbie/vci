@@ -100,14 +100,18 @@ func dispatch(command string, args []string) (Response, int) {
 			return appFailure(command, err), 2
 		}
 		// The --from-submission form reconstructs a workspace from a submission
-		// tar read on stdin and runs the build to completion. It is the
-		// coordinator-side receiver for a remote client build.
+		// tar read on stdin and stages the run; the client polls and aborts it
+		// like any other build.
 		if submissionShape {
-			result, err := app.BuildFromSubmission(context.Background(), l, args[1], os.Stdin)
+			prepared, err := app.PrepareFromSubmission(context.Background(), l, args[1], os.Stdin)
 			if err != nil {
 				return appFailure(command, err), 2
 			}
-			return Success(command, result), 0
+			if err := spawnRun(prepared.Record.ID); err != nil {
+				_ = app.Abandon(l, prepared.Record.ID)
+				return appFailure(command, err), 2
+			}
+			return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
 		}
 		// `build --hosted <project>` is a coordinator-only source
 		// mode. A client root proxies the command through ordinary

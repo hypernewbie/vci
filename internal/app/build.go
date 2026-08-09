@@ -261,51 +261,59 @@ func PrepareHosted(ctx context.Context, l model.Layout, projectName string) (Pre
 	return PreparedRun{Record: staged}, nil
 }
 
-// BuildFromSubmission drives a build from a framed client submission. It
-// reconstructs a workspace from the coordinator's local seed plus the
-// submission's Git bundle and local changes, then runs the configured command
-// through the normal build lifecycle. The submission tar is read from r.
-func BuildFromSubmission(ctx context.Context, l model.Layout, projectName string, r io.Reader) (BuildResult, error) {
+// PrepareFromSubmission reconstructs a workspace from a framed client
+// submission and stages the run, returning the prepared record. The
+// reconstructed staging dir persists until the run executes.
+func PrepareFromSubmission(ctx context.Context, l model.Layout, projectName string, r io.Reader) (PreparedRun, error) {
 	if err := l.Ensure(); err != nil {
-		return BuildResult{}, err
+		return PreparedRun{}, err
 	}
 	cfg, err := config.Load(l.ConfigPath())
 	if err != nil {
-		return BuildResult{}, err
+		return PreparedRun{}, err
 	}
 	if cfg.Orchestrator != config.OrchestratorSelf {
-		return BuildResult{}, fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
+		return PreparedRun{}, fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
 	}
 	project, ok := cfg.Projects[projectName]
 	if !ok {
-		return BuildResult{}, fmt.Errorf("project %q is not configured", projectName)
+		return PreparedRun{}, fmt.Errorf("project %q is not configured", projectName)
 	}
 	if len(project.Machines) == 0 {
-		return BuildResult{}, fmt.Errorf("project %q has no attached machines", projectName)
+		return PreparedRun{}, fmt.Errorf("project %q has no attached machines", projectName)
 	}
 	seed, seedErr := localSeed(cfg, projectName)
 	if seedErr != nil {
-		// No local seed configured: reconstruct from the bundle alone.
 		seed = ""
 	}
 	sub, err := source.UnpackageSubmission(r)
 	if err != nil {
-		return BuildResult{}, err
+		return PreparedRun{}, err
 	}
 	tempRoot, err := os.MkdirTemp(l.TempDir(), "vci-recon-*")
 	if err != nil {
-		return BuildResult{}, fmt.Errorf("create reconstruction dir: %w", err)
+		return PreparedRun{}, fmt.Errorf("create reconstruction dir: %w", err)
 	}
-	defer os.RemoveAll(tempRoot)
 	reconDir := filepath.Join(tempRoot, projectName)
 	var bundle io.Reader
 	if len(sub.Bundle) > 0 {
 		bundle = bytes.NewReader(sub.Bundle)
 	}
 	if err := source.ReconstructWorkspace(ctx, seed, reconDir, sub.Head, bundle, sub.LocalChanges, project.ExcludedPaths, process.Native{}); err != nil {
-		return BuildResult{}, fmt.Errorf("reconstruct workspace: %w", err)
+		_ = os.RemoveAll(tempRoot)
+		return PreparedRun{}, fmt.Errorf("reconstruct workspace: %w", err)
 	}
 	prepared, err := Prepare(ctx, l, reconDir)
+	if err != nil {
+		_ = os.RemoveAll(tempRoot)
+		return PreparedRun{}, err
+	}
+	return prepared, nil
+}
+
+// BuildFromSubmission reconstructs and runs a submission build to completion.
+func BuildFromSubmission(ctx context.Context, l model.Layout, projectName string, r io.Reader) (BuildResult, error) {
+	prepared, err := PrepareFromSubmission(ctx, l, projectName, r)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -420,6 +428,7 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		_, _ = runStore.Transition(id, model.RunLost, time.Now().UTC())
 		return BuildResult{}, err
 	}
+	cleanReconstructStaging(l, record.SourcePath)
 	if cancellationRequested(runStore, id) {
 		_ = removeOwned(workspace)
 		_, _ = runStore.Transition(id, model.RunAborted, time.Now().UTC())
@@ -510,6 +519,21 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		_ = os.WriteFile(filepath.Join(runDir, "cleanup.pending"), []byte(err.Error()), 0o600)
 	}
 	return result, nil
+}
+
+// cleanReconstructStaging removes the reconstructed staging dir once the run
+// workspace has been populated from it. It only removes paths strictly under
+// the Vci temp directory, so a local build's source checkout is never touched.
+func cleanReconstructStaging(l model.Layout, sourcePath string) {
+	if sourcePath == "" {
+		return
+	}
+	parent := filepath.Dir(sourcePath)
+	rel, err := filepath.Rel(l.TempDir(), parent)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return
+	}
+	_ = os.RemoveAll(parent)
 }
 
 // isManagedSource reports whether repoRoot is a Vci staging tree or cache

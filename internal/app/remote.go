@@ -43,55 +43,107 @@ func remoteOrchestrator(l model.Layout) (string, error) {
 	return cfg.Orchestrator, nil
 }
 
-// RemoteBuild snapshots selected input, computes its digest, and streams it
-// to remote staging over SSH.
+// RemoteBuild captures the source identity and local changes, asks the
+// coordinator for the deepest commit it already has, then streams a submission
+// (the missing Git objects as a bundle plus the local changes) to the
+// coordinator's build --from-submission over SSH stdin. It returns the
+// coordinator's run-id envelope; the build executes asynchronously and the
+// client polls or aborts it like any other run.
 func RemoteBuild(ctx context.Context, l model.Layout, sourcePath string) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
 	}
-	input, err := source.SelectBuildInput(ctx, sourcePath, process.Native{})
+	repo, err := source.Discover(ctx, sourcePath, process.Native{})
 	if err != nil {
-		return nil, true, fmt.Errorf("select build input: %w", err)
+		return nil, true, fmt.Errorf("discover source: %w", err)
 	}
-	// Validate the repository basename immediately, before any
-	// further work touches remote shell text or staging directories.
-	if !model.ValidName(input.ProjectName) {
-		return nil, true, fmt.Errorf("repository name %q cannot name a remote project", input.ProjectName)
+	if !model.ValidName(repo.Name) {
+		return nil, true, fmt.Errorf("repository name %q cannot name a remote project", repo.Name)
 	}
-
-	// Materialize one snapshot so the digest and archive come from identical bytes.
-	if err := os.MkdirAll(l.TempDir(), 0o700); err != nil {
-		return nil, true, fmt.Errorf("prepare client snapshot dir: %w", err)
-	}
-	snapshot, err := source.MaterializeSnapshot(input, l.TempDir())
-	if err != nil {
-		return nil, true, fmt.Errorf("materialize source snapshot: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(snapshot) }()
-
-	digest, err := source.ComputeSnapshotDigest(snapshot)
-	if err != nil {
-		return nil, true, fmt.Errorf("compute source digest: %w", err)
-	}
-	key, err := validateCacheKey(digest, input.ProjectName)
+	identity, err := source.CaptureIdentity(ctx, sourcePath, process.Native{})
 	if err != nil {
 		return nil, true, err
 	}
-
-	// Try remote source cache lookup over SSH before uploading the snapshot.
-	cacheScript := buildCacheProbeScript(key)
-	raw, err := runSSH(ctx, host, cacheScript)
-	if err == nil && validEnvelope(raw) {
-		fmt.Fprintln(os.Stderr, "vci: source cache hit")
-		return raw, true, nil
+	have, err := remoteSeedHead(ctx, host, repo.Name)
+	if err != nil {
+		return nil, true, err
 	}
-
-	raw, remote, tarBytes, err := buildOverStaging(ctx, host, input, snapshot, key)
-	if tarBytes > 0 {
-		fmt.Fprintf(os.Stderr, "vci: source tar bytes %d\n", tarBytes)
+	have = deltaBase(ctx, sourcePath, have, identity.Head)
+	bundleRC, err := source.CreateBundle(ctx, sourcePath, have, identity.Head, process.Native{})
+	if err != nil {
+		return nil, true, fmt.Errorf("create bundle: %w", err)
 	}
-	return raw, remote, err
+	bundle, err := io.ReadAll(bundleRC)
+	_ = bundleRC.Close()
+	if err != nil {
+		return nil, true, fmt.Errorf("read bundle: %w", err)
+	}
+	lc, err := source.CaptureLocalChanges(ctx, sourcePath, process.Native{})
+	if err != nil {
+		return nil, true, err
+	}
+	submission, err := source.PackageSubmission(source.Submission{
+		Head:         identity.Head,
+		Base:         identity.Base,
+		RemoteURL:    identity.RemoteURL,
+		Have:         have,
+		Bundle:       bundle,
+		LocalChanges: lc,
+	})
+	if err != nil {
+		return nil, true, err
+	}
+	cmd := exec.CommandContext(ctx, "ssh", host, buildRemoteCommand("build", "--from-submission", repo.Name))
+	cmd.Stdin = submission
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if validEnvelope(stdout.Bytes()) {
+			return stdout.Bytes(), true, nil
+		}
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, true, fmt.Errorf("ssh %s: %s", host, message)
+	}
+	if !validEnvelope(stdout.Bytes()) {
+		return nil, true, fmt.Errorf("remote vci returned invalid JSON")
+	}
+	return stdout.Bytes(), true, nil
+}
+
+// remoteSeedHead probes the coordinator for the HEAD commit of its local seed
+// for a project; empty means the coordinator has no usable seed.
+func remoteSeedHead(ctx context.Context, host, project string) (string, error) {
+	raw, err := runSSH(ctx, host, buildRemoteCommand("probe-seed", project))
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Data struct {
+			Have string `json:"have"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", fmt.Errorf("decode probe-seed response: %w", err)
+	}
+	return resp.Data.Have, nil
+}
+
+// deltaBase returns the commit to bundle from: have when it is an ancestor of
+// head, otherwise empty so the client sends its full history.
+func deltaBase(ctx context.Context, repoRoot, have, head string) string {
+	if have == "" {
+		return ""
+	}
+	res, err := (process.Native{}).Run(ctx, process.Command{Executable: "git", Args: []string{"-C", repoRoot, "merge-base", "--is-ancestor", have, head}})
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	return have
 }
 
 // buildOverStaging uploads the tar stream over SSH, runs the remote build,
