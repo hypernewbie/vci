@@ -1,6 +1,6 @@
 ---
 name: vci
-description: Run CI on this repository with an already configured Vci installation and report where it ran, whether it passed, and why it failed. Trigger when the user asks to run/check CI or a build with Vci ("run vci", "vci build", "run CI on this repo", "check this build", "did the build pass"), when a run ID from a previous Vci build must be checked, logged, aborted, or its artifacts retrieved, or when Vci results should be turned into a plain-language report. Never trigger setup, installation, or configuration tasks; if Vci is missing or unconfigured, report that and stop.
+description: Run CI on this repository with an already configured Vci installation and report where it ran, whether it passed, and why it failed. Trigger when the user asks to run/check CI or a build with Vci ("run vci", "vci build", "run CI on this repo", "check this build", "did the build pass"), when a run ID from a previous Vci build must be checked, logged, aborted, or its artifacts retrieved, or when Vci results should be turned into a plain-language report. Do not use for setup or configuration: route those requests to the `vci-orchestrator` skill instead.
 ---
 
 # Vci: run CI on an already configured installation
@@ -10,8 +10,9 @@ configured machine and keeps the run ID, machine, exit code, logs, and
 artifacts with the result. It is a single binary with no web service,
 dashboard, queue, or custom protocol.
 
-This skill only **uses** an already configured Vci installation. It never
-sets one up.
+This skill only **uses** an already configured Vci installation. For any
+setup or configuration request, use the `vci-orchestrator` skill instead of
+claiming that Vci cannot be configured.
 
 ## Hard boundary — do not configure, ever
 
