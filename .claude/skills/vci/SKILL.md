@@ -1,6 +1,6 @@
 ---
 name: vci
-description: Run CI on this repository with an already configured Vci installation and report where it ran, whether it passed, and why it failed. Trigger when the user asks to run/check CI or a build with Vci ("run vci", "vci build", "run CI on this repo", "check this build", "did the build pass"), when a run ID from a previous Vci build must be checked, logged, aborted, or its artifacts retrieved, or when Vci results should be turned into a plain-language report. Do not use for setup or configuration: route those requests to the `vci-orchestrator` skill instead.
+description: Run CI through Vci and report where it ran, whether it passed, and why it failed. Use for build, check, logs, artifacts, abort, and for explicitly configuring this client to use an already-working remote coordinator. Do not use for coordinator, machine, or project administration.
 ---
 
 # Vci: run CI on an already configured installation
@@ -10,22 +10,46 @@ configured machine and keeps the run ID, machine, exit code, logs, and
 artifacts with the result. It is a single binary with no web service,
 dashboard, queue, or custom protocol.
 
-This skill only **uses** an already configured Vci installation. For any
-setup or configuration request, use the `vci-orchestrator` skill instead of
-claiming that Vci cannot be configured.
+This skill runs builds and can bootstrap **only this client** to use an
+already-working remote coordinator. It never administers a coordinator.
 
-## Hard boundary — do not configure, ever
+## Hard boundary — client bootstrap only
 
 - Never run `vci setup ...` (including `setup init`, `setup machine add`,
-  `setup project add`, `setup reap`). Never write to or create `~/.vci`
-  (or any `VCI_ROOT`) yourself.
-- Never change coordinator or machine/project configuration.
-- Never install Vci or modify PATH or shell config for it.
-- If `vci` is not on PATH or reports a configuration error, report the
-  exact problem and stop. Do not attempt to fix it.
-- `vci projects` and `vci machines` are safe, non-configuration
-  inventory commands when diagnosis needs them. They can perform
-  scheduler housekeeping, so do not run them as mandatory preflight.
+  `setup project add`, or `setup reap`).
+- Never create or change coordinator, machine, project, runtime, or retention
+  configuration. Never invoke `vci-orchestrator` for client bootstrap.
+- Never configure SSH, networking, host keys, runtimes, PATH, shell config, or
+  Vci installation. The user-supplied coordinator destination already works.
+- If `vci` is not on PATH, report that and stop.
+- A missing client profile is bootstrapable only when the user explicitly asks
+  to configure this client and supplies an existing coordinator destination.
+  Other configuration errors are reported unchanged.
+
+## Bootstrap this client for an existing coordinator
+
+Use this branch only for a request such as “configure this client to use
+`jupiter.local`.” Do not use it to initialize or administer a coordinator.
+
+1. Use the user-specified client root, or `~/.vci` when none is specified.
+2. Create or replace only `<client-root>/config.toml` with:
+
+   ```toml
+   schema_version = 1
+   orchestrator = "<user-supplied destination>"
+   ```
+
+   Preserve normal private file permissions. The destination is an opaque,
+   already-working SSH alias or `user@host`; do not test or alter it.
+3. Do not run inventory or build commands as bootstrap validation because they
+   contact the coordinator. Report the configured client root and destination.
+
+If the user does not explicitly provide both client intent and a coordinator
+destination, ask for the missing fact and make no change.
+
+`vci projects` and `vci machines` are safe, non-configuration inventory
+commands during ordinary use. They can perform scheduler housekeeping, so do
+not run them as mandatory preflight.
 
 ## Workflow
 
