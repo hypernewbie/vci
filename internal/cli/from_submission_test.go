@@ -174,3 +174,95 @@ func TestBuildFromSubmissionReconstructsOverStdin(t *testing.T) {
 		t.Fatalf("expected succeeded; data=%+v", data)
 	}
 }
+
+func TestProbeSeedReportsSeedHead(t *testing.T) {
+	seed := filepath.Join(t.TempDir(), "probedemo-seed")
+	if err := os.MkdirAll(seed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGitIn := func(args ...string) {
+		t.Helper()
+		cmd := process.Command{Executable: "git", Args: append([]string{"-C", seed}, args...)}
+		if _, err := (process.Native{}).Run(context.Background(), cmd); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	runGitIn("init", "-q")
+	runGitIn("config", "user.email", "vci-test@example.com")
+	runGitIn("config", "user.name", "vci-test")
+	if err := os.WriteFile(filepath.Join(seed, "app.txt"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitIn("add", "app.txt")
+	runGitIn("commit", "-q", "-m", "base")
+	var headOut strings.Builder
+	if _, err := (process.Native{}).Run(context.Background(), process.Command{Executable: "git", Args: []string{"-C", seed, "rev-parse", "HEAD"}, Stdout: &headOut}); err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(headOut.String())
+
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	l := model.Layout{Root: root}
+	if err := app.Initialize(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddMachine(l, "mac-local", config.Machine{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddProject(l, "probedemo", config.Project{Machines: []string{"mac-local"}, Command: []string{"true"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.UpdateMachine(l, "mac-local", func(m *config.Machine) error {
+		m.SourcePaths = map[string]string{"probedemo": seed}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"probe-seed", "probedemo"}, &out, &errOut); code != 0 {
+		t.Fatalf("probe-seed failed (code %d): %s %s", code, out.String(), errOut.String())
+	}
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	data, ok := resp.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("expected object data: %#v", resp.Data)
+	}
+	if data["have"] != head {
+		t.Fatalf("have = %v, want %s", data["have"], head)
+	}
+}
+
+func TestProbeSeedEmptyWhenNoSeed(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	l := model.Layout{Root: root}
+	if err := app.Initialize(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddMachine(l, "mac-local", config.Machine{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddProject(l, "probedemo", config.Project{Machines: []string{"mac-local"}, Command: []string{"true"}}); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"probe-seed", "probedemo"}, &out, &errOut); code != 0 {
+		t.Fatalf("probe-seed failed (code %d): %s %s", code, out.String(), errOut.String())
+	}
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	data, ok := resp.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("expected object data: %#v", resp.Data)
+	}
+	if data["have"] != "" {
+		t.Fatalf("have = %v, want empty", data["have"])
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -324,6 +325,29 @@ func localSeed(cfg config.Config, projectName string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no local source path configured for project %q", projectName)
+}
+
+// ProbeSeed reports the HEAD commit of a project's local seed checkout, or an
+// empty string when no seed is configured or the seed is not a Git repository.
+// A remote client uses it to compute the smallest bundle that advances the
+// coordinator's seed to the client head.
+func ProbeSeed(ctx context.Context, l model.Layout, projectName string) (string, error) {
+	cfg, err := config.Load(l.ConfigPath())
+	if err != nil {
+		return "", err
+	}
+	if cfg.Orchestrator != config.OrchestratorSelf {
+		return "", fmt.Errorf("client root: orchestrator = %q", cfg.Orchestrator)
+	}
+	seed, err := localSeed(cfg, projectName)
+	if err != nil {
+		return "", nil
+	}
+	var out strings.Builder
+	if _, err := (process.Native{}).Run(ctx, process.Command{Executable: "git", Args: []string{"-C", seed, "rev-parse", "HEAD"}, Stdout: &out}); err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(out.String()), nil
 }
 
 func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (BuildResult, error) {

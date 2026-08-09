@@ -159,6 +159,19 @@ func dispatch(command string, args []string) (Response, int) {
 			return appFailure(command, err), 2
 		}
 		return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
+	case "probe-seed":
+		if len(args) != 1 || !model.ValidName(args[0]) {
+			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: probe-seed <project>.", false)), 2
+		}
+		l, err := resolveLayout()
+		if err != nil {
+			return appFailure(command, err), 2
+		}
+		have, err := app.ProbeSeed(context.Background(), l, args[0])
+		if err != nil {
+			return appFailure(command, err), 2
+		}
+		return Success(command, map[string]any{"have": have}), 0
 	case "check":
 		return checkRun(context.Background(), args)
 	case "abort":
