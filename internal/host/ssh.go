@@ -243,20 +243,31 @@ func validateCacheSegment(what, s string) error {
 	return nil
 }
 
-// cacheEntryPath returns the remote cache entry directory
-// <root>/v1/<project>/<base>, validating every segment. The path is composed
-// with "/" because it is a remote shell word, never a local filesystem path.
-func cacheEntryPath(cacheRoot, project, base string) (string, error) {
+// cacheProjectDir returns the remote cache project directory
+// <root>/v1/<project>, validating the root and the project segment the same
+// way cacheEntryPath does.
+func cacheProjectDir(cacheRoot, project string) (string, error) {
 	if cacheRoot == "" {
 		return "", fmt.Errorf("cache root is empty")
 	}
 	if err := validateCacheSegment("project", project); err != nil {
 		return "", err
 	}
+	return cacheRoot + "/" + cacheLayoutVersion + "/" + project, nil
+}
+
+// cacheEntryPath returns the remote cache entry directory
+// <root>/v1/<project>/<base>, validating every segment. The path is composed
+// with "/" because it is a remote shell word, never a local filesystem path.
+func cacheEntryPath(cacheRoot, project, base string) (string, error) {
+	projDir, err := cacheProjectDir(cacheRoot, project)
+	if err != nil {
+		return "", err
+	}
 	if err := validateCacheSegment("base", base); err != nil {
 		return "", err
 	}
-	return cacheRoot + "/" + cacheLayoutVersion + "/" + project + "/" + base, nil
+	return projDir + "/" + base, nil
 }
 
 // ProbeBundleCache asks a worker whether its bundle cache holds a complete
@@ -357,6 +368,53 @@ func (c Client) ReleaseBundleClaim(ctx context.Context, host, cacheRoot, project
 		return fmt.Errorf("release claim %s: remote exit %d", host, result.ExitCode)
 	}
 	return nil
+}
+
+// ReapBundleCacheResult reports what one remote reaping pass removed for a
+// project: Stale counts incomplete entries and claim markers dropped for age,
+// Evicted counts complete entries dropped to enforce the LRU limits.
+type ReapBundleCacheResult struct {
+	Stale   int
+	Evicted int
+}
+
+// ReapBundleCache runs the worker-side bundle-cache maintenance pass for one
+// project over SSH: it removes incomplete entries and claim markers untouched
+// for the 30-minute windows, evicts claim-free complete entries beyond the
+// policy limits, then removes the reap reference directory before the shell
+// prints `stale=N evicted=M`, which the client parses into
+// ReapBundleCacheResult. A nonzero remote exit is a reaping failure; a runner
+// failure without a remote exit is a wrapped transport error.
+func (c Client) ReapBundleCache(ctx context.Context, host, cacheRoot, project string, policy config.BundleCachePolicy, now time.Time) (ReapBundleCacheResult, error) {
+	if err := ValidateHost(host); err != nil {
+		return ReapBundleCacheResult{}, err
+	}
+	if c.Runner == nil {
+		return ReapBundleCacheResult{}, fmt.Errorf("ssh runner is required")
+	}
+	projDir, err := cacheProjectDir(cacheRoot, project)
+	if err != nil {
+		return ReapBundleCacheResult{}, err
+	}
+	var stdout bytes.Buffer
+	result, err := c.Runner.Run(ctx, process.Command{
+		Executable: "ssh",
+		Args:       []string{host, cacheReapShell(projDir, policy, now)},
+		Stdout:     &stdout,
+	})
+	if ctx.Err() != nil {
+		return ReapBundleCacheResult{}, ctx.Err()
+	}
+	if err != nil {
+		if result.ExitCode != 0 {
+			return ReapBundleCacheResult{}, fmt.Errorf("reap cache %s: remote exit %d", host, result.ExitCode)
+		}
+		return ReapBundleCacheResult{}, fmt.Errorf("ssh %s: %w", host, err)
+	}
+	if result.ExitCode != 0 {
+		return ReapBundleCacheResult{}, fmt.Errorf("reap cache %s: remote exit %d", host, result.ExitCode)
+	}
+	return parseReapOutput(stdout.String())
 }
 
 // StreamNoSeedReconstruct sends a worker payload tar over SSH stdin to a
@@ -478,6 +536,36 @@ func cacheAdmitShell(entry string, bundleBytes int64, now time.Time) (string, er
 		" && : > " + entry + "/complete", nil
 }
 
+// cacheEvictLoop returns a POSIX sh loop that removes the
+// least-recently-used claim-free complete entries of projDir until both
+// positive limits are satisfied, mirroring bundlecache.EvictLRU. A non-empty
+// counter tallies removals into that shell variable and aborts the shell when
+// a removal fails so the loop cannot spin on an undeletable entry; an empty
+// counter keeps the bare rm shape the reconstruction shell relies on. With no
+// positive limits the loop is the no-op ":", matching EvictLRU's
+// within-limits short-circuit.
+func cacheEvictLoop(projDir string, maxEntries int, maxBytes int64, counter string) string {
+	parts := make([]string, 0, 2)
+	if maxEntries > 0 {
+		parts = append(parts, `[ "$n" -le `+strconv.Itoa(maxEntries)+` ]`)
+	}
+	if maxBytes > 0 {
+		parts = append(parts, `[ "$b" -le `+strconv.FormatInt(maxBytes, 10)+` ]`)
+	}
+	if len(parts) == 0 {
+		return ":"
+	}
+	within := parts[0]
+	if len(parts) == 2 {
+		within = parts[0] + " && " + parts[1]
+	}
+	remove := `rm -rf "$o"`
+	if counter != "" {
+		remove = counter + "=$((" + counter + "+1)); " + remove + " || exit"
+	}
+	return `while :; do n=0; b=0; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; n=$((n+1)); v=$(sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p' "$d/meta.json"); [ -n "$v" ] || v=0; b=$((b+v)); done; if ` + within + `; then break; fi; o=; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; [ -n "$(ls -A "$d/claims" 2>/dev/null)" ] && continue; if [ -z "$o" ] || [ "$d/meta.json" -ot "$o/meta.json" ]; then o=$d; fi; done; [ -n "$o" ] || break; ` + remove + `; done`
+}
+
 // cacheEvictShell returns a POSIX sh loop that removes the
 // least-recently-used claim-free complete entries of a project until both
 // positive policy limits are satisfied, mirroring bundlecache.EvictLRU. entry
@@ -488,23 +576,70 @@ func cacheEvictShell(entry string, maxEntries int, maxBytes int64) (string, erro
 	if slash < 0 {
 		return "", fmt.Errorf("invalid cache entry path %q", entry)
 	}
-	projDir := entry[:slash]
-	parts := make([]string, 0, 2)
-	if maxEntries > 0 {
-		parts = append(parts, `[ "$n" -le `+strconv.Itoa(maxEntries)+` ]`)
+	return cacheEvictLoop(entry[:slash], maxEntries, maxBytes, ""), nil
+}
+
+// bundleCachePartialTTL and bundleCacheClaimTTL bound how long an incomplete
+// entry or a claim marker may go untouched before remote reaping removes it.
+const (
+	bundleCachePartialTTL = 30 * time.Minute
+	bundleCacheClaimTTL   = 30 * time.Minute
+)
+
+// cacheReapShell builds the remote POSIX sh body that reaps one cache
+// project: it drops incomplete entries and claim markers older than the
+// 30-minute partial and claim windows, evicts claim-free complete entries
+// beyond the policy limits, removes the reference directory, and prints
+// `stale=N evicted=M`. Each window is a reference file touched to exactly
+// now-cutoff under a dot directory the `*/` entry globs never match, so
+// staleness uses plain POSIX `-ot` mtime comparisons — no GNU-only find
+// time flags and no remote scripting runtime. Removals abort the shell on
+// failure (`|| exit`) so a stuck rm cannot spin the eviction loop or
+// silently under-count.
+func cacheReapShell(projDir string, policy config.BundleCachePolicy, now time.Time) string {
+	if now.IsZero() {
+		now = time.Now()
 	}
-	if maxBytes > 0 {
-		parts = append(parts, `[ "$b" -le `+strconv.FormatInt(maxBytes, 10)+` ]`)
+	now = now.UTC()
+	refDir := projDir + "/.vci-reap"
+	partialRef := refDir + "/partial"
+	claimRef := refDir + "/claim"
+	partialCutoff := now.Add(-bundleCachePartialTTL).Format("200601021504.05")
+	claimCutoff := now.Add(-bundleCacheClaimTTL).Format("200601021504.05")
+
+	var b strings.Builder
+	b.WriteString("mkdir -p " + refDir)
+	b.WriteString(" && TZ=UTC touch -t " + partialCutoff + " " + partialRef)
+	b.WriteString(" && TZ=UTC touch -t " + claimCutoff + " " + claimRef)
+	b.WriteString(" && p=0 && for d in " + projDir + `/*/; do [ -d "$d" ] || continue; [ -f "$d/complete" ] && continue; if [ -f "$d/meta.json" ]; then [ "$d/meta.json" -ot ` + partialRef + ` ] || continue; else [ "$d" -ot ` + partialRef + ` ] || continue; fi; rm -rf "$d" || exit; p=$((p+1)); done`)
+	b.WriteString(" && q=0 && for d in " + projDir + `/*/; do [ -d "$d" ] || continue; [ -d "$d/claims" ] || continue; for c in "$d"/claims/*; do [ -f "$c" ] || continue; [ "$c" -ot ` + claimRef + ` ] || continue; rm -f "$c" || exit; q=$((q+1)); done; done`)
+	b.WriteString(" && e=0 && " + cacheEvictLoop(projDir, policy.MaxEntries, policy.MaxBytes, "e"))
+	b.WriteString(" && rm -f " + partialRef + " " + claimRef + " && rmdir " + refDir)
+	b.WriteString(` && printf 'stale=%d evicted=%d\n' "$((p+q))" "$e"`)
+	return b.String()
+}
+
+// reapOutputRe matches the machine-readable removal line the reaping shell
+// prints.
+var reapOutputRe = regexp.MustCompile(`stale=(\d+) evicted=(\d+)`)
+
+// parseReapOutput decodes the reaping shell's removal-count line. A missing
+// or malformed line is an error so a truncated or changed remote shell cannot
+// silently report zero removals.
+func parseReapOutput(out string) (ReapBundleCacheResult, error) {
+	m := reapOutputRe.FindStringSubmatch(out)
+	if m == nil {
+		return ReapBundleCacheResult{}, fmt.Errorf("reap cache: no removal counts in output %q", strings.TrimSpace(out))
 	}
-	if len(parts) == 0 {
-		return ":", nil // no positive limits: nothing to evict
+	stale, err := strconv.Atoi(m[1])
+	if err != nil {
+		return ReapBundleCacheResult{}, fmt.Errorf("reap cache: stale count %q: %w", m[1], err)
 	}
-	within := parts[0]
-	if len(parts) == 2 {
-		within = parts[0] + " && " + parts[1]
+	evicted, err := strconv.Atoi(m[2])
+	if err != nil {
+		return ReapBundleCacheResult{}, fmt.Errorf("reap cache: evicted count %q: %w", m[2], err)
 	}
-	loop := `while :; do n=0; b=0; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; n=$((n+1)); v=$(sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p' "$d/meta.json"); [ -n "$v" ] || v=0; b=$((b+v)); done; if ` + within + `; then break; fi; o=; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; [ -n "$(ls -A "$d/claims" 2>/dev/null)" ] && continue; if [ -z "$o" ] || [ "$d/meta.json" -ot "$o/meta.json" ]; then o=$d; fi; done; [ -n "$o" ] || break; rm -rf "$o"; done`
-	return loop, nil
+	return ReapBundleCacheResult{Stale: stale, Evicted: evicted}, nil
 }
 
 // StageRemote clears the validated remote work dir, then tars a local

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/process"
 )
 
@@ -1136,6 +1137,161 @@ func TestClientStreamNoSeedReconstructRejectsBadInput(t *testing.T) {
 	if len(runner.commands) != 0 {
 		t.Errorf("runner invoked %d times for rejected input", len(runner.commands))
 	}
+}
+
+// TestClientReapBundleCache pins the remote bundle-cache reaping pass through
+// a scripted runner: validation happens before any subprocess, the shell
+// removes stale incomplete entries and claim markers by comparing mtimes
+// against reference files touched to the 30-minute cutoffs, then enforces the
+// project LRU limits with a counting loop, and the client parses the printed
+// `stale=N evicted=M` line. Nonzero remote exits stay remote-exit failures
+// and runner failures without a remote exit stay wrapped transport errors.
+func TestClientReapBundleCache(t *testing.T) {
+	projDir := "~/.vci/state/bundle-cache/v1/Vci"
+	refDir := projDir + "/.vci-reap"
+	now := time.Date(2026, 8, 9, 12, 34, 56, 0, time.UTC)
+	cutoff := "202608091204.56"
+
+	t.Run("pins shell and parses counts", func(t *testing.T) {
+		runner := &stdoutRunner{stdout: "stale=3 evicted=2\n"}
+		got, err := (Client{Runner: runner}).ReapBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", config.BundleCachePolicy{MaxEntries: 5, MaxBytes: 5 << 30}, now)
+		if err != nil {
+			t.Fatalf("reap: %v", err)
+		}
+		if got != (ReapBundleCacheResult{Stale: 3, Evicted: 2}) {
+			t.Fatalf("counts: %+v", got)
+		}
+		if len(runner.commands) != 1 {
+			t.Fatalf("runner invoked %d times", len(runner.commands))
+		}
+		cmd := runner.commands[0]
+		if cmd.Executable != "ssh" || len(cmd.Args) != 2 || cmd.Args[0] != "charon" {
+			t.Fatalf("command: %+v", cmd)
+		}
+		s := cmd.Args[1]
+		ordered := []string{
+			"mkdir -p " + refDir,
+			"TZ=UTC touch -t " + cutoff + " " + refDir + "/partial",
+			"TZ=UTC touch -t " + cutoff + " " + refDir + "/claim",
+			`[ -f "$d/complete" ] && continue`,
+			`[ "$d/meta.json" -ot ` + refDir + "/partial ]",
+			`[ -d "$d/claims" ] || continue`,
+			`[ "$c" -ot ` + refDir + "/claim ]",
+			"while :; do",
+			`[ "$n" -le 5 ] && [ "$b" -le 5368709120 ]`,
+			`e=$((e+1)); rm -rf "$o" || exit`,
+			"rm -f " + refDir + "/partial " + refDir + "/claim",
+			"rmdir " + refDir,
+			`printf 'stale=%d evicted=%d\n' "$((p+q))" "$e"`,
+		}
+		last := -1
+		for _, want := range ordered {
+			i := strings.Index(s, want)
+			if i < 0 {
+				t.Errorf("shell missing %q: %s", want, s)
+				continue
+			}
+			if i < last {
+				t.Errorf("shell order violated for %q: %s", want, s)
+			}
+			last = i
+		}
+		// The pass must stay portable POSIX sh: staleness is decided by -ot
+		// against reference files, never GNU-only find time flags or a remote
+		// scripting runtime, and removals abort the shell on failure.
+		for _, banned := range []string{"find ", "-mmin", "-delete", "python"} {
+			if strings.Contains(s, banned) {
+				t.Errorf("shell must not use %q: %s", banned, s)
+			}
+		}
+		for _, want := range []string{`rm -rf "$d" || exit`, `rm -f "$c" || exit`} {
+			if !strings.Contains(s, want) {
+				t.Errorf("shell missing %q: %s", want, s)
+			}
+		}
+	})
+
+	t.Run("parses zero counts", func(t *testing.T) {
+		runner := &stdoutRunner{stdout: "stale=0 evicted=0\n"}
+		got, err := (Client{Runner: runner}).ReapBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", config.BundleCachePolicy{MaxEntries: 5}, now)
+		if err != nil {
+			t.Fatalf("reap: %v", err)
+		}
+		if got != (ReapBundleCacheResult{}) {
+			t.Fatalf("counts: %+v", got)
+		}
+	})
+
+	t.Run("no limits keeps no-op eviction", func(t *testing.T) {
+		runner := &stdoutRunner{stdout: "stale=1 evicted=0\n"}
+		got, err := (Client{Runner: runner}).ReapBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", config.BundleCachePolicy{}, now)
+		if err != nil {
+			t.Fatalf("reap: %v", err)
+		}
+		if got.Stale != 1 || got.Evicted != 0 {
+			t.Fatalf("counts: %+v", got)
+		}
+		s := runner.commands[0].Args[1]
+		if !strings.Contains(s, "e=0 && : && rm -f "+refDir+"/partial "+refDir+"/claim && rmdir "+refDir+" && printf 'stale=%d evicted=%d\\n'") {
+			t.Errorf("no-limit shell must keep the no-op eviction, clean up the reference directory, and print the count line: %s", s)
+		}
+	})
+
+	t.Run("malformed output", func(t *testing.T) {
+		runner := &stdoutRunner{stdout: "boom\n"}
+		if _, err := (Client{Runner: runner}).ReapBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", config.BundleCachePolicy{MaxEntries: 5}, now); err == nil {
+			t.Fatal("malformed output accepted")
+		}
+	})
+
+	t.Run("nonzero remote exit", func(t *testing.T) {
+		runner := &scriptRunner{result: process.Result{ExitCode: 7}, err: errors.New("exit status 7")}
+		_, err := (Client{Runner: runner}).ReapBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", config.BundleCachePolicy{MaxEntries: 5}, now)
+		if err == nil {
+			t.Fatal("nonzero remote exit not reported")
+		}
+		if !strings.Contains(err.Error(), "reap cache charon: remote exit 7") {
+			t.Errorf("error: %v", err)
+		}
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		runner := &scriptRunner{err: errors.New("connection refused")}
+		_, err := (Client{Runner: runner}).ReapBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", config.BundleCachePolicy{MaxEntries: 5}, now)
+		if err == nil {
+			t.Fatal("transport error not reported")
+		}
+		if !strings.Contains(err.Error(), "ssh charon") || !errors.Is(err, runner.err) {
+			t.Errorf("error: %v", err)
+		}
+	})
+
+	t.Run("rejects bad input", func(t *testing.T) {
+		runner := &scriptRunner{}
+		cases := []struct {
+			name      string
+			client    Client
+			host      string
+			cacheRoot string
+			project   string
+		}{
+			{"empty host", Client{Runner: runner}, "", "~/.vci/state/bundle-cache", "Vci"},
+			{"empty root", Client{Runner: runner}, "charon", "", "Vci"},
+			{"slash project", Client{Runner: runner}, "charon", "~/.vci/state/bundle-cache", "a/b"},
+			{"dotdot project", Client{Runner: runner}, "charon", "~/.vci/state/bundle-cache", ".."},
+			{"nil runner", Client{}, "charon", "~/.vci/state/bundle-cache", "Vci"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if _, err := tc.client.ReapBundleCache(context.Background(), tc.host, tc.cacheRoot, tc.project, config.BundleCachePolicy{MaxEntries: 5}, now); err == nil {
+					t.Errorf("accepted host %q root %q project %q", tc.host, tc.cacheRoot, tc.project)
+				}
+			})
+		}
+		if len(runner.commands) != 0 {
+			t.Errorf("runner invoked %d times for rejected input", len(runner.commands))
+		}
+	})
 }
 
 func TestValidateRemotePath(t *testing.T) {

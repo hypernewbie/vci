@@ -74,6 +74,21 @@ func DefaultBundleCache() BundleCachePolicy {
 	return BundleCachePolicy{MaxEntries: 5, MaxBytes: 5 << 30, AdmissionBytes: 50 << 20}
 }
 
+// EffectiveBundleCache fills zero policy fields with the documented defaults.
+func EffectiveBundleCache(p BundleCachePolicy) BundleCachePolicy {
+	d := DefaultBundleCache()
+	if p.MaxEntries <= 0 {
+		p.MaxEntries = d.MaxEntries
+	}
+	if p.MaxBytes <= 0 {
+		p.MaxBytes = d.MaxBytes
+	}
+	if p.AdmissionBytes <= 0 {
+		p.AdmissionBytes = d.AdmissionBytes
+	}
+	return p
+}
+
 // EffectiveCapacity returns local slot capacity, treating 0 or missing as one.
 func EffectiveCapacity(m Machine) int {
 	if m.MaxConcurrent <= 0 {

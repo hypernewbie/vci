@@ -128,10 +128,12 @@ func Maintain(l model.Layout) (MaintenanceReport, error) {
 	if err != nil {
 		return MaintenanceReport{}, err
 	}
-	reaped, err := reaper.Run(l, time.Now().UTC())
+	now := time.Now().UTC()
+	reaped, err := reaper.Run(l, now)
 	if err != nil {
 		return MaintenanceReport{}, err
 	}
+	reaper.ReapRemoteBundleCaches(&reaped, cfg, now)
 	retained, err := reaper.Enforce(l, cfg.Retention)
 	if err != nil {
 		return MaintenanceReport{}, err

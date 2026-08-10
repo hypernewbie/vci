@@ -496,8 +496,8 @@ func TestNoSeedCacheEligibilityAndPolicy(t *testing.T) {
 	}
 	for _, tt := range policyTests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := effectiveBundleCachePolicy(tt.machine.BundleCache); got != tt.want {
-				t.Fatalf("effectiveBundleCachePolicy() = %+v, want %+v", got, tt.want)
+			if got := config.EffectiveBundleCache(tt.machine.BundleCache); got != tt.want {
+				t.Fatalf("config.EffectiveBundleCache() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}

@@ -861,3 +861,60 @@ func TestReapRemoteTurdsSkipsLiveLease(t *testing.T) {
 		t.Fatalf("live-lease run swept: %+v", report)
 	}
 }
+
+// TestReapBundleCachesReportsRemoteCounts pins the remote bundle-cache sweep:
+// an eligible machine (host configured) attached to a project invokes the
+// worker reap shell over ssh, the stale/evicted removal counts the shell
+// reports land in the reaper report JSON, and hostless machines never invoke
+// ssh.
+func TestReapBundleCachesReportsRemoteCounts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-specific")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + logPath + "\nprintf 'stale=2 evicted=1\\n'\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+previous)
+
+	cfg := config.Config{
+		Machines: map[string]config.Machine{
+			"builder": {Host: "builder-host"},
+			"local":   {},
+		},
+		Projects: map[string]config.Project{
+			"app": {Machines: []string{"builder", "local"}, Command: []string{"make"}},
+		},
+	}
+	var report Report
+	ReapRemoteBundleCaches(&report, cfg, time.Now().UTC())
+
+	if report.BundleCacheStaleRemoved != 2 || report.BundleCacheEvictedRemoved != 1 {
+		t.Fatalf("report counts: %+v", report)
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"bundle_cache_stale_removed":2`, `"bundle_cache_evicted_removed":1`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("report JSON missing %s: %s", want, raw)
+		}
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(log)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected one ssh invocation for the remote machine, got %d: %q", len(lines), log)
+	}
+	for _, want := range []string{"builder-host", "bundle-cache/v1/app", ".vci-reap"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("ssh invocation missing %q: %s", want, lines[0])
+		}
+	}
+}

@@ -367,22 +367,6 @@ func writePayloadEntry(tw *tar.Writer, name string, data []byte) error {
 // layout lives beneath it as v1/<project>/<base>/... .
 const workerCacheRoot = "~/.vci/state/bundle-cache"
 
-// effectiveBundleCachePolicy resolves a machine's bundle-cache policy,
-// replacing zero fields with the documented defaults.
-func effectiveBundleCachePolicy(p config.BundleCachePolicy) config.BundleCachePolicy {
-	d := config.DefaultBundleCache()
-	if p.MaxEntries <= 0 {
-		p.MaxEntries = d.MaxEntries
-	}
-	if p.MaxBytes <= 0 {
-		p.MaxBytes = d.MaxBytes
-	}
-	if p.AdmissionBytes <= 0 {
-		p.AdmissionBytes = d.AdmissionBytes
-	}
-	return p
-}
-
 // noSeedPayload assembles the reconstruction payload for a machine with no
 // seed: the submitted head, a full bundle covering the entire reachable
 // history (have is empty), and the durable local-change archive copied
@@ -470,7 +454,7 @@ func noSeedCacheEligible(machine config.Machine, project config.Project, project
 // warning) so stageOrReconstruct falls back to full workspace staging.
 func stageNoSeedReconstruct(ctx context.Context, runner process.Runner, machine config.Machine, projectName, lcPath, sourceRoot, submittedHead, remoteWorkDir string) (string, error) {
 	client := host.Client{Runner: runner}
-	policy := effectiveBundleCachePolicy(machine.BundleCache)
+	policy := config.EffectiveBundleCache(machine.BundleCache)
 
 	// The cache key is the submitted head's first parent: a worker that holds
 	// a complete entry for that base has all objects reachable from it, so

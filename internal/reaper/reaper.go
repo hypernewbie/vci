@@ -8,6 +8,7 @@ import (
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/host"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/process"
 	"github.com/hypernewbie/vci/internal/scheduler"
 	"github.com/hypernewbie/vci/internal/source"
 	"github.com/hypernewbie/vci/internal/store"
@@ -19,15 +20,17 @@ import (
 )
 
 type Report struct {
-	Removed                 int `json:"removed"`
-	MarkedLost              int `json:"marked_lost"`
-	QueuedAborted           int `json:"queued_aborted"`
-	TransferRemoved         int `json:"transfer_removed"`
-	PerRunTmpRemoved        int `json:"per_run_tmp_removed"`
-	WorkspacesRemoved       int `json:"workspaces_removed"`
-	RemoteCleaned           int `json:"remote_cleaned"`
-	SchedulerClaimsReleased int `json:"scheduler_claims_released"`
-	ArtifactsReaped         int `json:"artifacts_reaped"`
+	Removed                   int `json:"removed"`
+	MarkedLost                int `json:"marked_lost"`
+	QueuedAborted             int `json:"queued_aborted"`
+	TransferRemoved           int `json:"transfer_removed"`
+	PerRunTmpRemoved          int `json:"per_run_tmp_removed"`
+	WorkspacesRemoved         int `json:"workspaces_removed"`
+	RemoteCleaned             int `json:"remote_cleaned"`
+	SchedulerClaimsReleased   int `json:"scheduler_claims_released"`
+	ArtifactsReaped           int `json:"artifacts_reaped"`
+	BundleCacheStaleRemoved   int `json:"bundle_cache_stale_removed"`
+	BundleCacheEvictedRemoved int `json:"bundle_cache_evicted_removed"`
 }
 
 const (
@@ -404,4 +407,53 @@ func CleanupRemote(ctx context.Context, hostName, remotePath string) error {
 		return fmt.Errorf("cleanup remote %s: %s", hostName, message)
 	}
 	return nil
+}
+
+// workerCacheRoot is the worker-side bundle-cache root the sweep addresses on
+// remote machines, mirroring the reconstruction path's ~/.vci/state layout.
+const workerCacheRoot = "~/.vci/state/bundle-cache"
+
+// remoteReapTimeout bounds each remote cache sweep so an unresponsive worker
+// cannot stall maintenance.
+const remoteReapTimeout = 30 * time.Second
+
+// ReapRemoteBundleCaches sweeps the worker-side bundle cache of every
+// coordinator-configured remote machine for each project attached to it,
+// adding the reported removal counts to the sweep report. A machine is remote
+// when it declares a host; hostless machines hold no worker cache and are
+// skipped. Remote workers are best-effort: an unreachable or failing host
+// contributes nothing and never fails the sweep, so maintenance completes and
+// only successful removals are reported.
+func ReapRemoteBundleCaches(report *Report, cfg config.Config, now time.Time) {
+	client := host.Client{Runner: process.Native{}}
+	for machineName, machine := range cfg.Machines {
+		if machine.Host == "" {
+			continue
+		}
+		policy := config.EffectiveBundleCache(machine.BundleCache)
+		for projectName, project := range cfg.Projects {
+			if !attachedTo(project, machineName) {
+				continue
+			}
+			reapCtx, cancel := context.WithTimeout(context.Background(), remoteReapTimeout)
+			result, err := client.ReapBundleCache(reapCtx, machine.Host, workerCacheRoot, projectName, policy, now)
+			cancel()
+			if err != nil {
+				continue
+			}
+			report.BundleCacheStaleRemoved += result.Stale
+			report.BundleCacheEvictedRemoved += result.Evicted
+		}
+	}
+}
+
+// attachedTo reports whether the project declares the machine in its
+// configured machine set.
+func attachedTo(project config.Project, machine string) bool {
+	for _, name := range project.Machines {
+		if name == machine {
+			return true
+		}
+	}
+	return false
 }
