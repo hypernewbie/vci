@@ -11,7 +11,9 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
@@ -190,6 +192,319 @@ func (c Client) StreamReconstruct(ctx context.Context, host, seed, workDir strin
 		return fmt.Errorf("reconstruct %s: remote exit %d", host, result.ExitCode)
 	}
 	return nil
+}
+
+// ---- Worker bundle-cache transport ----
+
+// cacheLayoutVersion is the on-disk layout segment of the worker bundle
+// cache, mirroring bundlecache.Version so coordinator-composed shells address
+// the same entries the bundlecache package manages.
+const cacheLayoutVersion = "v1"
+
+// NoSeedCacheSpec describes how one no-seed reconstruction stream treats the
+// worker's bundle cache. An empty Root disables every cache behavior and
+// yields a plain one-shot reconstruction.
+type NoSeedCacheSpec struct {
+	Root        string    // worker-side cache root (e.g. ~/.vci/state/bundle-cache)
+	Project     string    // cache project segment
+	Base        string    // cache entry key (a commit id)
+	UseCached   bool      // hit: seed the repository from the cached bundle
+	Admit       bool      // miss: write the streamed bundle into the entry
+	Evict       bool      // run LRU eviction after admission
+	MaxEntries  int       // per-project entry cap; <=0 means unlimited
+	MaxBytes    int64     // per-project byte cap; <=0 means unlimited
+	BundleBytes int64     // bundle size written into meta.json on admission
+	Now         time.Time // admission timestamp; zero means time.Now
+}
+
+// validCacheSegment mirrors bundlecache's single-segment rule: non-empty
+// letters, digits, dot, dash, and underscore with no slashes, and not "." or
+// "..". Project, base, and claim ids must all be such segments before they
+// are composed into a remote shell path.
+func validCacheSegment(s string) bool {
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, `\/`) {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validateCacheSegment(what, s string) error {
+	if !validCacheSegment(s) {
+		return fmt.Errorf("cache %s %q must be a single path segment of letters, digits, '.', '-', '_'", what, s)
+	}
+	return nil
+}
+
+// cacheEntryPath returns the remote cache entry directory
+// <root>/v1/<project>/<base>, validating every segment. The path is composed
+// with "/" because it is a remote shell word, never a local filesystem path.
+func cacheEntryPath(cacheRoot, project, base string) (string, error) {
+	if cacheRoot == "" {
+		return "", fmt.Errorf("cache root is empty")
+	}
+	if err := validateCacheSegment("project", project); err != nil {
+		return "", err
+	}
+	if err := validateCacheSegment("base", base); err != nil {
+		return "", err
+	}
+	return cacheRoot + "/" + cacheLayoutVersion + "/" + project + "/" + base, nil
+}
+
+// ProbeBundleCache asks a worker whether its bundle cache holds a complete
+// entry for project/base by running `ssh <host> test -f
+// <root>/v1/<project>/<base>/complete`. A zero remote exit is a hit; any
+// nonzero remote exit is a miss; only a runner failure without a remote exit
+// is a wrapped transport error.
+func (c Client) ProbeBundleCache(ctx context.Context, host, cacheRoot, project, base string) (bool, error) {
+	if err := ValidateHost(host); err != nil {
+		return false, err
+	}
+	if c.Runner == nil {
+		return false, fmt.Errorf("ssh runner is required")
+	}
+	entry, err := cacheEntryPath(cacheRoot, project, base)
+	if err != nil {
+		return false, err
+	}
+	result, err := c.Runner.Run(ctx, process.Command{
+		Executable: "ssh",
+		Args:       []string{host, "test", "-f", entry + "/complete"},
+	})
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if err != nil && result.ExitCode == 0 {
+		return false, fmt.Errorf("ssh %s: %w", host, err)
+	}
+	if result.ExitCode != 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
+// AcquireBundleClaim writes an active-claim marker for entry project/base on
+// the worker so LRU eviction skips the entry while the coordinator uses it.
+// The complete marker must already exist; the claims dir is created on
+// demand, mirroring bundlecache.AcquireActiveClaim.
+func (c Client) AcquireBundleClaim(ctx context.Context, host, cacheRoot, project, base, claimID string) error {
+	if err := ValidateHost(host); err != nil {
+		return err
+	}
+	if c.Runner == nil {
+		return fmt.Errorf("ssh runner is required")
+	}
+	if err := validateCacheSegment("claimID", claimID); err != nil {
+		return err
+	}
+	entry, err := cacheEntryPath(cacheRoot, project, base)
+	if err != nil {
+		return err
+	}
+	shell := "test -f " + entry + "/complete && mkdir -p " + entry + "/claims && : > " + entry + "/claims/" + claimID
+	result, err := c.Runner.Run(ctx, process.Command{Executable: "ssh", Args: []string{host, shell}})
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		if result.ExitCode != 0 {
+			return fmt.Errorf("acquire claim %s: remote exit %d", host, result.ExitCode)
+		}
+		return fmt.Errorf("ssh %s: %w", host, err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("acquire claim %s: remote exit %d", host, result.ExitCode)
+	}
+	return nil
+}
+
+// ReleaseBundleClaim removes an active-claim marker on the worker. A missing
+// marker is not an error, mirroring bundlecache.ReleaseActiveClaim.
+func (c Client) ReleaseBundleClaim(ctx context.Context, host, cacheRoot, project, base, claimID string) error {
+	if err := ValidateHost(host); err != nil {
+		return err
+	}
+	if c.Runner == nil {
+		return fmt.Errorf("ssh runner is required")
+	}
+	if err := validateCacheSegment("claimID", claimID); err != nil {
+		return err
+	}
+	entry, err := cacheEntryPath(cacheRoot, project, base)
+	if err != nil {
+		return err
+	}
+	shell := "rm -f " + entry + "/claims/" + claimID
+	result, err := c.Runner.Run(ctx, process.Command{Executable: "ssh", Args: []string{host, shell}})
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		if result.ExitCode != 0 {
+			return fmt.Errorf("release claim %s: remote exit %d", host, result.ExitCode)
+		}
+		return fmt.Errorf("ssh %s: %w", host, err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("release claim %s: remote exit %d", host, result.ExitCode)
+	}
+	return nil
+}
+
+// StreamNoSeedReconstruct sends a worker payload tar over SSH stdin to a
+// remote reconstruction shell for a machine with no seed. The shell
+// initializes an empty repository, imports a full bundle (or, on a cache
+// hit, the cached entry bundle plus the optional delta the payload carries),
+// checks out the submitted head, applies the durable local-change archive,
+// and — on a cache miss at or above the admission threshold — writes the
+// bundle into the cache entry and evicts LRU entries. Any remote failure is
+// an error so the caller can fall back to full workspace staging.
+func (c Client) StreamNoSeedReconstruct(ctx context.Context, host, workDir string, cache NoSeedCacheSpec, payload io.Reader) error {
+	if err := ValidateHost(host); err != nil {
+		return err
+	}
+	if payload == nil {
+		return fmt.Errorf("reconstruction payload is required")
+	}
+	if c.Runner == nil {
+		return fmt.Errorf("ssh runner is required")
+	}
+	shell, err := noSeedReconstructShell(workDir, cache)
+	if err != nil {
+		return err
+	}
+	result, err := c.Runner.Run(ctx, process.Command{
+		Executable: "ssh",
+		Args:       []string{host, shell},
+		Stdin:      payload,
+	})
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		if result.ExitCode != 0 {
+			return fmt.Errorf("reconstruct %s: remote exit %d", host, result.ExitCode)
+		}
+		return fmt.Errorf("ssh %s: %w", host, err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("reconstruct %s: remote exit %d", host, result.ExitCode)
+	}
+	return nil
+}
+
+// noSeedReconstructShell builds the remote shell that turns a streamed worker
+// payload into a reconstructed workspace on a machine with no seed. The
+// payload tar carries head, a bundle, and the durable lc.tar. Without a cache
+// entry the bundle must cover the full reachable history; on a cache hit the
+// shell imports the cached entry bundle first and then the payload's delta
+// bundle when present. On a miss with admission enabled the shell writes the
+// streamed bundle into the cache entry (meta.json, then the complete marker
+// last so an interrupted admission is never a hit) and evicts LRU entries
+// beyond the policy limits. Every step is chained with && so any failure
+// aborts the reconstruction instead of leaving a half-built workspace.
+func noSeedReconstructShell(workDir string, cache NoSeedCacheSpec) (string, error) {
+	if err := ValidateRemotePath(workDir); err != nil {
+		return "", err
+	}
+	entry := ""
+	if cache.Root != "" {
+		var err error
+		entry, err = cacheEntryPath(cache.Root, cache.Project, cache.Base)
+		if err != nil {
+			return "", err
+		}
+	}
+	if (cache.UseCached || cache.Admit) && entry == "" {
+		return "", fmt.Errorf("no-seed cache reconstruction requires a cache entry")
+	}
+
+	var b strings.Builder
+	b.WriteString("mkdir -p " + workDir)
+	b.WriteString(" && cd " + workDir)
+	b.WriteString(" && mkdir -p .vci-payload")
+	b.WriteString(" && tar -xf - -C .vci-payload")
+	b.WriteString(" && git init -q")
+	if cache.UseCached {
+		b.WriteString(" && touch " + entry + "/meta.json")
+		b.WriteString(" && git bundle unbundle " + entry + "/bundle >/dev/null 2>&1")
+		b.WriteString(" && if [ -s .vci-payload/bundle ]; then git bundle unbundle .vci-payload/bundle >/dev/null 2>&1; fi")
+	} else {
+		b.WriteString(" && git bundle unbundle .vci-payload/bundle >/dev/null 2>&1")
+	}
+	b.WriteString(" && head=$(cat .vci-payload/head)")
+	b.WriteString(" && git checkout -q \"$head\"")
+	b.WriteString(" && tar -tf .vci-payload/lc.tar >/dev/null")
+	b.WriteString(" && if tar -xOf .vci-payload/lc.tar patch > .vci-payload/patch 2>/dev/null; then git apply --binary --whitespace=nowarn .vci-payload/patch; fi")
+	b.WriteString(" && if tar -tf .vci-payload/lc.tar f/ >/dev/null 2>&1; then tar -xf .vci-payload/lc.tar -C . --strip-components=1 f/; fi")
+	if cache.Admit {
+		admit, err := cacheAdmitShell(entry, cache.BundleBytes, cache.Now)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(" && " + admit)
+		if cache.Evict {
+			evict, err := cacheEvictShell(entry, cache.MaxEntries, cache.MaxBytes)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(" && " + evict)
+		}
+	}
+	b.WriteString(" && rm -rf .vci-payload")
+	return b.String(), nil
+}
+
+// cacheAdmitShell writes the streamed payload bundle into a cache entry and
+// marks it complete, writing the complete marker last so an interrupted
+// admission is never a hit. meta.json carries the byte size and an RFC3339
+// last-used timestamp in the same shape bundlecache.Admit persists.
+func cacheAdmitShell(entry string, bundleBytes int64, now time.Time) (string, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	meta := fmt.Sprintf(`{"bytes":%d,"last_used":%q}`, bundleBytes, now.UTC().Format(time.RFC3339))
+	return "mkdir -p " + entry +
+		" && cp .vci-payload/bundle " + entry + "/bundle" +
+		" && printf '" + meta + "' > " + entry + "/meta.json" +
+		" && : > " + entry + "/complete", nil
+}
+
+// cacheEvictShell returns a POSIX sh loop that removes the
+// least-recently-used claim-free complete entries of a project until both
+// positive policy limits are satisfied, mirroring bundlecache.EvictLRU. entry
+// is <root>/v1/<project>/<base>; the loop operates on the project directory
+// that holds it.
+func cacheEvictShell(entry string, maxEntries int, maxBytes int64) (string, error) {
+	slash := strings.LastIndex(entry, "/")
+	if slash < 0 {
+		return "", fmt.Errorf("invalid cache entry path %q", entry)
+	}
+	projDir := entry[:slash]
+	parts := make([]string, 0, 2)
+	if maxEntries > 0 {
+		parts = append(parts, `[ "$n" -le `+strconv.Itoa(maxEntries)+` ]`)
+	}
+	if maxBytes > 0 {
+		parts = append(parts, `[ "$b" -le `+strconv.FormatInt(maxBytes, 10)+` ]`)
+	}
+	if len(parts) == 0 {
+		return ":", nil // no positive limits: nothing to evict
+	}
+	within := parts[0]
+	if len(parts) == 2 {
+		within = parts[0] + " && " + parts[1]
+	}
+	loop := `while :; do n=0; b=0; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; n=$((n+1)); v=$(sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p' "$d/meta.json"); [ -n "$v" ] || v=0; b=$((b+v)); done; if ` + within + `; then break; fi; o=; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; [ -n "$(ls -A "$d/claims" 2>/dev/null)" ] && continue; if [ -z "$o" ] || [ "$d/meta.json" -ot "$o/meta.json" ]; then o=$d; fi; done; [ -n "$o" ] || break; rm -rf "$o"; done`
+	return loop, nil
 }
 
 // StageRemote clears the validated remote work dir, then tars a local

@@ -65,14 +65,16 @@ func TestStageOrReconstructIneligibleFallsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Ineligible: the machine has no source path seeded for the project, so
-	// seededReconstructionEligible is false even though the LC archive exists.
+	// Ineligible: the machine has no source path seeded for the project and
+	// the project declares a hard workspace exclusion, so both
+	// seededReconstructionEligible and noSeedCacheEligible are false even
+	// though the LC archive exists.
 	runner := &scriptedRunner{result: process.Result{ExitCode: 0}}
 	machine := config.Machine{Host: "builder", SourcePaths: map[string]string{"Other": "/src/other"}}
-	project := config.Project{}
+	project := config.Project{ExcludedPaths: []string{"vendor/"}}
 	projectName := "Vci"
 
-	err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, "cafebabe", "~/.vci/state/work/run_abc")
+	_, err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, "cafebabe", "~/.vci/state/work/run_abc")
 	if err != nil {
 		t.Fatalf("stageOrReconstruct: %v", err)
 	}
@@ -134,7 +136,7 @@ func TestStageOrReconstructProbeErrorFallsBack(t *testing.T) {
 	project := config.Project{}
 	projectName := "Vci"
 
-	err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, "cafebabe", "~/.vci/state/work/run_abc")
+	_, err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, "cafebabe", "~/.vci/state/work/run_abc")
 	if err != nil {
 		t.Fatalf("stageOrReconstruct: %v", err)
 	}
@@ -275,7 +277,7 @@ func TestStageOrReconstructStreamsSeeded(t *testing.T) {
 	project := config.Project{}
 	projectName := "Vci"
 
-	err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, head, "~/.vci/state/work/run_abc")
+	_, err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, head, "~/.vci/state/work/run_abc")
 	if err != nil {
 		t.Fatalf("stageOrReconstruct: %v", err)
 	}
@@ -385,7 +387,7 @@ func TestStageOrReconstructStreamErrorFallsBack(t *testing.T) {
 	project := config.Project{}
 	projectName := "Vci"
 
-	err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, head, "~/.vci/state/work/run_abc")
+	_, err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, head, "~/.vci/state/work/run_abc")
 	if err != nil {
 		t.Fatalf("stageOrReconstruct: %v", err)
 	}
@@ -473,7 +475,7 @@ func TestStageOrReconstructEmptySubmittedHeadFallsBack(t *testing.T) {
 	project := config.Project{}
 	projectName := "Vci"
 
-	err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, "", "~/.vci/state/work/run_abc")
+	_, err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, workspace, workspace, "", "~/.vci/state/work/run_abc")
 	if err != nil {
 		t.Fatalf("stageOrReconstruct: %v", err)
 	}

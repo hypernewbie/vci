@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hypernewbie/vci/internal/process"
 )
@@ -774,8 +775,369 @@ func TestClientStreamReconstructRejectsBadInput(t *testing.T) {
 	}
 }
 
-// TestValidateRemotePath pins the remote-tree grammar: only the fixed
-// layout plus a run id.
+// TestProbeBundleCacheHitAndMiss pins that ProbeBundleCache runs
+// `ssh <host> test -f <root>/v1/<project>/<base>/complete` and maps a zero
+// remote exit to a hit and any nonzero remote exit to a miss, with or without
+// a runner error.
+func TestProbeBundleCacheHitAndMiss(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	hit, err := (Client{Runner: runner}).ProbeBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if !hit {
+		t.Fatal("zero remote exit must be a hit")
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("runner invoked %d times", len(runner.commands))
+	}
+	cmd := runner.commands[0]
+	if cmd.Executable != "ssh" {
+		t.Errorf("executable: %q", cmd.Executable)
+	}
+	want := []string{"charon", "test", "-f", "~/.vci/state/bundle-cache/v1/Vci/abc123/complete"}
+	if len(cmd.Args) != len(want) {
+		t.Fatalf("args: %q", cmd.Args)
+	}
+	for i := range want {
+		if cmd.Args[i] != want[i] {
+			t.Errorf("arg %d: %q want %q", i, cmd.Args[i], want[i])
+		}
+	}
+
+	for name, tc := range map[string]struct {
+		result process.Result
+		err    error
+	}{
+		"nonzero exit with error":    {process.Result{ExitCode: 1}, errors.New("exit status 1")},
+		"nonzero exit without error": {process.Result{ExitCode: 3}, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &scriptRunner{result: tc.result, err: tc.err}
+			hit, err := (Client{Runner: r}).ProbeBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123")
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if hit {
+				t.Fatal("nonzero remote exit must be a miss")
+			}
+		})
+	}
+}
+
+// TestProbeBundleCacheTransportError pins that a runner failure without a
+// remote exit is a wrapped transport error, never a miss.
+func TestProbeBundleCacheTransportError(t *testing.T) {
+	runner := &scriptRunner{err: errors.New("connection refused")}
+	hit, err := (Client{Runner: runner}).ProbeBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123")
+	if err == nil {
+		t.Fatal("transport error not reported")
+	}
+	if hit {
+		t.Fatal("hit must be false on transport error")
+	}
+	if !strings.Contains(err.Error(), "ssh charon") || !errors.Is(err, runner.err) {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestProbeBundleCacheRejectsBadInput pins that invalid hosts, roots,
+// project/base segments, and a nil runner fail before any subprocess starts.
+func TestProbeBundleCacheRejectsBadInput(t *testing.T) {
+	runner := &scriptRunner{}
+	cases := []struct {
+		name      string
+		client    Client
+		host      string
+		cacheRoot string
+		project   string
+		base      string
+	}{
+		{"empty host", Client{Runner: runner}, "", "~/.vci/state/bundle-cache", "Vci", "abc123"},
+		{"empty root", Client{Runner: runner}, "charon", "", "Vci", "abc123"},
+		{"slash project", Client{Runner: runner}, "charon", "~/.vci/state/bundle-cache", "a/b", "abc123"},
+		{"space base", Client{Runner: runner}, "charon", "~/.vci/state/bundle-cache", "Vci", "a b"},
+		{"dotdot base", Client{Runner: runner}, "charon", "~/.vci/state/bundle-cache", "Vci", ".."},
+		{"nil runner", Client{}, "charon", "~/.vci/state/bundle-cache", "Vci", "abc123"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.client.ProbeBundleCache(context.Background(), tc.host, tc.cacheRoot, tc.project, tc.base); err == nil {
+				t.Errorf("accepted host %q root %q project %q base %q", tc.host, tc.cacheRoot, tc.project, tc.base)
+			}
+		})
+	}
+	if len(runner.commands) != 0 {
+		t.Errorf("runner invoked %d times for rejected input", len(runner.commands))
+	}
+}
+
+// TestAcquireAndReleaseBundleClaimPinShells pins the claim shell commands:
+// acquire guards on the complete marker, creates the claims dir, and writes
+// the claim marker; release removes the marker with rm -f.
+func TestAcquireAndReleaseBundleClaimPinShells(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	if err := (Client{Runner: runner}).AcquireBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123", "run_1"); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := (Client{Runner: runner}).ReleaseBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123", "run_1"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if len(runner.commands) != 2 {
+		t.Fatalf("runner invoked %d times, want 2", len(runner.commands))
+	}
+	acquire := runner.commands[0]
+	if acquire.Executable != "ssh" || len(acquire.Args) != 2 || acquire.Args[0] != "charon" {
+		t.Fatalf("acquire command: %+v", acquire)
+	}
+	wantAcquire := "test -f ~/.vci/state/bundle-cache/v1/Vci/abc123/complete && mkdir -p ~/.vci/state/bundle-cache/v1/Vci/abc123/claims && : > ~/.vci/state/bundle-cache/v1/Vci/abc123/claims/run_1"
+	if acquire.Args[1] != wantAcquire {
+		t.Errorf("acquire shell:\n  %s\nwant:\n  %s", acquire.Args[1], wantAcquire)
+	}
+	release := runner.commands[1]
+	wantRelease := "rm -f ~/.vci/state/bundle-cache/v1/Vci/abc123/claims/run_1"
+	if release.Args[1] != wantRelease {
+		t.Errorf("release shell:\n  %s\nwant:\n  %s", release.Args[1], wantRelease)
+	}
+}
+
+// TestAcquireAndReleaseBundleClaimNonzeroExit pins that a nonzero remote
+// exit on acquire or release is reported as a remote-exit error.
+func TestAcquireAndReleaseBundleClaimNonzeroExit(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 7}, err: errors.New("exit status 7")}
+	err := (Client{Runner: runner}).AcquireBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123", "run_1")
+	if err == nil {
+		t.Fatal("acquire: nonzero remote exit not reported")
+	}
+	if !strings.Contains(err.Error(), "acquire claim charon: remote exit 7") {
+		t.Errorf("error: %v", err)
+	}
+
+	runner = &scriptRunner{result: process.Result{ExitCode: 7}, err: errors.New("exit status 7")}
+	err = (Client{Runner: runner}).ReleaseBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123", "run_1")
+	if err == nil {
+		t.Fatal("release: nonzero remote exit not reported")
+	}
+	if !strings.Contains(err.Error(), "release claim charon: remote exit 7") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestAcquireAndReleaseBundleClaimRejectBadInput pins that invalid hosts and
+// segments fail before any subprocess starts.
+func TestAcquireAndReleaseBundleClaimRejectBadInput(t *testing.T) {
+	runner := &scriptRunner{}
+	if err := (Client{Runner: runner}).AcquireBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123", "a/b"); err == nil {
+		t.Error("acquire accepted invalid claimID")
+	}
+	if err := (Client{Runner: runner}).ReleaseBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123", ""); err == nil {
+		t.Error("release accepted empty claimID")
+	}
+	if err := (Client{Runner: runner}).AcquireBundleClaim(context.Background(), "", "~/.vci/state/bundle-cache", "Vci", "abc123", "run_1"); err == nil {
+		t.Error("acquire accepted empty host")
+	}
+	if err := (Client{Runner: runner}).ReleaseBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "..", "run_1"); err == nil {
+		t.Error("release accepted dotdot base")
+	}
+	if err := (Client{Runner: runner}).AcquireBundleClaim(context.Background(), "charon", "", "Vci", "abc123", "run_1"); err == nil {
+		t.Error("acquire accepted empty cache root")
+	}
+	if len(runner.commands) != 0 {
+		t.Errorf("runner invoked %d times for rejected input", len(runner.commands))
+	}
+}
+
+// TestClientStreamNoSeedReconstructPinsShell pins the one-shot no-seed
+// reconstruction shell: init an empty repository, import the payload's full
+// bundle, checkout the submitted head, apply the lc patch and f/ overlay, and
+// remove the payload — with no cache steps at all.
+func TestClientStreamNoSeedReconstructPinsShell(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	payload := bytes.NewReader([]byte("payload-tar"))
+	err := (Client{Runner: runner}).StreamNoSeedReconstruct(context.Background(), "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{}, payload)
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("runner invoked %d times", len(runner.commands))
+	}
+	cmd := runner.commands[0]
+	if cmd.Executable != "ssh" || len(cmd.Args) != 2 || cmd.Args[0] != "charon" {
+		t.Fatalf("command: %+v", cmd)
+	}
+	if cmd.Stdin != io.Reader(payload) {
+		t.Errorf("payload not wired to ssh stdin")
+	}
+	s := cmd.Args[1]
+	ordered := []string{
+		"mkdir -p ~/.vci/state/work/run_abc",
+		"cd ~/.vci/state/work/run_abc",
+		"mkdir -p .vci-payload",
+		"tar -xf - -C .vci-payload",
+		"git init -q",
+		"git bundle unbundle .vci-payload/bundle",
+		"head=$(cat .vci-payload/head)",
+		`git checkout -q "$head"`,
+		"git apply --binary --whitespace=nowarn .vci-payload/patch",
+		"--strip-components=1 f/",
+		"rm -rf .vci-payload",
+	}
+	last := -1
+	for _, want := range ordered {
+		i := strings.Index(s, want)
+		if i < 0 {
+			t.Errorf("shell missing %q: %s", want, s)
+			continue
+		}
+		if i < last {
+			t.Errorf("shell order violated for %q: %s", want, s)
+		}
+		last = i
+	}
+	for _, banned := range []string{"state/bundle-cache", "complete", "meta.json"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("one-shot shell must not touch the cache (%q): %s", banned, s)
+		}
+	}
+}
+
+// TestClientStreamNoSeedReconstructHitShell pins the cache-hit shell: recency
+// is updated by touching the entry's meta.json as a bare && step chained
+// before the cached bundle import, the repository is seeded from the cached
+// entry bundle, the payload's delta bundle is imported only when present, and
+// no admission or eviction steps run.
+func TestClientStreamNoSeedReconstructHitShell(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	cache := NoSeedCacheSpec{Root: "~/.vci/state/bundle-cache", Project: "Vci", Base: "abc123", UseCached: true}
+	err := (Client{Runner: runner}).StreamNoSeedReconstruct(context.Background(), "charon", "~/.vci/state/work/run_abc", cache, bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	s := runner.commands[0].Args[1]
+
+	// The touch is a bare && step chained directly after git init and before
+	// the cached bundle unbundle, so a hit refreshes the entry's recency.
+	bare := "git init -q && touch ~/.vci/state/bundle-cache/v1/Vci/abc123/meta.json && git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/abc123/bundle"
+	if !strings.Contains(s, bare) {
+		t.Errorf("meta.json touch is not a bare && step before the cached unbundle: %s", s)
+	}
+
+	ordered := []string{
+		"git init -q",
+		"touch ~/.vci/state/bundle-cache/v1/Vci/abc123/meta.json",
+		"git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/abc123/bundle",
+		"if [ -s .vci-payload/bundle ]",
+		`git checkout -q "$head"`,
+	}
+	last := -1
+	for _, want := range ordered {
+		i := strings.Index(s, want)
+		if i < 0 {
+			t.Errorf("shell missing %q: %s", want, s)
+			continue
+		}
+		if i < last {
+			t.Errorf("shell order violated for %q: %s", want, s)
+		}
+		last = i
+	}
+	// The hit path never writes cache entries (bundle/complete) or evicts.
+	for _, banned := range []string{"complete", "while :; do"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("hit shell must not admit or evict (%q): %s", banned, s)
+		}
+	}
+}
+
+// TestClientStreamNoSeedReconstructAdmitShell pins the cache-miss admission
+// shell: after the reconstruction steps the streamed bundle is written into
+// the entry, meta.json carries the byte size and last-used timestamp, the
+// complete marker is written last, and the LRU eviction loop runs after
+// admission with the policy limits embedded.
+func TestClientStreamNoSeedReconstructAdmitShell(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	now := time.Date(2026, 8, 9, 12, 34, 56, 0, time.UTC)
+	cache := NoSeedCacheSpec{
+		Root: "~/.vci/state/bundle-cache", Project: "Vci", Base: "abc123",
+		Admit: true, Evict: true, MaxEntries: 5, MaxBytes: 5368709120, BundleBytes: 12345, Now: now,
+	}
+	err := (Client{Runner: runner}).StreamNoSeedReconstruct(context.Background(), "charon", "~/.vci/state/work/run_abc", cache, bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	s := runner.commands[0].Args[1]
+	ordered := []string{
+		"mkdir -p ~/.vci/state/bundle-cache/v1/Vci/abc123",
+		"cp .vci-payload/bundle ~/.vci/state/bundle-cache/v1/Vci/abc123/bundle",
+		`printf '{"bytes":12345,"last_used":"2026-08-09T12:34:56Z"}' > ~/.vci/state/bundle-cache/v1/Vci/abc123/meta.json`,
+		": > ~/.vci/state/bundle-cache/v1/Vci/abc123/complete",
+		"while :; do",
+		`[ "$n" -le 5 ] && [ "$b" -le 5368709120 ]`,
+		`[ -n "$(ls -A "$d/claims" 2>/dev/null)" ] && continue`,
+		`[ "$d/meta.json" -ot "$o/meta.json" ]`,
+		`rm -rf "$o"`,
+		"rm -rf .vci-payload",
+	}
+	last := -1
+	for _, want := range ordered {
+		i := strings.Index(s, want)
+		if i < 0 {
+			t.Errorf("shell missing %q: %s", want, s)
+			continue
+		}
+		if i < last {
+			t.Errorf("shell order violated for %q: %s", want, s)
+		}
+		last = i
+	}
+}
+
+// TestClientStreamNoSeedReconstructNonzeroExit pins that a non-zero remote
+// exit is a reconstruction failure, not a transport error.
+func TestClientStreamNoSeedReconstructNonzeroExit(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 9}, err: errors.New("exit status 9")}
+	err := (Client{Runner: runner}).StreamNoSeedReconstruct(context.Background(), "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{}, bytes.NewReader(nil))
+	if err == nil {
+		t.Fatal("nonzero remote exit not reported")
+	}
+	if !strings.Contains(err.Error(), "reconstruct charon: remote exit 9") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestClientStreamNoSeedReconstructRejectsBadInput pins that invalid hosts,
+// work dirs, cache specs, a nil payload, and a nil runner fail before any
+// subprocess starts.
+func TestClientStreamNoSeedReconstructRejectsBadInput(t *testing.T) {
+	runner := &scriptRunner{}
+	cases := []struct {
+		name    string
+		client  Client
+		host    string
+		workDir string
+		cache   NoSeedCacheSpec
+		payload io.Reader
+	}{
+		{"empty host", Client{Runner: runner}, "", "~/.vci/state/work/run_abc", NoSeedCacheSpec{}, bytes.NewReader(nil)},
+		{"nil payload", Client{Runner: runner}, "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{}, nil},
+		{"nil runner", Client{}, "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{}, bytes.NewReader(nil)},
+		{"bad workdir", Client{Runner: runner}, "charon", "/etc/passwd", NoSeedCacheSpec{}, bytes.NewReader(nil)},
+		{"bad project", Client{Runner: runner}, "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{Root: "~/.vci/state/bundle-cache", Project: "a/b", Base: "abc123", UseCached: true}, bytes.NewReader(nil)},
+		{"use-cached without entry", Client{Runner: runner}, "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{UseCached: true}, bytes.NewReader(nil)},
+		{"admit without entry", Client{Runner: runner}, "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{Admit: true}, bytes.NewReader(nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.client.StreamNoSeedReconstruct(context.Background(), tc.host, tc.workDir, tc.cache, tc.payload); err == nil {
+				t.Errorf("accepted host %q workdir %q cache %+v", tc.host, tc.workDir, tc.cache)
+			}
+		})
+	}
+	if len(runner.commands) != 0 {
+		t.Errorf("runner invoked %d times for rejected input", len(runner.commands))
+	}
+}
+
 func TestValidateRemotePath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires Unix ssh")

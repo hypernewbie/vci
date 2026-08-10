@@ -43,6 +43,7 @@ type BuildResult struct {
 	StderrTruncated    bool            `json:"stderr_truncated"`
 	Artifacts          []string        `json:"artifacts,omitempty"`
 	ArtifactsTruncated bool            `json:"artifacts_truncated"`
+	Warnings           []string        `json:"warnings,omitempty"`
 	Executor           runtime.Result  `json:"executor"`
 }
 type PreparedRun struct {
@@ -460,6 +461,7 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 	var execErr error
 	var collectedArtifacts []string
 	var artifactsTruncated bool
+	var warning string
 	if machine.Host != "" {
 		// Remote path: run via ssh on the target host.
 		lcPath, _ := submissionLCPath(l, id)
@@ -473,7 +475,7 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		// Leave an unresolvable submittedHead empty and proceed to
 		// executeRemote: stageOrReconstruct falls back to full workspace
 		// staging whenever reconstruction cannot proceed.
-		execResult, collectedArtifacts, artifactsTruncated, execErr = executeRemote(workerCtx, l, id, runDir, machine, record.SourcePath, workspace, project, record.Project, lcPath, submittedHead, pair)
+		execResult, collectedArtifacts, artifactsTruncated, warning, execErr = executeRemote(workerCtx, l, id, runDir, machine, record.SourcePath, workspace, project, record.Project, lcPath, submittedHead, pair)
 	} else {
 		execResult, execErr = execRunner.ExecuteSupervised(workerCtx, runtime.Request{Executable: project.Command[0], Args: project.Command[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
 			execution := process.Execution{SchemaVersion: model.SchemaVersion, RunID: id, Owner: owner, PID: running.PID, PGID: running.PGID, StartedAt: running.StartedAt, CancellationPhase: process.CancellationNone}
@@ -511,6 +513,9 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		state, failure = model.RunFailed, "job"
 	}
 	result := BuildResult{RunID: id, Project: record.Project, Machine: record.Machine, State: state, SourceDigest: record.SourceDigest, ConfigDigest: record.ConfigDigest, ConfigSnapshot: record.ConfigSnapshot, ExitCode: execResult.ExitCode, Failure: failure, StdoutPath: filepath.Join(runDir, "stdout.log"), StderrPath: filepath.Join(runDir, "stderr.log"), StdoutTruncated: pair.Stdout.Truncated(), StderrTruncated: pair.Stderr.Truncated(), Artifacts: collectedArtifacts, ArtifactsTruncated: artifactsTruncated, Executor: execResult}
+	if warning != "" {
+		result.Warnings = []string{warning}
+	}
 	if _, err := runStore.Transition(id, model.RunCommitting, time.Now().UTC()); err != nil {
 		_ = removeOwned(workspace)
 		return BuildResult{}, err

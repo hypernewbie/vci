@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -51,6 +52,28 @@ func gitRunErr(t *testing.T, dir string, args ...string) error {
 	return cmd.Run()
 }
 
+// newTwoCommitRepo creates a fresh Git repo with a "base" commit that
+// writes a.txt as "one\n" and a "head" commit that rewrites it as
+// "two\n", returning the repo path, the base hash, and the head hash.
+func newTwoCommitRepo(t *testing.T) (string, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	gitRun(t, root, "init", "-q")
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", "a.txt")
+	gitRun(t, root, "commit", "-q", "-m", "base")
+	base := gitRun(t, root, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", "a.txt")
+	gitRun(t, root, "commit", "-q", "-m", "head")
+	head := gitRun(t, root, "rev-parse", "HEAD")
+	return root, base, head
+}
+
 // payloadMembers reads a worker payload tar and returns its members in order.
 func payloadMembers(t *testing.T, payload io.ReadCloser) []struct{ Name, Data string } {
 	t.Helper()
@@ -76,20 +99,7 @@ func payloadMembers(t *testing.T, payload io.ReadCloser) []struct{ Name, Data st
 
 func TestWorkerPayloadDeltaMembersAndBytes(t *testing.T) {
 	ctx := context.Background()
-	workspace := t.TempDir()
-	gitRun(t, workspace, "init", "-q")
-	if err := os.WriteFile(filepath.Join(workspace, "a.txt"), []byte("one\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, workspace, "add", "a.txt")
-	gitRun(t, workspace, "commit", "-q", "-m", "base")
-	have := gitRun(t, workspace, "rev-parse", "HEAD")
-	if err := os.WriteFile(filepath.Join(workspace, "a.txt"), []byte("two\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, workspace, "add", "a.txt")
-	gitRun(t, workspace, "commit", "-q", "-m", "head")
-	head := gitRun(t, workspace, "rev-parse", "HEAD")
+	workspace, have, head := newTwoCommitRepo(t)
 
 	// The durable LC archive is what PrepareFromSubmission persists: the
 	// packaged local changes of a real client delta.
@@ -128,19 +138,7 @@ func TestWorkerPayloadDeltaMembersAndBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workerPayload: %v", err)
 	}
-	members := payloadMembers(t, payload)
-	if len(members) != 3 {
-		t.Fatalf("got %d members, want 3 (head, bundle, lc.tar): %v", len(members), memberNames(members))
-	}
-	if members[0].Name != "head" || members[1].Name != "bundle" || members[2].Name != "lc.tar" {
-		t.Fatalf("member order %v, want [head bundle lc.tar]", memberNames(members))
-	}
-	if members[0].Data != head+"\n" {
-		t.Fatalf("head member %q, want %q", members[0].Data, head+"\n")
-	}
-	if members[2].Data != string(lcBytes) {
-		t.Fatal("lc.tar member differs from the durable archive byte-for-byte")
-	}
+	members := assertPayload(t, payload, head, lcBytes, true)
 
 	// The bundle member must be a real Git bundle that reconstructs head in a
 	// worker seeded only with have.
@@ -182,20 +180,7 @@ func TestWorkerPayloadUsesSourceRootForDelta(t *testing.T) {
 	ctx := context.Background()
 
 	// The submitted sourceRoot is a real Git checkout holding base and head.
-	sourceRoot := t.TempDir()
-	gitRun(t, sourceRoot, "init", "-q")
-	if err := os.WriteFile(filepath.Join(sourceRoot, "a.txt"), []byte("one\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, sourceRoot, "add", "a.txt")
-	gitRun(t, sourceRoot, "commit", "-q", "-m", "base")
-	have := gitRun(t, sourceRoot, "rev-parse", "HEAD")
-	if err := os.WriteFile(filepath.Join(sourceRoot, "a.txt"), []byte("two\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, sourceRoot, "add", "a.txt")
-	gitRun(t, sourceRoot, "commit", "-q", "-m", "head")
-	head := gitRun(t, sourceRoot, "rev-parse", "HEAD")
+	sourceRoot, have, head := newTwoCommitRepo(t)
 
 	// The submission workspace is a separate directory with no .git. The
 	// current workerPayload signature requires no workspace value, so the
@@ -219,22 +204,7 @@ func TestWorkerPayloadUsesSourceRootForDelta(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workerPayload: %v", err)
 	}
-	members := payloadMembers(t, payload)
-	if len(members) != 3 {
-		t.Fatalf("got %d members, want 3 (head, bundle, lc.tar): %v", len(members), memberNames(members))
-	}
-	if members[0].Name != "head" || members[1].Name != "bundle" || members[2].Name != "lc.tar" {
-		t.Fatalf("member order %v, want [head bundle lc.tar]", memberNames(members))
-	}
-	if members[0].Data != head+"\n" {
-		t.Fatalf("head member %q, want %q", members[0].Data, head+"\n")
-	}
-	if members[1].Data == "" {
-		t.Fatal("bundle member is empty; expected a delta bundle derived from sourceRoot")
-	}
-	if members[2].Data != string(lcBytes) {
-		t.Fatal("lc.tar member differs from the durable archive byte-for-byte")
-	}
+	assertPayload(t, payload, head, lcBytes, true)
 }
 
 func TestWorkerPayloadOmitsBundleWhenWorkerHasHead(t *testing.T) {
@@ -258,19 +228,7 @@ func TestWorkerPayloadOmitsBundleWhenWorkerHasHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workerPayload: %v", err)
 	}
-	members := payloadMembers(t, payload)
-	if len(members) != 2 {
-		t.Fatalf("got %d members, want 2 (head, lc.tar): %v", len(members), memberNames(members))
-	}
-	if members[0].Name != "head" || members[1].Name != "lc.tar" {
-		t.Fatalf("member order %v, want [head lc.tar]", memberNames(members))
-	}
-	if members[0].Data != head+"\n" {
-		t.Fatalf("head member %q, want %q", members[0].Data, head+"\n")
-	}
-	if members[1].Data != string(lcBytes) {
-		t.Fatal("lc.tar member differs from the durable archive byte-for-byte")
-	}
+	assertPayload(t, payload, head, lcBytes, false)
 }
 
 func TestWorkerPayloadErrors(t *testing.T) {
@@ -298,6 +256,45 @@ func TestWorkerPayloadErrors(t *testing.T) {
 	}
 }
 
+// TestNoSeedPayloadCarriesFullBundle pins that noSeedPayload returns the
+// submitted head, a full bundle covering the entire reachable history (a
+// fresh worker with no seed can import it and reach head), and the durable
+// lc.tar byte-for-byte, plus the bundle byte size.
+func TestNoSeedPayloadCarriesFullBundle(t *testing.T) {
+	ctx := context.Background()
+	workspace, _, head := newTwoCommitRepo(t)
+
+	lcBytes := []byte("durable local-change archive\n")
+	lcPath := filepath.Join(t.TempDir(), "submission-lc.tar")
+	if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, size, err := noSeedPayload(ctx, workspace, head, lcPath)
+	if err != nil {
+		t.Fatalf("noSeedPayload: %v", err)
+	}
+	members := assertPayload(t, payload, head, lcBytes, true)
+	bundleFile := filepath.Join(t.TempDir(), "full.bundle")
+	if err := os.WriteFile(bundleFile, []byte(members[1].Data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(members[1].Data)) != size {
+		t.Fatalf("bundle size = %d, want %d", size, len(members[1].Data))
+	}
+
+	// A fresh worker with no seed must be able to import the bundle and
+	// check out head.
+	worker := t.TempDir()
+	gitRun(t, worker, "init", "-q")
+	gitRun(t, worker, "bundle", "verify", bundleFile)
+	gitRun(t, worker, "bundle", "unbundle", bundleFile)
+	gitRun(t, worker, "checkout", "-q", head)
+	if got := gitRun(t, worker, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("worker HEAD = %s, want %s", got, head)
+	}
+}
+
 // memberNames flattens payload members to names for failure messages.
 func memberNames(members []struct{ Name, Data string }) []string {
 	names := make([]string, 0, len(members))
@@ -305,6 +302,38 @@ func memberNames(members []struct{ Name, Data string }) []string {
 		names = append(names, m.Name)
 	}
 	return names
+}
+
+// assertPayload verifies a worker payload's member order, head member, and
+// byte-for-byte lc.tar equality, and that the bundle member is present and
+// non-empty when requireBundle is true, or forbidden when it is false. It
+// returns the members so callers can assert distinct bundle content.
+func assertPayload(t *testing.T, payload io.ReadCloser, head string, lcBytes []byte, requireBundle bool) []struct{ Name, Data string } {
+	t.Helper()
+	members := payloadMembers(t, payload)
+	want := []string{"head", "bundle", "lc.tar"}
+	if !requireBundle {
+		want = []string{"head", "lc.tar"}
+	}
+	got := memberNames(members)
+	if len(got) != len(want) {
+		t.Fatalf("payload has %d members %v, want %v", len(got), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("payload member order %v, want %v", got, want)
+		}
+	}
+	if members[0].Data != head+"\n" {
+		t.Fatalf("payload head %q, want %q", members[0].Data, head+"\n")
+	}
+	if members[len(members)-1].Data != string(lcBytes) {
+		t.Fatalf("payload %s member differs from the durable archive byte-for-byte", want[len(want)-1])
+	}
+	if requireBundle && members[1].Data == "" {
+		t.Fatal("payload bundle member is empty; want a nonempty bundle")
+	}
+	return members
 }
 
 func TestSeededReconstructionEligible(t *testing.T) {
@@ -369,5 +398,577 @@ func TestSeededReconstructionEligible(t *testing.T) {
 				t.Fatalf("seededReconstructionEligible() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestNoSeedCacheEligibilityAndPolicy pins the no-seed bundle-cache gate and
+// the effective bundle-cache policy resolution: a machine without a seeded
+// source path qualifies only when the project declares no exclusions and the
+// durable local-change archive is a regular file; and the machine's policy
+// falls back to the documented defaults when bundle_cache is omitted (zero
+// value) while overriding only the fields it sets.
+func TestNoSeedCacheEligibilityAndPolicy(t *testing.T) {
+	lcFile := filepath.Join(t.TempDir(), "lc.tar")
+	if err := os.WriteFile(lcFile, []byte("lc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lcDir := t.TempDir()
+
+	eligibilityTests := []struct {
+		name        string
+		machine     config.Machine
+		project     config.Project
+		projectName string
+		lcPath      string
+		head        string
+		want        bool
+	}{
+		{
+			name:        "valid no-seed eligibility",
+			machine:     config.Machine{},
+			project:     config.Project{},
+			projectName: "Vci",
+			lcPath:      lcFile,
+			head:        "abc123",
+			want:        true,
+		},
+		{
+			name:        "false with source path",
+			machine:     config.Machine{SourcePaths: map[string]string{"Vci": "/src/vci"}},
+			project:     config.Project{},
+			projectName: "Vci",
+			lcPath:      lcFile,
+			head:        "abc123",
+			want:        false,
+		},
+		{
+			name:        "false with exclusions",
+			machine:     config.Machine{},
+			project:     config.Project{ExcludedPaths: []string{"vendor/"}},
+			projectName: "Vci",
+			lcPath:      lcFile,
+			head:        "abc123",
+			want:        false,
+		},
+		{
+			name:        "false missing LC",
+			machine:     config.Machine{},
+			project:     config.Project{},
+			projectName: "Vci",
+			lcPath:      filepath.Join(t.TempDir(), "missing.tar"),
+			head:        "abc123",
+			want:        false,
+		},
+		{
+			name:        "false directory LC",
+			machine:     config.Machine{},
+			project:     config.Project{},
+			projectName: "Vci",
+			lcPath:      lcDir,
+			head:        "abc123",
+			want:        false,
+		},
+	}
+	for _, tt := range eligibilityTests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := noSeedCacheEligible(tt.machine, tt.project, tt.projectName, tt.lcPath, tt.head); got != tt.want {
+				t.Fatalf("noSeedCacheEligible() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	def := config.DefaultBundleCache()
+	policyTests := []struct {
+		name    string
+		machine config.Machine
+		want    config.BundleCachePolicy
+	}{
+		{
+			name:    "policy default when machine.BundleCache is zero",
+			machine: config.Machine{},
+			want:    def,
+		},
+		{
+			name:    "machine policy override",
+			machine: config.Machine{BundleCache: config.BundleCachePolicy{MaxBytes: 1 << 20, AdmissionBytes: 1 << 10}},
+			want:    config.BundleCachePolicy{MaxEntries: def.MaxEntries, MaxBytes: 1 << 20, AdmissionBytes: 1 << 10},
+		},
+	}
+	for _, tt := range policyTests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectiveBundleCachePolicy(tt.machine.BundleCache); got != tt.want {
+				t.Fatalf("effectiveBundleCachePolicy() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestStageNoSeedReconstructOversizedBundleOneShot pins the no-seed
+// reconstruction path when the full-history bundle exceeds the machine's
+// bundle_cache.max_bytes: the transfer succeeds one-shot (zero cache spec)
+// and returns an actionable warning naming the project, host, byte cap, and
+// the seeded-reconstruction alternative, while the streamed shell stays
+// entirely off the worker bundle-cache path.
+func TestStageNoSeedReconstructOversizedBundleOneShot(t *testing.T) {
+	ctx := context.Background()
+
+	// A real small Git source root with base and head, so the cache key (the
+	// submitted head's first parent) is non-empty and the full bundle covers
+	// the reachable history.
+	sourceRoot, _, head := newTwoCommitRepo(t)
+
+	// The durable local-change archive is a regular file on disk; make it a
+	// real tar so the coordinator-side archive is well-formed.
+	var lcBuf bytes.Buffer
+	lcTw := tar.NewWriter(&lcBuf)
+	patch := []byte("diff --git a/a.txt b/a.txt\n")
+	if err := lcTw.WriteHeader(&tar.Header{Name: "patch", Mode: 0o644, Size: int64(len(patch)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lcTw.Write(patch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lcTw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lcBytes := lcBuf.Bytes()
+	lcPath := filepath.Join(t.TempDir(), "lc.tar")
+	if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Measure the full-history bundle the coordinator will emit so the test
+	// can prove it is nonempty and therefore larger than the small constant
+	// cache cap below.
+	bundleRC, err := source.CreateBundle(ctx, sourceRoot, "", head, process.Native{})
+	if err != nil {
+		t.Fatalf("create full bundle: %v", err)
+	}
+	bundleBytes, err := io.ReadAll(bundleRC)
+	_ = bundleRC.Close()
+	if err != nil {
+		t.Fatalf("read full bundle: %v", err)
+	}
+	if len(bundleBytes) == 0 {
+		t.Fatal("full bundle is empty; want a nonempty bundle")
+	}
+
+	// The machine is no-seed eligible for the project (no source path seeded,
+	// no exclusions, durable lc.tar present) but its bundle cache cannot hold
+	// the emitted bundle: the cap is a small constant that the nonempty
+	// full-history bundle provably exceeds.
+	const maxBundleBytes = 64
+	machine := config.Machine{
+		Host:        "builder",
+		BundleCache: config.BundleCachePolicy{MaxBytes: maxBundleBytes},
+	}
+	projectName := "Vci"
+
+	// The bundle-cache probe reports a miss, so the full bundle is streamed
+	// one-shot.
+	runner := &noSeedRouteRunner{probeHit: false}
+	warning, err := stageNoSeedReconstruct(ctx, runner, machine, projectName, lcPath, sourceRoot, head, "~/.vci/state/work/run_abc")
+	if err != nil {
+		t.Fatalf("stageNoSeedReconstruct: %v", err)
+	}
+
+	// The oversized transfer must succeed and return an actionable warning
+	// naming the project, host, byte cap, source path, and the one-shot
+	// not-cached outcome.
+	if warning == "" {
+		t.Fatal("expected a non-empty warning for the oversized one-shot bundle")
+	}
+	for _, want := range []string{
+		`project "Vci"`,
+		`machine "builder" bundle_cache.max_bytes`,
+		"source path",
+		"one-shot",
+		"not cached",
+	} {
+		if !strings.Contains(warning, want) {
+			t.Errorf("warning missing %q: %s", want, warning)
+		}
+	}
+
+	// The scripted runner saw exactly the probe then the one-shot stream.
+	if len(runner.commands) != 2 {
+		t.Fatalf("runner invoked %d times, want 2 (probe + stream)", len(runner.commands))
+	}
+	probe := runner.commands[0]
+	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || !strings.HasSuffix(probe.Args[3], "/complete") {
+		t.Errorf("unexpected probe command: %+v", probe)
+	}
+	stream := runner.commands[1]
+	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+		t.Errorf("unexpected stream command: %+v", stream)
+	}
+
+	// The streamed payload carries head, a nonempty full-history bundle, and
+	// the durable lc.tar byte-for-byte.
+	members := assertPayload(t, io.NopCloser(bytes.NewReader(runner.payload)), head, lcBytes, true)
+
+	// The warning must cite the actual emitted byte sizes so an operator can
+	// act on it.
+	if !strings.Contains(warning, fmt.Sprintf("bundle is %d bytes", len(members[1].Data))) {
+		t.Errorf("warning missing emitted bundle size %d: %s", len(members[1].Data), warning)
+	}
+	if !strings.Contains(warning, fmt.Sprintf("bundle_cache.max_bytes of %d", maxBundleBytes)) {
+		t.Errorf("warning missing the configured max_bytes %d: %s", maxBundleBytes, warning)
+	}
+
+	// The one-shot shell imports the payload bundle entry-free and never
+	// touches the worker bundle cache: it unbundles .vci-payload/bundle
+	// directly and references no workerCacheRoot path at all.
+	s := stream.Args[1]
+	if !strings.Contains(s, "git bundle unbundle .vci-payload/bundle") {
+		t.Errorf("one-shot shell missing the entry-free bundle import: %s", s)
+	}
+	if strings.Contains(s, workerCacheRoot) {
+		t.Errorf("one-shot shell must not reference the worker bundle cache (%q): %s", workerCacheRoot, s)
+	}
+}
+
+// noSeedRouteRunner scripts the ssh invocations of the no-seed bundle-cache
+// routes: the probe outcome is configured up front (zero exit is a hit,
+// nonzero a miss), and the reconstruction stream is the only command that
+// carries the payload on stdin, which is captured so tests can assert what
+// was emitted. A configured streamErr makes that stream invocation fail so
+// the caller falls back to full workspace staging.
+type noSeedRouteRunner struct {
+	probeHit  bool
+	streamErr error
+	commands  []process.Command
+	payload   []byte
+}
+
+func (r *noSeedRouteRunner) Run(_ context.Context, command process.Command) (process.Result, error) {
+	r.commands = append(r.commands, command)
+	if len(r.commands) == 1 { // ProbeBundleCache: `ssh <host> test -f <entry>/complete`.
+		if r.probeHit {
+			return process.Result{ExitCode: 0}, nil
+		}
+		return process.Result{ExitCode: 1}, nil
+	}
+	if command.Stdin != nil { // StreamNoSeedReconstruct carries the payload on stdin.
+		data, err := io.ReadAll(command.Stdin)
+		if err != nil {
+			return process.Result{}, err
+		}
+		r.payload = data
+		if r.streamErr != nil {
+			return process.Result{ExitCode: 0}, r.streamErr
+		}
+	}
+	return process.Result{ExitCode: 0}, nil
+}
+
+// TestStageNoSeedReconstructRoutesCacheHitAndMiss pins the two worker
+// bundle-cache routes of the no-seed reconstruction path against a real Git
+// source root: a cache hit acquires and releases an active claim around the
+// stream and runs a shell seeded from the cached entry bundle (no bundle
+// payload requirement), while a cache miss whose full bundle clears the
+// machine's AdmissionBytes streams the full bundle and runs admission plus
+// LRU eviction shell steps. Neither route returns a warning.
+func TestStageNoSeedReconstructRoutesCacheHitAndMiss(t *testing.T) {
+	ctx := context.Background()
+
+	// A real small Git source root with base and head, so the cache key (the
+	// submitted head's first parent) is non-empty and the full bundle covers
+	// the reachable history.
+	sourceRoot, base, head := newTwoCommitRepo(t)
+
+	// The durable local-change archive is a regular file on disk.
+	lcBytes := []byte("durable local-change archive\n")
+	lcPath := filepath.Join(t.TempDir(), "lc.tar")
+	if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name         string
+		probeHit     bool
+		machine      config.Machine
+		wantCommands int
+	}{
+		{
+			name:         "cache hit acquires and releases a claim and streams the cached entry",
+			probeHit:     true,
+			machine:      config.Machine{Host: "builder"},
+			wantCommands: 4,
+		},
+		{
+			name:         "cache miss above admission bytes streams a full bundle with admit and evict",
+			probeHit:     false,
+			machine:      config.Machine{Host: "builder", BundleCache: config.BundleCachePolicy{MaxBytes: 1 << 30, AdmissionBytes: 1}},
+			wantCommands: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &noSeedRouteRunner{probeHit: tt.probeHit}
+			warning, err := stageNoSeedReconstruct(ctx, runner, tt.machine, "Vci", lcPath, sourceRoot, head, "~/.vci/state/work/run_abc")
+			if err != nil {
+				t.Fatalf("stageNoSeedReconstruct: %v", err)
+			}
+			if warning != "" {
+				t.Fatalf("expected no warning, got %q", warning)
+			}
+			if len(runner.commands) != tt.wantCommands {
+				t.Fatalf("runner invoked %d times, want %d", len(runner.commands), tt.wantCommands)
+			}
+
+			// Both routes begin with the same bundle-cache probe for the
+			// submitted head's first parent.
+			probe := runner.commands[0]
+			if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || probe.Args[2] != "-f" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base+"/complete" {
+				t.Errorf("unexpected probe command: %+v", probe)
+			}
+
+			if tt.probeHit {
+				// A hit acquires an active claim before the stream and
+				// releases it after, so eviction skips the entry while the
+				// worker imports it.
+				acquire := runner.commands[1]
+				stream := runner.commands[2]
+				release := runner.commands[3]
+				wantAcquire := "test -f ~/.vci/state/bundle-cache/v1/Vci/" + base + "/complete && mkdir -p ~/.vci/state/bundle-cache/v1/Vci/" + base + "/claims && : > ~/.vci/state/bundle-cache/v1/Vci/" + base + "/claims/run_abc"
+				if acquire.Executable != "ssh" || len(acquire.Args) != 2 || acquire.Args[0] != "builder" || acquire.Args[1] != wantAcquire {
+					t.Errorf("unexpected acquire command: %+v", acquire)
+				}
+				wantRelease := "rm -f ~/.vci/state/bundle-cache/v1/Vci/" + base + "/claims/run_abc"
+				if release.Executable != "ssh" || len(release.Args) != 2 || release.Args[0] != "builder" || release.Args[1] != wantRelease {
+					t.Errorf("unexpected release command: %+v", release)
+				}
+				if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+					t.Errorf("unexpected stream command: %+v", stream)
+				}
+				// The hit shell seeds the repository from the cached entry
+				// bundle and treats the payload bundle as an optional delta;
+				// it never admits or evicts.
+				s := stream.Args[1]
+				for _, want := range []string{
+					"git init -q",
+					"git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/" + base + "/bundle",
+					"if [ -s .vci-payload/bundle ]",
+				} {
+					if !strings.Contains(s, want) {
+						t.Errorf("hit shell missing %q: %s", want, s)
+					}
+				}
+				for _, banned := range []string{"complete", "while :; do"} {
+					if strings.Contains(s, banned) {
+						t.Errorf("hit shell must not admit or evict (%q): %s", banned, s)
+					}
+				}
+				if runner.payload == nil {
+					t.Error("cache hit did not stream a payload")
+				}
+				return
+			}
+
+			// A miss above AdmissionBytes streams the full bundle and runs
+			// admission plus LRU eviction on the worker.
+			stream := runner.commands[1]
+			if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+				t.Errorf("unexpected stream command: %+v", stream)
+			}
+			members := assertPayload(t, io.NopCloser(bytes.NewReader(runner.payload)), head, lcBytes, true)
+			s := stream.Args[1]
+			if !strings.Contains(s, "git bundle unbundle .vci-payload/bundle") {
+				t.Errorf("miss shell missing the full-bundle import: %s", s)
+			}
+			if strings.Contains(s, "git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/"+base+"/bundle") {
+				t.Errorf("miss shell must not import the cached entry: %s", s)
+			}
+			for _, want := range []string{
+				"mkdir -p ~/.vci/state/bundle-cache/v1/Vci/" + base,
+				"cp .vci-payload/bundle ~/.vci/state/bundle-cache/v1/Vci/" + base + "/bundle",
+				fmt.Sprintf(`printf '{"bytes":%d,"last_used":`, len(members[1].Data)),
+				"> ~/.vci/state/bundle-cache/v1/Vci/" + base + "/meta.json",
+				": > ~/.vci/state/bundle-cache/v1/Vci/" + base + "/complete",
+				"while :; do",
+			} {
+				if !strings.Contains(s, want) {
+					t.Errorf("miss shell missing %q: %s", want, s)
+				}
+			}
+		})
+	}
+}
+
+// TestStageNoSeedReconstructBelowAdmissionOneShot pins the no-seed
+// reconstruction path when the full-history bundle is below the machine's
+// bundle_cache.admission_bytes: the probe reports a cache miss, the bundle
+// fits MaxBytes, and because the admission threshold sits above the emitted
+// bundle the stream is one-shot with a zero cache spec — no admission, no
+// LRU eviction, and no warning — while the payload still carries the full
+// bundle the worker needs.
+func TestStageNoSeedReconstructBelowAdmissionOneShot(t *testing.T) {
+	ctx := context.Background()
+
+	// A real small Git source root with base and head, so the cache key (the
+	// submitted head's first parent) is non-empty and the full bundle covers
+	// the reachable history.
+	sourceRoot, base, head := newTwoCommitRepo(t)
+
+	// The durable local-change archive is a regular file on disk.
+	lcBytes := []byte("durable local-change archive\n")
+	lcPath := filepath.Join(t.TempDir(), "lc.tar")
+	if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Measure the full-history bundle the coordinator will emit so the
+	// machine's thresholds are provably relative to it: AdmissionBytes must
+	// sit above the nonempty bundle while MaxBytes remains greater too, so
+	// the bundle is cacheable by size yet below the admission threshold.
+	bundleRC, err := source.CreateBundle(ctx, sourceRoot, "", head, process.Native{})
+	if err != nil {
+		t.Fatalf("create full bundle: %v", err)
+	}
+	bundleBytes, err := io.ReadAll(bundleRC)
+	_ = bundleRC.Close()
+	if err != nil {
+		t.Fatalf("read full bundle: %v", err)
+	}
+	if len(bundleBytes) == 0 {
+		t.Fatal("full bundle is empty; want a nonempty bundle")
+	}
+
+	// The machine is no-seed eligible for the project (no source path seeded,
+	// no exclusions, durable lc.tar present). Its admission threshold exceeds
+	// the emitted bundle, so the cache miss is streamed one-shot.
+	machine := config.Machine{
+		Host: "builder",
+		BundleCache: config.BundleCachePolicy{
+			MaxBytes:       1 << 30,
+			AdmissionBytes: int64(len(bundleBytes)) + 1,
+		},
+	}
+	projectName := "Vci"
+
+	// The bundle-cache probe reports a miss, so the full bundle is streamed
+	// one-shot below the admission threshold.
+	runner := &noSeedRouteRunner{probeHit: false}
+	warning, err := stageNoSeedReconstruct(ctx, runner, machine, projectName, lcPath, sourceRoot, head, "~/.vci/state/work/run_abc")
+	if err != nil {
+		t.Fatalf("stageNoSeedReconstruct: %v", err)
+	}
+	if warning != "" {
+		t.Fatalf("expected an empty warning below the admission threshold, got %q", warning)
+	}
+
+	// The scripted runner saw exactly the probe then the one-shot stream.
+	if len(runner.commands) != 2 {
+		t.Fatalf("runner invoked %d times, want 2 (probe + stream)", len(runner.commands))
+	}
+	probe := runner.commands[0]
+	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || probe.Args[2] != "-f" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base+"/complete" {
+		t.Errorf("unexpected probe command: %+v", probe)
+	}
+	stream := runner.commands[1]
+	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+		t.Errorf("unexpected stream command: %+v", stream)
+	}
+
+	// The streamed payload carries head, a nonempty full-history bundle, and
+	// the durable lc.tar byte-for-byte.
+	assertPayload(t, io.NopCloser(bytes.NewReader(runner.payload)), head, lcBytes, true)
+
+	// The one-shot shell imports the payload bundle entry-free and never
+	// touches the worker bundle cache: no cached entry path, no admission,
+	// and no LRU eviction.
+	s := stream.Args[1]
+	if !strings.Contains(s, "git bundle unbundle .vci-payload/bundle") {
+		t.Errorf("one-shot shell missing the entry-free bundle import: %s", s)
+	}
+	if strings.Contains(s, workerCacheRoot) {
+		t.Errorf("one-shot shell must not reference the worker bundle cache (%q): %s", workerCacheRoot, s)
+	}
+}
+
+// TestStageNoSeedReconstructStreamErrorFallsBack pins that a no-seed
+// reconstruction stream failure falls back to full workspace staging: for an
+// otherwise eligible machine the bundle-cache probe reports a miss, the full
+// bundle stream then fails with a configured error, and stageOrReconstruct
+// returns an empty warning and nil error after StageRemote stages the whole
+// workspace.
+func TestStageNoSeedReconstructStreamErrorFallsBack(t *testing.T) {
+	ctx := context.Background()
+
+	// Sentinel ssh/tar stubs on PATH: the real StageRemote fallback execs
+	// `tar` and `ssh` through PATH lookup, so the fallback appends to these
+	// logs.
+	dir := t.TempDir()
+	sshLog := filepath.Join(dir, "ssh.log")
+	tarLog := filepath.Join(dir, "tar.log")
+	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+sshLog+"\ncat >/dev/null 2>&1\nexit 0\n")
+	writeStub(t, dir, "tar", "#!/bin/sh\necho \"$*\" >> "+tarLog+"\nexit 0\n")
+
+	// A real small Git source root with base and head, so the cache key (the
+	// submitted head's first parent) is non-empty and the full bundle covers
+	// the reachable history.
+	sourceRoot, base, head := newTwoCommitRepo(t)
+
+	// The durable local-change archive is a regular file on disk.
+	lcBytes := []byte("durable local-change archive\n")
+	lcPath := filepath.Join(t.TempDir(), "lc.tar")
+	if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The machine is no-seed eligible for the project (no source path seeded,
+	// no exclusions, durable lc.tar present), so stageOrReconstruct takes the
+	// no-seed probe/stream path. The probe reports a miss; the stream then
+	// fails with the configured error.
+	runner := &noSeedRouteRunner{probeHit: false, streamErr: fmt.Errorf("stream failed")}
+	machine := config.Machine{Host: "builder"}
+	project := config.Project{}
+	projectName := "Vci"
+	workspace := t.TempDir()
+
+	warning, err := stageOrReconstruct(ctx, runner, machine, project, projectName, lcPath, sourceRoot, workspace, head, "~/.vci/state/work/run_abc")
+	if err != nil {
+		t.Fatalf("stageOrReconstruct: %v", err)
+	}
+	if warning != "" {
+		t.Fatalf("expected an empty warning on the fallback, got %q", warning)
+	}
+
+	// The runner saw exactly the probe then the failed stream.
+	if len(runner.commands) != 2 {
+		t.Fatalf("runner invoked %d times, want 2 (probe + failed stream)", len(runner.commands))
+	}
+	probe := runner.commands[0]
+	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || probe.Args[2] != "-f" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base+"/complete" {
+		t.Errorf("unexpected probe command: %+v", probe)
+	}
+	stream := runner.commands[1]
+	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+		t.Errorf("unexpected stream command: %+v", stream)
+	}
+	if len(runner.payload) == 0 {
+		t.Fatal("StreamNoSeedReconstruct stdin was empty; expected the reconstruction payload tar")
+	}
+
+	// The failed stream fell back to StageRemote: ssh runs the
+	// mkdir/cd/tar-extract shell and tar archives the local workspace.
+	sshOut, err := os.ReadFile(sshLog)
+	if err != nil {
+		t.Fatalf("ssh stub log: %v", err)
+	}
+	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+		if !strings.Contains(string(sshOut), want) {
+			t.Errorf("stage command missing %q: %s", want, sshOut)
+		}
+	}
+	tarOut, err := os.ReadFile(tarLog)
+	if err != nil {
+		t.Fatalf("tar stub log: %v", err)
+	}
+	for _, want := range []string{"-cf", "-", "-C", workspace, "."} {
+		if !strings.Contains(string(tarOut), want) {
+			t.Errorf("tar invocation missing %q: %s", want, tarOut)
+		}
 	}
 }

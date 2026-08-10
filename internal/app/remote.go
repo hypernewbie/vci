@@ -362,6 +362,68 @@ func writePayloadEntry(tw *tar.Writer, name string, data []byte) error {
 	return err
 }
 
+// workerCacheRoot is the worker-side bundle-cache root, mirroring the
+// coordinator's `~/.vci/state` layout for remote worker state. The bundlecache
+// layout lives beneath it as v1/<project>/<base>/... .
+const workerCacheRoot = "~/.vci/state/bundle-cache"
+
+// effectiveBundleCachePolicy resolves a machine's bundle-cache policy,
+// replacing zero fields with the documented defaults.
+func effectiveBundleCachePolicy(p config.BundleCachePolicy) config.BundleCachePolicy {
+	d := config.DefaultBundleCache()
+	if p.MaxEntries <= 0 {
+		p.MaxEntries = d.MaxEntries
+	}
+	if p.MaxBytes <= 0 {
+		p.MaxBytes = d.MaxBytes
+	}
+	if p.AdmissionBytes <= 0 {
+		p.AdmissionBytes = d.AdmissionBytes
+	}
+	return p
+}
+
+// noSeedPayload assembles the reconstruction payload for a machine with no
+// seed: the submitted head, a full bundle covering the entire reachable
+// history (have is empty), and the durable local-change archive copied
+// byte-for-byte. It returns the payload and the bundle byte size so the
+// caller can apply the machine's admission threshold.
+func noSeedPayload(ctx context.Context, sourceRoot, head, lcPath string) (io.ReadCloser, int64, error) {
+	var bundle []byte
+	bundleRC, err := source.CreateBundle(ctx, sourceRoot, "", head, process.Native{})
+	if err != nil && !errors.Is(err, source.ErrBundleEmpty) {
+		return nil, 0, fmt.Errorf("create worker bundle: %w", err)
+	}
+	if bundleRC != nil {
+		bundle, err = io.ReadAll(bundleRC)
+		_ = bundleRC.Close()
+		if err != nil {
+			return nil, 0, fmt.Errorf("read worker bundle: %w", err)
+		}
+	}
+	lc, err := os.ReadFile(lcPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read durable local-change archive: %w", err)
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := writePayloadEntry(tw, "head", []byte(strings.TrimSpace(head)+"\n")); err != nil {
+		return nil, 0, err
+	}
+	if len(bundle) > 0 {
+		if err := writePayloadEntry(tw, "bundle", bundle); err != nil {
+			return nil, 0, err
+		}
+	}
+	if err := writePayloadEntry(tw, "lc.tar", lc); err != nil {
+		return nil, 0, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, 0, err
+	}
+	return io.NopCloser(bytes.NewReader(buf.Bytes())), int64(len(bundle)), nil
+}
+
 // seededReconstructionEligible reports whether a machine can reconstruct the
 // submitted local changes onto its own source checkout: the machine must have
 // a source path seeded for the project, the project must declare no hard
@@ -378,54 +440,157 @@ func seededReconstructionEligible(machine config.Machine, project config.Project
 	return err == nil && info.Mode().IsRegular()
 }
 
+// noSeedCacheEligible reports whether a machine without a seed can use the
+// bundle-cache reconstruction path: the project must declare no hard
+// workspace exclusions (the cache path cannot honor them), the submitted head
+// must be known, and the durable local-change archive must be present as a
+// regular file.
+func noSeedCacheEligible(machine config.Machine, project config.Project, projectName, lcPath, submittedHead string) bool {
+	if machine.SourcePaths[projectName] != "" {
+		return false
+	}
+	if len(project.ExcludedPaths) != 0 {
+		return false
+	}
+	if submittedHead == "" {
+		return false
+	}
+	info, err := os.Stat(lcPath)
+	return err == nil && info.Mode().IsRegular()
+}
+
+// stageNoSeedReconstruct prepares a worker workspace on a machine with no
+// seed by streaming a reconstruction payload through the worker bundle cache:
+// it probes the cache for the submission base, acquires an active claim on a
+// hit so eviction skips the entry while the worker imports it, admits the
+// transferred bundle only at or above the machine's AdmissionBytes (one-shot
+// otherwise), and evicts LRU entries after admission. A bundle larger than
+// the machine's MaxBytes cannot fit the cache, so it is transferred one-shot
+// with an actionable warning. Every failure returns an error (with an empty
+// warning) so stageOrReconstruct falls back to full workspace staging.
+func stageNoSeedReconstruct(ctx context.Context, runner process.Runner, machine config.Machine, projectName, lcPath, sourceRoot, submittedHead, remoteWorkDir string) (string, error) {
+	client := host.Client{Runner: runner}
+	policy := effectiveBundleCachePolicy(machine.BundleCache)
+
+	// The cache key is the submitted head's first parent: a worker that holds
+	// a complete entry for that base has all objects reachable from it, so
+	// the coordinator needs to send only the delta. A root commit has no base
+	// and therefore no usable cache key; the transfer is one-shot.
+	identity, err := source.CaptureIdentity(ctx, sourceRoot, process.Native{})
+	base := ""
+	if err == nil {
+		base = identity.Base
+	}
+	if base == "" {
+		payload, _, err := noSeedPayload(ctx, sourceRoot, submittedHead, lcPath)
+		if err != nil {
+			return "", err
+		}
+		return "", client.StreamNoSeedReconstruct(ctx, machine.Host, remoteWorkDir, host.NoSeedCacheSpec{}, payload)
+	}
+
+	hit, err := client.ProbeBundleCache(ctx, machine.Host, workerCacheRoot, projectName, base)
+	if err != nil {
+		return "", err
+	}
+	if hit {
+		segments := strings.Split(remoteWorkDir, "/")
+		claimID := segments[len(segments)-1]
+		if err := client.AcquireBundleClaim(ctx, machine.Host, workerCacheRoot, projectName, base, claimID); err != nil {
+			return "", err
+		}
+		defer func() { _ = client.ReleaseBundleClaim(ctx, machine.Host, workerCacheRoot, projectName, base, claimID) }()
+		payload, err := workerPayload(ctx, sourceRoot, base, submittedHead, lcPath)
+		if err != nil {
+			return "", err
+		}
+		cache := host.NoSeedCacheSpec{Root: workerCacheRoot, Project: projectName, Base: base, UseCached: true}
+		return "", client.StreamNoSeedReconstruct(ctx, machine.Host, remoteWorkDir, cache, payload)
+	}
+
+	// Cache miss: transfer the full bundle. A bundle larger than the machine's
+	// MaxBytes cannot fit the cache, so it is streamed one-shot (zero cache
+	// spec) with an actionable warning; otherwise admit it only at or above
+	// the machine's AdmissionBytes and evict LRU entries after admission.
+	payload, bundleSize, err := noSeedPayload(ctx, sourceRoot, submittedHead, lcPath)
+	if err != nil {
+		return "", err
+	}
+	if bundleSize > policy.MaxBytes {
+		warning := fmt.Sprintf(
+			"project %q bundle is %d bytes, exceeding machine %q bundle_cache.max_bytes of %d; "+
+				"the machine has no local seed, so the bundle was transferred one-shot and not cached. "+
+				"Configure a source path for project %q on machine %q to enable seeded reconstruction, "+
+				"or raise bundle_cache.max_bytes to at least %d to admit the bundle into the worker cache.",
+			projectName, bundleSize, machine.Host, policy.MaxBytes, projectName, machine.Host, bundleSize)
+		return warning, client.StreamNoSeedReconstruct(ctx, machine.Host, remoteWorkDir, host.NoSeedCacheSpec{}, payload)
+	}
+	var cache host.NoSeedCacheSpec
+	if bundleSize >= policy.AdmissionBytes {
+		cache = host.NoSeedCacheSpec{Root: workerCacheRoot, Project: projectName, Base: base, Admit: true, Evict: true, MaxEntries: policy.MaxEntries, MaxBytes: policy.MaxBytes, BundleBytes: bundleSize, Now: time.Now().UTC()}
+	}
+	return "", client.StreamNoSeedReconstruct(ctx, machine.Host, remoteWorkDir, cache, payload)
+}
+
 // stageOrReconstruct prepares a worker's remote workspace for a
 // submission-backed remote build. When the machine is eligible for seeded
 // reconstruction it probes the machine's seed checkout for its head and
-// streams a reconstruction payload; any probe, payload, or stream failure
-// falls back to full workspace staging exactly as executeRemote stages it.
-// runner supplies the ssh transport for the probe and the stream.
+// streams a reconstruction payload; a machine without a seed reconstructs
+// through the worker bundle cache instead. Any probe, payload, or stream
+// failure falls back to full workspace staging exactly as executeRemote
+// stages it. runner supplies the ssh transport for the probe and the stream.
 // submittedHead is the submitted commit used as the payload head; the
 // probed seed head is the bundle base, so the worker receives exactly the
-// objects it lacks.
-func stageOrReconstruct(ctx context.Context, runner process.Runner, machine config.Machine, project config.Project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir string) error {
+// objects it lacks. The returned warning is non-empty only when the no-seed
+// reconstruction stream succeeds but transfers a bundle too large for the
+// machine's bundle cache; fallbacks and errors return an empty warning.
+func stageOrReconstruct(ctx context.Context, runner process.Runner, machine config.Machine, project config.Project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir string) (string, error) {
 	if !seededReconstructionEligible(machine, project, projectName, lcPath) {
-		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
-			return fmt.Errorf("stage remote workspace: %w", err)
+		if noSeedCacheEligible(machine, project, projectName, lcPath, submittedHead) {
+			if warning, err := stageNoSeedReconstruct(ctx, runner, machine, projectName, lcPath, sourceRoot, submittedHead, remoteWorkDir); err == nil {
+				return warning, nil
+			}
 		}
-		return nil
+		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
+			return "", fmt.Errorf("stage remote workspace: %w", err)
+		}
+		return "", nil
 	}
 	seed := machine.SourcePaths[projectName]
 	client := host.Client{Runner: runner}
 	seedHead, err := client.ProbeSeedHead(ctx, machine.Host, seed)
 	if err != nil || seedHead == "" {
 		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
-			return fmt.Errorf("stage remote workspace: %w", err)
+			return "", fmt.Errorf("stage remote workspace: %w", err)
 		}
-		return nil
+		return "", nil
 	}
 	payload, err := workerPayload(ctx, sourceRoot, seedHead, submittedHead, lcPath)
 	if err != nil {
 		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
-			return fmt.Errorf("stage remote workspace: %w", err)
+			return "", fmt.Errorf("stage remote workspace: %w", err)
 		}
-		return nil
+		return "", nil
 	}
 	if err := client.StreamReconstruct(ctx, machine.Host, seed, remoteWorkDir, payload); err != nil {
 		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
-			return fmt.Errorf("stage remote workspace: %w", err)
+			return "", fmt.Errorf("stage remote workspace: %w", err)
 		}
-		return nil
+		return "", nil
 	}
-	return nil
+	return "", nil
 }
 
 // executeRemote stages workspace on a remote host via ssh, runs the command,
 // fetches artifacts if requested, and best-effort cleans the remote workspace.
 // Uses `ssh`, `tar`, and `scp` only and returns runtime.Result with matches.
-func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir string, machine config.Machine, sourceRoot string, workspace string, project config.Project, projectName, lcPath, submittedHead string, pair process.Pair) (runtime.Result, []string, bool, error) {
+// The returned warning string reports non-fatal remote execution conditions
+// surfaced to the caller, such as a no-seed bundle transfer that exceeded the
+// machine's bundle-cache byte cap and was therefore streamed one-shot.
+func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir string, machine config.Machine, sourceRoot string, workspace string, project config.Project, projectName, lcPath, submittedHead string, pair process.Pair) (runtime.Result, []string, bool, string, error) {
 	remoteWorkDir, err := host.RemoteWorkDir(id)
 	if err != nil {
-		return runtime.Result{}, nil, false, err
+		return runtime.Result{}, nil, false, "", err
 	}
 	defer func() {
 		// Best-effort remote workspace cleanup on the success path.
@@ -434,12 +599,13 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 		_ = reaper.CleanupRemote(context.Background(), machine.Host, remoteWorkDir)
 	}()
 
-	if err := stageOrReconstruct(ctx, process.Native{}, machine, project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir); err != nil {
-		return runtime.Result{}, nil, false, err
+	warning, err := stageOrReconstruct(ctx, process.Native{}, machine, project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir)
+	if err != nil {
+		return runtime.Result{}, nil, false, "", err
 	}
 	argv, err := remoteArgv(machine, remoteWorkDir, project.Command)
 	if err != nil {
-		return runtime.Result{}, nil, false, err
+		return runtime.Result{}, nil, false, "", err
 	}
 	started := time.Now().UTC()
 	exitCode, runErr := host.RunRemote(ctx, machine.Host, remoteWorkDir, argv, project.Environment, pair.Stdout, pair.Stderr)
@@ -453,18 +619,18 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 	if len(project.Artifacts) > 0 {
 		fetchParent, mkErr := os.MkdirTemp(l.TempDir(), "vci-fetch-")
 		if mkErr != nil {
-			return result, nil, false, fmt.Errorf("artifact fetch dir: %w", mkErr)
+			return result, nil, false, "", fmt.Errorf("artifact fetch dir: %w", mkErr)
 		}
 		defer func() { _ = os.RemoveAll(fetchParent) }()
 		if err := host.FetchRemote(ctx, machine.Host, remoteWorkDir, fetchParent); err != nil {
-			return result, nil, false, err
+			return result, nil, false, "", err
 		}
 		collected, truncated, err = CollectArtifacts(filepath.Join(fetchParent, string(id)), runDir, project.Artifacts)
 		if err != nil {
-			return result, nil, false, fmt.Errorf("collect remote artifacts: %w", err)
+			return result, nil, false, "", fmt.Errorf("collect remote artifacts: %w", err)
 		}
 	}
-	return result, collected, truncated, runErr
+	return result, collected, truncated, warning, runErr
 }
 
 // selectExecutor selects runtime based on the snapshot's machine.
