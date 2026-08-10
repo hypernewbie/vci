@@ -223,6 +223,18 @@ func PrepareHosted(ctx context.Context, l model.Layout, projectName string) (Pre
 	return PreparedRun{Record: staged}, nil
 }
 
+// submissionLCPath names the private per-run file that holds a submission's
+// local-change archive. PrepareFromSubmission writes the exact serialized
+// local changes there so the submitted delta stays available until
+// ExecutePrepared removes it during end-of-run cleanup.
+func submissionLCPath(l model.Layout, id model.RunID) (string, error) {
+	dir, err := l.RunDir(string(id))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "submission-lc.tar"), nil
+}
+
 // PrepareFromSubmission reconstructs a workspace from a framed client
 // submission and stages the run, returning the prepared record. The
 // reconstructed staging dir persists until the run executes.
@@ -267,6 +279,26 @@ func PrepareFromSubmission(ctx context.Context, l model.Layout, projectName stri
 	}
 	prepared, err := Prepare(ctx, l, reconDir)
 	if err != nil {
+		_ = os.RemoveAll(tempRoot)
+		return PreparedRun{}, err
+	}
+	lcPath, err := submissionLCPath(l, prepared.Record.ID)
+	if err != nil {
+		_ = os.RemoveAll(tempRoot)
+		return PreparedRun{}, err
+	}
+	lcRC, err := source.PackageLC(sub.LocalChanges)
+	if err != nil {
+		_ = os.RemoveAll(tempRoot)
+		return PreparedRun{}, err
+	}
+	lcBytes, err := io.ReadAll(lcRC)
+	_ = lcRC.Close()
+	if err != nil {
+		_ = os.RemoveAll(tempRoot)
+		return PreparedRun{}, err
+	}
+	if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
 		_ = os.RemoveAll(tempRoot)
 		return PreparedRun{}, err
 	}
@@ -477,6 +509,11 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		return BuildResult{}, err
 	}
 	_ = process.RemoveExecution(filepath.Join(runDir, "execution.json"))
+	// Drop the persisted submission archive with the rest of the run's cleanup;
+	// a prepared-but-unexecuted run keeps it available for inspection.
+	if lcPath, lcErr := submissionLCPath(l, id); lcErr == nil {
+		_ = os.Remove(lcPath)
+	}
 	if err := removeOwned(workspace); err != nil {
 		_ = os.WriteFile(filepath.Join(runDir, "cleanup.pending"), []byte(err.Error()), 0o600)
 	}
