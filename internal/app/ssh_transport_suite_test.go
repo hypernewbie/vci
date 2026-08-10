@@ -13,6 +13,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,8 @@ import (
 
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/scheduler"
+	"github.com/hypernewbie/vci/internal/store"
 )
 
 // findStagingArtifacts lists staging dirs left under a coordinator
@@ -304,6 +307,28 @@ func setupRemoteRoot(t *testing.T, machine config.Machine, project config.Projec
 	return l
 }
 
+// executeChild reserves the first child of a prepared build request and runs
+// it to completion, since dispatch is a coordinator-owned step these tests do
+// not exercise directly.
+func executeChild(t *testing.T, ctx context.Context, l model.Layout, parentID model.RunID) (BuildResult, model.RunID, error) {
+	t.Helper()
+	cfg, err := config.Load(l.ConfigPath())
+	if err != nil {
+		return BuildResult{}, "", err
+	}
+	runStore := store.Store{Layout: l}
+	children, err := runStore.LoadChildren(parentID)
+	if err != nil || len(children) == 0 {
+		return BuildResult{}, "", fmt.Errorf("no children: %v", err)
+	}
+	childID := children[0].ID
+	if err := scheduler.Reserve(l, runStore, cfg, children[0].Machine, childID, time.Now().UTC()); err != nil {
+		return BuildResult{}, childID, err
+	}
+	result, err := ExecutePrepared(ctx, l, childID)
+	return result, childID, err
+}
+
 // TestRemoteBareBuildViaFakeSSH pins the remote-bare happy path:
 // workspace staged via fake ssh, `true` run remotely, succeeded run on
 // mac-remote. The ssh argv carries the host alias, workspace, and
@@ -318,7 +343,7 @@ func TestRemoteBareBuildViaFakeSSH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	result, err := ExecutePrepared(context.Background(), l, prep.Record.ID)
+	result, childID, err := executeChild(t, context.Background(), l, prep.Record.ID)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -335,9 +360,9 @@ func TestRemoteBareBuildViaFakeSSH(t *testing.T) {
 	s := string(log)
 	for _, want := range []string{
 		"builder",
-		"~/.vci/state/work/" + string(prep.Record.ID),
+		"~/.vci/state/work/" + string(childID),
 		"'true'",
-		"rm -rf -- ~/.vci/state/work/" + string(prep.Record.ID),
+		"rm -rf -- ~/.vci/state/work/" + string(childID),
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("ssh log missing %q: %s", want, s)
@@ -364,7 +389,7 @@ func TestRemoteDockerBuildViaFakeSSH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	result, err := ExecutePrepared(context.Background(), l, prep.Record.ID)
+	result, childID, err := executeChild(t, context.Background(), l, prep.Record.ID)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -373,7 +398,7 @@ func TestRemoteDockerBuildViaFakeSSH(t *testing.T) {
 	}
 	log, _ := os.ReadFile(logPath)
 	s := string(log)
-	runID := string(prep.Record.ID)
+	runID := string(childID)
 	for _, want := range []string{
 		"exec 'docker' 'run' '--rm'",
 		`"$__vci_login_home"/.vci/state/work/` + runID + ":/vci/work:ro",
@@ -405,7 +430,7 @@ func TestRemoteVMBuildViaFakeSSH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	result, err := ExecutePrepared(context.Background(), l, prep.Record.ID)
+	result, childID, err := executeChild(t, context.Background(), l, prep.Record.ID)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -414,7 +439,7 @@ func TestRemoteVMBuildViaFakeSSH(t *testing.T) {
 	}
 	log, _ := os.ReadFile(logPath)
 	s := string(log)
-	runID := string(prep.Record.ID)
+	runID := string(childID)
 	for _, want := range []string{"exec 'tart' 'run' '--no-gui'", `"$__vci_login_home"/.vci/state/work/` + runID + ":/vci/work", "'ghcr.io/org/vm:pin'", "--", "'true'"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("ssh log missing %q: %s", want, s)
@@ -458,7 +483,7 @@ exit 0
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	result, err := ExecutePrepared(context.Background(), l, prep.Record.ID)
+	result, childID, err := executeChild(t, context.Background(), l, prep.Record.ID)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -467,7 +492,7 @@ exit 0
 	}
 	scpLogData, _ := os.ReadFile(scpLog)
 	s := string(scpLogData)
-	ws := "~/.vci/state/work/" + string(prep.Record.ID)
+	ws := "~/.vci/state/work/" + string(childID)
 	if !strings.Contains(s, "builder:"+ws) {
 		t.Errorf("scp log missing remote source %q: %s", ws, s)
 	}
@@ -478,7 +503,7 @@ exit 0
 		t.Errorf("artifacts_truncated=true under cap")
 	}
 	// The collected artifact is durable on the coordinator.
-	runDir, err := l.RunDir(string(prep.Record.ID))
+	runDir, err := l.RunDir(string(childID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +528,7 @@ func TestRemoteBareBuildViaSSHDFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	result, err := ExecutePrepared(context.Background(), l, prep.Record.ID)
+	result, childID, err := executeChild(t, context.Background(), l, prep.Record.ID)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -514,7 +539,7 @@ func TestRemoteBareBuildViaSSHDFixture(t *testing.T) {
 		t.Errorf("machine: %q", result.Machine)
 	}
 	// Remote workspace must have been cleaned up.
-	remoteWork := filepath.Join(fixture.homeDir, ".vci", "state", "work", string(prep.Record.ID))
+	remoteWork := filepath.Join(fixture.homeDir, ".vci", "state", "work", string(childID))
 	if _, err := os.Stat(remoteWork); !os.IsNotExist(err) {
 		t.Errorf("remote workspace turd remains: %v", err)
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/hypernewbie/vci/internal/app"
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/store"
 )
 
 // hostedGitStub is a fake `git` binary placed in PATH for the duration
@@ -340,19 +341,15 @@ func TestCLICoordinatorHostedEndToEndWithStubGit(t *testing.T) {
 	if runID == "" {
 		t.Fatalf("no run_id: %s", out.String())
 	}
-	// The staged record carries an additive source_provenance
-	// block. Use `vci check` to read it back; the public envelope
-	// returns the saved snapshot.
-	var checkBuf, checkErr bytes.Buffer
-	if code := Run([]string{"check", runID}, &checkBuf, &checkErr); code != 0 {
-		t.Fatalf("check: %d %s", code, checkBuf.String())
+	// Each target run carries the additive source_provenance block in its
+	// snapshot. Look up a child record directly to read it back.
+	children, err := (store.Store{Layout: l}).LoadChildren(model.RunID(runID))
+	if err != nil || len(children) == 0 {
+		t.Fatalf("no children: %v", err)
 	}
-	var checkEnv Response
-	_ = json.Unmarshal(checkBuf.Bytes(), &checkEnv)
-	data, _ := checkEnv.Data.(map[string]any)
-	cfgSnap, _ := data["config_snapshot"].(map[string]any)
-	if cfgSnap == nil {
-		t.Fatalf("no config_snapshot: %+v", data)
+	var cfgSnap map[string]any
+	if err := json.Unmarshal(children[0].ConfigSnapshot, &cfgSnap); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
 	}
 	prov, _ := cfgSnap["source_provenance"].(map[string]any)
 	if prov == nil {

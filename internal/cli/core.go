@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hypernewbie/vci/internal/app"
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/model"
 	"github.com/hypernewbie/vci/internal/runtime"
@@ -61,6 +62,17 @@ func resolveLayout() (model.Layout, error) {
 		return model.Layout{Root: filepath.Clean(root)}, nil
 	}
 	return model.Default()
+}
+
+// buildResponse dispatches a freshly prepared build and returns its aggregate
+// summary as the build command's response.
+func buildResponse(command string, l model.Layout, parentID model.RunID) (Response, int) {
+	app.DispatchPending(l)
+	summary, err := app.BuildSummaryView(l, parentID)
+	if err != nil {
+		return appFailure(command, err), 2
+	}
+	return Success(command, summary), 0
 }
 
 func appFailure(command string, err error) Response {

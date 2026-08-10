@@ -37,11 +37,18 @@ const (
 	RunFailed     RunState = "failed"
 	RunLost       RunState = "lost"
 	RunAborted    RunState = "aborted"
+	// RunUnavailable marks a target that could not be reached or staged.
+	// It is terminal and distinct from a command failure.
+	RunUnavailable RunState = "unavailable"
+	// RunAggregating is the derived state of a multi-target build whose
+	// targets have not all reached a terminal state. It is never persisted
+	// on a run record; Check computes it from the target runs.
+	RunAggregating RunState = "aggregating"
 )
 
 func (s RunState) Valid() bool {
 	switch s {
-	case RunQueued, RunStaging, RunRunning, RunCommitting, RunSucceeded, RunFailed, RunLost, RunAborted:
+	case RunQueued, RunStaging, RunRunning, RunCommitting, RunSucceeded, RunFailed, RunLost, RunAborted, RunUnavailable, RunAggregating:
 		return true
 	default:
 		return false
@@ -50,17 +57,17 @@ func (s RunState) Valid() bool {
 
 func CanTransition(from, to RunState) bool {
 	if from == to {
-		return from != RunSucceeded && from != RunFailed && from != RunLost && from != RunAborted
+		return from != RunSucceeded && from != RunFailed && from != RunLost && from != RunAborted && from != RunUnavailable
 	}
 	switch from {
 	case RunQueued:
-		return to == RunStaging || to == RunAborted
+		return to == RunStaging || to == RunAborted || to == RunUnavailable
 	case RunStaging:
-		return to == RunRunning || to == RunLost || to == RunAborted
+		return to == RunRunning || to == RunLost || to == RunAborted || to == RunUnavailable
 	case RunRunning:
-		return to == RunCommitting || to == RunFailed || to == RunLost || to == RunAborted
+		return to == RunCommitting || to == RunFailed || to == RunLost || to == RunAborted || to == RunUnavailable
 	case RunCommitting:
-		return to == RunSucceeded || to == RunFailed || to == RunLost || to == RunAborted
+		return to == RunSucceeded || to == RunFailed || to == RunLost || to == RunAborted || to == RunUnavailable
 	case RunLost:
 		return to == RunAborted
 	default:
@@ -79,9 +86,9 @@ func Transition(from, to RunState) error {
 }
 
 // IsTerminal reports whether a run state is final and immutable:
-// succeeded, failed, lost, or aborted.
+// succeeded, failed, lost, aborted, or unavailable.
 func IsTerminal(state RunState) bool {
-	return state == RunSucceeded || state == RunFailed || state == RunLost || state == RunAborted
+	return state == RunSucceeded || state == RunFailed || state == RunLost || state == RunAborted || state == RunUnavailable
 }
 
 type FailureClass string

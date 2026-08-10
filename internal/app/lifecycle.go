@@ -14,29 +14,54 @@ import (
 )
 
 // Abort persists a cancellation request and transitions run state; the owning
-// worker handles TERM/KILL escalation.
+// Abort cancels a run or build request. A build request fans the cancellation
+// out to every non-terminal target and then records the request as aborted.
 func Abort(l model.Layout, id model.RunID) (store.RunRecord, error) {
 	runStore := store.Store{Layout: l}
 	record, err := runStore.Load(id)
 	if err != nil {
 		return store.RunRecord{}, err
 	}
+	if record.ParentRunID != "" {
+		if parent, perr := runStore.Load(record.ParentRunID); perr == nil {
+			record = parent
+			id = parent.ID
+		}
+	}
+	if len(record.Children) > 0 {
+		children, _ := runStore.LoadChildren(id)
+		for _, child := range children {
+			if model.IsTerminal(child.State) {
+				continue
+			}
+			if _, cerr := abortSingle(l, runStore, child); cerr == nil {
+				_ = scheduler.Release(l, child.Machine, child.ID)
+			}
+		}
+		return runStore.Transition(id, model.RunAborted, time.Now().UTC())
+	}
+	return abortSingle(l, runStore, record)
+}
+
+// abortSingle cancels one target run: an already-started run requests
+// cancellation for its worker; a queued or lost run terminates immediately
+// and frees its scheduler slot.
+func abortSingle(l model.Layout, runStore store.Store, record store.RunRecord) (store.RunRecord, error) {
 	switch record.State {
 	case model.RunQueued:
-		// Release the scheduler reservation acquired in Prepare.
-		aborted, abortErr := runStore.Transition(id, model.RunAborted, time.Now().UTC())
+		aborted, abortErr := runStore.Transition(record.ID, model.RunAborted, time.Now().UTC())
 		if abortErr != nil {
 			return store.RunRecord{}, abortErr
 		}
-		_ = scheduler.Release(l, aborted.Machine, id)
+		_ = scheduler.Release(l, aborted.Machine, record.ID)
 		return aborted, nil
 	case model.RunStaging, model.RunRunning, model.RunCommitting:
-		return runStore.RequestCancellation(id, time.Now().UTC())
+		return runStore.RequestCancellation(record.ID, time.Now().UTC())
 	case model.RunLost:
-		_ = scheduler.Release(l, record.Machine, id)
+		_ = scheduler.Release(l, record.Machine, record.ID)
 		return record, nil
 	default:
-		return store.RunRecord{}, fmt.Errorf("run %s cannot be aborted from state %s", id, record.State)
+		return store.RunRecord{}, fmt.Errorf("run %s cannot be aborted from state %s", record.ID, record.State)
 	}
 }
 
@@ -134,6 +159,7 @@ func Maintain(l model.Layout) (MaintenanceReport, error) {
 		return MaintenanceReport{}, err
 	}
 	reaper.ReapRemoteBundleCaches(&reaped, cfg, now)
+	DispatchPending(l)
 	retained, err := reaper.Enforce(l, cfg.Retention)
 	if err != nil {
 		return MaintenanceReport{}, err

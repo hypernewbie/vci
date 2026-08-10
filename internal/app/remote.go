@@ -268,12 +268,15 @@ func RemoteCommand(ctx context.Context, l model.Layout, name string, args ...str
 }
 
 // RemoteLog proxies `vci logs` to the remote host and returns raw log bytes.
-func RemoteLog(ctx context.Context, l model.Layout, id model.RunID, stream string, tail int) ([]byte, bool, error) {
+func RemoteLog(ctx context.Context, l model.Layout, id model.RunID, machine, stream string, tail int) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
 	}
 	args := []string{"logs", string(id)}
+	if machine != "" {
+		args = append(args, "--machine", machine)
+	}
 	if stream == "stderr" {
 		args = append(args, "--stderr")
 	}
@@ -285,12 +288,17 @@ func RemoteLog(ctx context.Context, l model.Layout, id model.RunID, stream strin
 }
 
 // RemoteGetArtifact proxies `vci artifacts get` and returns raw artifact bytes.
-func RemoteGetArtifact(ctx context.Context, l model.Layout, id model.RunID, rel string) ([]byte, bool, error) {
+func RemoteGetArtifact(ctx context.Context, l model.Layout, id model.RunID, machine, rel string) ([]byte, bool, error) {
 	host, remote, err := remoteTarget(l)
 	if err != nil || !remote {
 		return nil, remote, err
 	}
-	raw, err := runSSHRaw(ctx, host, buildRemoteCommand("artifacts", "get", string(id), rel))
+	cmdArgs := []string{"artifacts", "get"}
+	if machine != "" {
+		cmdArgs = append(cmdArgs, "--machine", machine)
+	}
+	cmdArgs = append(cmdArgs, string(id), rel)
+	raw, err := runSSHRaw(ctx, host, buildRemoteCommand(cmdArgs[0], cmdArgs[1:]...))
 	return raw, true, err
 }
 
@@ -585,7 +593,7 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 
 	warning, err := stageOrReconstruct(ctx, process.Native{}, machine, project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir)
 	if err != nil {
-		return runtime.Result{}, nil, false, "", err
+		return runtime.Result{}, nil, false, "", unavailableError(err)
 	}
 	argv, err := remoteArgv(machine, remoteWorkDir, project.Command)
 	if err != nil {
@@ -614,7 +622,10 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 			return result, nil, false, "", fmt.Errorf("collect remote artifacts: %w", err)
 		}
 	}
-	return result, collected, truncated, warning, runErr
+	if runErr != nil {
+		return result, collected, truncated, warning, unavailableError(runErr)
+	}
+	return result, collected, truncated, warning, nil
 }
 
 // selectExecutor selects runtime based on the snapshot's machine.

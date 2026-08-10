@@ -1,6 +1,6 @@
 //go:build !windows
 
-package cli
+package app
 
 import (
 	"fmt"
@@ -11,7 +11,10 @@ import (
 	"github.com/hypernewbie/vci/internal/model"
 )
 
-func spawnRun(id model.RunID) error {
+// Launch starts a detached worker that runs one target run to completion.
+// The dispatcher calls it once a target holds a scheduler reservation; the
+// worker owns the run from promotion to terminalization.
+func Launch(id model.RunID) error {
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve Vci executable: %w", err)

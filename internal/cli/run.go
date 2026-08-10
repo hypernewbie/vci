@@ -107,11 +107,7 @@ func dispatch(command string, args []string) (Response, int) {
 			if err != nil {
 				return appFailure(command, err), 2
 			}
-			if err := spawnRun(prepared.Record.ID); err != nil {
-				_ = app.Abandon(l, prepared.Record.ID)
-				return appFailure(command, err), 2
-			}
-			return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
+			return buildResponse(command, l, prepared.Record.ID)
 		}
 		// `build --hosted <project>` is a coordinator-only source
 		// mode. A client root proxies the command through ordinary
@@ -135,11 +131,7 @@ func dispatch(command string, args []string) (Response, int) {
 			if err != nil {
 				return appFailure(command, err), 2
 			}
-			if err := spawnRun(prepared.Record.ID); err != nil {
-				_ = app.Abandon(l, prepared.Record.ID)
-				return appFailure(command, err), 2
-			}
-			return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
+			return buildResponse(command, l, prepared.Record.ID)
 		}
 		remoteConfigured, remoteErr := app.RemoteConfigured(l)
 		if remoteErr != nil {
@@ -156,13 +148,7 @@ func dispatch(command string, args []string) (Response, int) {
 		if err != nil {
 			return appFailure(command, err), 2
 		}
-		if err := spawnRun(prepared.Record.ID); err != nil {
-			// Spawn failed: terminalize the prepared run and release
-			// its scheduler reservation so the slot is freed.
-			_ = app.Abandon(l, prepared.Record.ID)
-			return appFailure(command, err), 2
-		}
-		return Success(command, map[string]any{"run_id": prepared.Record.ID, "state": prepared.Record.State, "machine": prepared.Record.Machine}), 0
+		return buildResponse(command, l, prepared.Record.ID)
 	case "probe-seed":
 		if len(args) != 1 || !model.ValidName(args[0]) {
 			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "Usage: probe-seed <project>.", false)), 2

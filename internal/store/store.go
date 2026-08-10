@@ -37,6 +37,12 @@ type RunRecord struct {
 	QueuedAt                time.Time       `json:"queued_at"`
 	UpdatedAt               time.Time       `json:"updated_at"`
 	CancellationRequestedAt *time.Time      `json:"cancellation_requested_at,omitempty"`
+	// ParentRunID links a target run to the build request that created it.
+	// Empty for build requests and legacy single-machine runs.
+	ParentRunID model.RunID `json:"parent_run_id,omitempty"`
+	// Children lists the target run IDs of a build request, in the order
+	// the project attaches machines. Empty for target runs and legacy runs.
+	Children []model.RunID `json:"children,omitempty"`
 }
 
 type Store struct{ Layout model.Layout }
@@ -55,6 +61,101 @@ func NewRun(project, machine string, command []string, sourceDigest string, snap
 // reservation never exists without a record.
 func NewRunFromID(id model.RunID, project, machine string, command []string, sourceDigest string, snapshot any, now time.Time) (RunRecord, error) {
 	return newRun(id, project, machine, command, sourceDigest, snapshot, model.RunQueued, now)
+}
+
+// NewParentRun builds a build-request record that fans out to one target run
+// per attached machine. It carries no single machine; Children names the
+// target runs in machine-attach order.
+func NewParentRun(id model.RunID, project string, command []string, children []model.RunID, snapshot any, now time.Time) (RunRecord, error) {
+	r, err := newRun(id, project, "", command, "", snapshot, model.RunQueued, now)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	r.Children = append([]model.RunID(nil), children...)
+	return r, nil
+}
+
+// LoadQueuedChildren returns target runs that are queued and attached to a
+// build request. The scheduler has not yet launched them; the dispatcher
+// reserves a slot on each one's machine and spawns its worker.
+func (s Store) LoadQueuedChildren() ([]RunRecord, error) {
+	entries, err := os.ReadDir(s.Layout.RunsDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []RunRecord
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := model.RunID(entry.Name())
+		if !model.ValidRunID(id) {
+			continue
+		}
+		record, loadErr := s.Load(id)
+		if loadErr != nil {
+			continue
+		}
+		if record.State == model.RunQueued && record.ParentRunID != "" {
+			out = append(out, record)
+		}
+	}
+	return out, nil
+}
+
+// LoadChildren returns the target runs of a build request in stored order.
+func (s Store) LoadChildren(parent model.RunID) ([]RunRecord, error) {
+	parentRecord, err := s.Load(parent)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RunRecord, 0, len(parentRecord.Children))
+	for _, childID := range parentRecord.Children {
+		child, loadErr := s.Load(childID)
+		if loadErr != nil {
+			continue
+		}
+		out = append(out, child)
+	}
+	return out, nil
+}
+
+// AggregateState reduces a build request's target runs to one parent state and
+// a no-machine-responded flag. It returns RunAggregating while any target is
+// non-terminal. A failed, lost, or aborted target fails the request;
+// unavailable targets never do. When every target is unavailable the request
+// succeeds with NoMachineResponded set so the caller can surface it.
+func AggregateState(children []RunRecord, parentAborted bool) (model.RunState, bool) {
+	if parentAborted {
+		return model.RunAborted, false
+	}
+	var failed, lost, aborted, unavailable, terminal int
+	for _, c := range children {
+		if !model.IsTerminal(c.State) {
+			return model.RunAggregating, false
+		}
+		terminal++
+		switch c.State {
+		case model.RunFailed:
+			failed++
+		case model.RunLost:
+			lost++
+		case model.RunAborted:
+			aborted++
+		case model.RunUnavailable:
+			unavailable++
+		}
+	}
+	if terminal == 0 {
+		return model.RunAggregating, false
+	}
+	if failed > 0 || lost > 0 || aborted > 0 {
+		return model.RunFailed, false
+	}
+	return model.RunSucceeded, unavailable == terminal
 }
 
 // NewStagedRunFromID builds a RunRecord already in `staging` state
@@ -83,6 +184,16 @@ func newID(now time.Time) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("run_%x_%s", now.UnixNano(), hex.EncodeToString(random)), nil
+}
+
+// NewRunID mints one durable run id for a caller that must create related
+// records before persisting them, such as a build request and its targets.
+func NewRunID(now time.Time) (model.RunID, error) {
+	id, err := newID(now)
+	if err != nil {
+		return "", err
+	}
+	return model.RunID(id), nil
 }
 
 func (s Store) runDir(id model.RunID) (string, error) { return s.Layout.RunDir(string(id)) }

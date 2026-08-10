@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -88,42 +89,28 @@ func Prepare(ctx context.Context, l model.Layout, sourcePath string) (PreparedRu
 	}
 	now := time.Now().UTC()
 	runStore := store.Store{Layout: l}
-	// Reserve one machine and publish a staged run atomically.
-	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, "", buildDraftSnapshot(projectName, project, cfg), now)
+	parent, err := stageFanout(l, runStore, cfg, projectName, project, repo.Root, "", "", nil, now)
 	if err != nil {
 		return PreparedRun{}, err
 	}
-	var staged store.RunRecord
-	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
-		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, "", buildStagedSnapshot(projectName, project, machineName, cfg, "", nil), now)
-		if buildErr != nil {
-			return buildErr
-		}
-		record.SourcePath = repo.Root
-		if saveErr := runStore.Save(record); saveErr != nil {
-			return saveErr
-		}
-		staged = record
-		return nil
-	})
-	if err != nil {
-		return PreparedRun{}, err
-	}
-	return PreparedRun{Record: staged}, nil
+	return PreparedRun{Record: parent}, nil
 }
 
-// buildDraftSnapshot returns the pre-staging config snapshot.
-func buildDraftSnapshot(projectName string, project config.Project, cfg config.Config) map[string]any {
+// buildParentSnapshot returns the build-request config snapshot shared by
+// every target of one build.
+func buildParentSnapshot(projectName string, project config.Project, cfg config.Config) map[string]any {
 	return map[string]any{
 		"schema_version": config.SchemaVersion,
 		"project":        projectName,
 		"project_config": project,
+		"machines":       cfg.Machines,
 		"log_limits":     cfg.LogLimits,
 		"retention":      cfg.Retention,
 	}
 }
 
-// buildStagedSnapshot returns the staged config snapshot, optionally with source_provenance.
+// buildStagedSnapshot returns a target run's config snapshot, carrying the
+// machine it runs on and optional submitted-head/provenance provenance.
 func buildStagedSnapshot(projectName string, project config.Project, machineName string, cfg config.Config, sourceHead string, provenance map[string]any) map[string]any {
 	out := map[string]any{
 		"schema_version": config.SchemaVersion,
@@ -141,6 +128,59 @@ func buildStagedSnapshot(projectName string, project config.Project, machineName
 		out["source_provenance"] = provenance
 	}
 	return out
+}
+
+// stageFanout persists a build request and one queued target run per attached
+// machine, in configured order. Every target shares sourcePath read-only; the
+// parent carries it so a temp source is reaped once the request is done. A
+// persistence failure removes every record created so admission is atomic.
+func stageFanout(l model.Layout, runStore store.Store, cfg config.Config, projectName string, project config.Project, sourcePath, sourceDigest, sourceHead string, provenance map[string]any, now time.Time) (store.RunRecord, error) {
+	parentID, err := store.NewRunID(now)
+	if err != nil {
+		return store.RunRecord{}, err
+	}
+	childIDs := make([]model.RunID, len(project.Machines))
+	created := make([]model.RunID, 0, len(project.Machines))
+	for i, machine := range project.Machines {
+		childID, err := store.NewRunID(now)
+		if err != nil {
+			rollbackRuns(l, created)
+			return store.RunRecord{}, err
+		}
+		child, err := store.NewRunFromID(childID, projectName, machine, project.Command, sourceDigest, buildStagedSnapshot(projectName, project, machine, cfg, sourceHead, provenance), now)
+		if err != nil {
+			rollbackRuns(l, created)
+			return store.RunRecord{}, err
+		}
+		child.ParentRunID = parentID
+		child.SourcePath = sourcePath
+		if err := runStore.Save(child); err != nil {
+			rollbackRuns(l, created)
+			return store.RunRecord{}, err
+		}
+		childIDs[i] = child.ID
+		created = append(created, child.ID)
+	}
+	parent, err := store.NewParentRun(parentID, projectName, project.Command, childIDs, buildParentSnapshot(projectName, project, cfg), now)
+	if err != nil {
+		rollbackRuns(l, created)
+		return store.RunRecord{}, err
+	}
+	parent.SourcePath = sourcePath
+	if err := runStore.Save(parent); err != nil {
+		rollbackRuns(l, created)
+		return store.RunRecord{}, err
+	}
+	return parent, nil
+}
+
+// rollbackRuns removes run records created by a partially failed admission.
+func rollbackRuns(l model.Layout, ids []model.RunID) {
+	for _, id := range ids {
+		if dir, err := l.RunDir(string(id)); err == nil {
+			_ = os.RemoveAll(dir)
+		}
+	}
 }
 
 // PrepareHosted runs `vci build --hosted <project>`.
@@ -206,26 +246,11 @@ func PrepareHosted(ctx context.Context, l model.Layout, projectName string) (Pre
 	}
 	now := time.Now().UTC()
 	runStore := store.Store{Layout: l}
-	draftRecord, err := store.NewRun(projectName, project.Machines[0], project.Command, manifest.Digest, buildDraftSnapshot(projectName, project, cfg), now)
+	parent, err := stageFanout(l, runStore, cfg, projectName, project, "", manifest.Digest, validated.Commit, provenance, now)
 	if err != nil {
 		return PreparedRun{}, err
 	}
-	var staged store.RunRecord
-	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
-		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, buildStagedSnapshot(projectName, project, machineName, cfg, validated.Commit, provenance), now)
-		if buildErr != nil {
-			return buildErr
-		}
-		if saveErr := runStore.Save(record); saveErr != nil {
-			return saveErr
-		}
-		staged = record
-		return nil
-	})
-	if err != nil {
-		return PreparedRun{}, err
-	}
-	return PreparedRun{Record: staged}, nil
+	return PreparedRun{Record: parent}, nil
 }
 
 // submissionLCPath names the private per-run file that holds a submission's
@@ -287,36 +312,69 @@ func PrepareFromSubmission(ctx context.Context, l model.Layout, projectName stri
 		_ = os.RemoveAll(tempRoot)
 		return PreparedRun{}, err
 	}
-	lcPath, err := submissionLCPath(l, prepared.Record.ID)
-	if err != nil {
+	// The reconstructed source is shared by every target; the parent owns the
+	// temp root so the reaper removes it once the request is terminal.
+	runStore := store.Store{Layout: l}
+	parent := prepared.Record
+	parent.SourcePath = tempRoot
+	if err := runStore.Save(parent); err != nil {
 		_ = os.RemoveAll(tempRoot)
 		return PreparedRun{}, err
 	}
 	lcRC, err := source.PackageLC(sub.LocalChanges)
 	if err != nil {
-		_ = os.RemoveAll(tempRoot)
 		return PreparedRun{}, err
 	}
 	lcBytes, err := io.ReadAll(lcRC)
 	_ = lcRC.Close()
 	if err != nil {
-		_ = os.RemoveAll(tempRoot)
 		return PreparedRun{}, err
 	}
-	if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
-		_ = os.RemoveAll(tempRoot)
+	children, err := runStore.LoadChildren(parent.ID)
+	if err != nil {
 		return PreparedRun{}, err
 	}
-	return prepared, nil
+	for _, child := range children {
+		lcPath, err := submissionLCPath(l, child.ID)
+		if err != nil {
+			return PreparedRun{}, err
+		}
+		if err := os.WriteFile(lcPath, lcBytes, 0o600); err != nil {
+			return PreparedRun{}, err
+		}
+	}
+	return PreparedRun{Record: parent}, nil
 }
 
-// BuildFromSubmission reconstructs and runs a submission build to completion.
-func BuildFromSubmission(ctx context.Context, l model.Layout, projectName string, r io.Reader) (BuildResult, error) {
+// BuildFromSubmission reconstructs a submission, fans it out, and runs every
+// target to completion inline. It is a synchronous convenience for tests;
+// production builds dispatch detached workers and are polled.
+func BuildFromSubmission(ctx context.Context, l model.Layout, projectName string, r io.Reader) (BuildSummary, error) {
 	prepared, err := PrepareFromSubmission(ctx, l, projectName, r)
 	if err != nil {
-		return BuildResult{}, err
+		return BuildSummary{}, err
 	}
-	return ExecutePrepared(ctx, l, prepared.Record.ID)
+	cfg, err := config.Load(l.ConfigPath())
+	if err != nil {
+		return BuildSummary{}, err
+	}
+	runStore := store.Store{Layout: l}
+	children, _ := runStore.LoadChildren(prepared.Record.ID)
+	now := time.Now().UTC()
+	for _, child := range children {
+		if err := scheduler.Reserve(l, runStore, cfg, child.Machine, child.ID, now); err == nil {
+			_, _ = ExecutePrepared(ctx, l, child.ID)
+		}
+	}
+	view, err := BuildSummaryView(l, prepared.Record.ID)
+	if err != nil {
+		return BuildSummary{}, err
+	}
+	summary, ok := view.(BuildSummary)
+	if !ok {
+		return BuildSummary{}, fmt.Errorf("build %s produced an unexpected summary", prepared.Record.ID)
+	}
+	return summary, nil
 }
 
 // localSeed returns the configured local source checkout for a project: the
@@ -364,16 +422,39 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 	if err != nil {
 		return BuildResult{}, err
 	}
+	// A parent build request is a container; executing it runs its first target
+	// so callers that hold a parent run id (tests, `vci internal-run <parent>`)
+	// still observe a concrete result without a separate helper.
+	if len(record.Children) > 0 && record.Machine == "" {
+		cfg, cfgErr := config.Load(l.ConfigPath())
+		if cfgErr != nil {
+			return BuildResult{}, cfgErr
+		}
+		children, cErr := runStore.LoadChildren(id)
+		if cErr != nil || len(children) == 0 {
+			return BuildResult{}, fmt.Errorf("build %s has no targets to execute: %w", id, cErr)
+		}
+		if rErr := scheduler.Reserve(l, runStore, cfg, children[0].Machine, children[0].ID, time.Now().UTC()); rErr != nil {
+			return BuildResult{}, rErr
+		}
+		return ExecutePrepared(ctx, l, children[0].ID)
+	}
 	if record.State == model.RunAborted {
 		return BuildResult{}, fmt.Errorf("run %s was aborted", id)
-	}
-	// Only staging runs may start.
-	if record.State != model.RunStaging {
-		return BuildResult{}, fmt.Errorf("run %s is not in staging state (state=%s)", id, record.State)
 	}
 	// Verify the scheduler reservation before starting.
 	if _, err := scheduler.ReservationFor(l, record.Machine, id); err != nil {
 		return BuildResult{}, fmt.Errorf("scheduler reservation missing for %s on %s: %w", id, record.Machine, err)
+	}
+	// A target run is created queued and promoted to staging by its worker once
+	// it holds a reservation; a legacy staged run is already staging.
+	if record.State == model.RunQueued {
+		if record, err = runStore.Transition(id, model.RunStaging, time.Now().UTC()); err != nil {
+			return BuildResult{}, err
+		}
+	}
+	if record.State != model.RunStaging {
+		return BuildResult{}, fmt.Errorf("run %s is not in staging state (state=%s)", id, record.State)
 	}
 	defer func() { _ = scheduler.Release(l, record.Machine, id) }()
 	// Claim the worker lease so reaper and cancellation can track liveness.
@@ -427,7 +508,11 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		_, _ = runStore.Transition(id, model.RunLost, time.Now().UTC())
 		return BuildResult{}, err
 	}
-	defer cleanReconstructStaging(l, record.SourcePath)
+	// A target run shares an immutable source with its siblings; the parent
+	// owns any temp source for reaping. Only a legacy solo run cleans its own.
+	if record.ParentRunID == "" {
+		defer cleanReconstructStaging(l, record.SourcePath)
+	}
 	if cancellationRequested(runStore, id) {
 		_ = removeOwned(workspace)
 		_, _ = runStore.Transition(id, model.RunAborted, time.Now().UTC())
@@ -508,7 +593,11 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 	if cancelled {
 		state = model.RunAborted
 	} else if execErr != nil {
-		state, failure = model.RunFailed, "infrastructure"
+		if errors.Is(execErr, ErrTargetUnavailable) {
+			state, failure = model.RunUnavailable, "infrastructure"
+		} else {
+			state, failure = model.RunFailed, "infrastructure"
+		}
 	} else if execResult.ExitCode != 0 {
 		state, failure = model.RunFailed, "job"
 	}
@@ -575,20 +664,7 @@ func populateWorkspace(l model.Layout, record store.RunRecord, project config.Pr
 }
 
 func Check(l model.Layout, id model.RunID) (any, error) {
-	runStore := store.Store{Layout: l}
-	record, err := runStore.Load(id)
-	if err != nil {
-		return nil, err
-	}
-	if model.IsTerminal(record.State) {
-		if data, err := runStore.ReadResult(id); err == nil {
-			var result any
-			if json.Unmarshal(data, &result) == nil {
-				return result, nil
-			}
-		}
-	}
-	return record, nil
+	return BuildSummaryView(l, id)
 }
 
 func removeOwned(path string) error {

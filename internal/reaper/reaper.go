@@ -58,15 +58,23 @@ func Run(l model.Layout, now time.Time) (Report, error) {
 		if loadErr != nil {
 			continue
 		}
-		// Legacy queued records are not live without a lease; queueing occurs after staging.
-		// Mark as aborted (distinct counter) and let scheduler reap orphan claims.
+		// Legacy queued runs are not live without a lease; queueing occurs after
+		// staging. A parented target is legitimately queued until dispatched, so it
+		// is never reaped here; a stale reservation means its worker never started
+		// and is released for the next dispatch pass.
 		if record.State == model.RunQueued {
-			if store.ReadHasNoLease(l, id) {
-				if _, transitionErr := runStore.Transition(id, model.RunAborted, now); transitionErr == nil {
-					report.QueuedAborted++
+			if record.ParentRunID != "" {
+				if res, err := scheduler.ReservationFor(l, record.Machine, id); err == nil && now.Sub(res.CreatedAt) >= preStartGrace {
+					_ = scheduler.Release(l, record.Machine, id)
 				}
 				continue
 			}
+			if len(record.Children) == 0 && store.ReadHasNoLease(l, id) {
+				if _, transitionErr := runStore.Transition(id, model.RunAborted, now); transitionErr == nil {
+					report.QueuedAborted++
+				}
+			}
+			continue
 		}
 		// Only staging, running, and committing states can hold a live lease.
 		// Committing means publish is in progress; if lease is stale or
@@ -176,7 +184,61 @@ func Run(l model.Layout, now time.Time) (Report, error) {
 		report.ArtifactsReaped = reaped
 	}
 
+	aggregateParents(l, runStore, now)
 	return report, nil
+}
+
+// aggregateParents terminalizes build requests whose targets are all terminal,
+// removing the shared temp source once a request is done. A request stays
+// queued while any target is still running.
+func aggregateParents(l model.Layout, runStore store.Store, now time.Time) {
+	entries, err := os.ReadDir(l.RunsDir())
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		parent, err := runStore.Load(model.RunID(entry.Name()))
+		if err != nil || len(parent.Children) == 0 || model.IsTerminal(parent.State) {
+			continue
+		}
+		children, err := runStore.LoadChildren(parent.ID)
+		if err != nil {
+			continue
+		}
+		state, _ := store.AggregateState(children, parent.State == model.RunAborted)
+		if state == model.RunAggregating {
+			continue
+		}
+		// The parent is a container; its terminal state is set when all targets
+		// finish, bypassing the per-target CanTransition table via Mutate.
+		if _, err := runStore.Mutate(parent.ID, func(r *store.RunRecord) error {
+			if model.IsTerminal(r.State) {
+				return nil
+			}
+			r.State = state
+			r.UpdatedAt = now
+			return nil
+		}); err == nil {
+			cleanSharedSource(l, parent.SourcePath)
+		}
+	}
+}
+
+// cleanSharedSource removes a build request's shared temp source once the
+// request is terminal. It only removes paths inside the Vci temp directory so
+// a live source checkout is never touched.
+func cleanSharedSource(l model.Layout, sourcePath string) {
+	if sourcePath == "" {
+		return
+	}
+	rel, err := filepath.Rel(l.TempDir(), sourcePath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return
+	}
+	_ = os.RemoveAll(sourcePath)
 }
 
 // reapTransferDirs prunes TempDir subdirectories with prefixes vci-source-,

@@ -33,10 +33,32 @@ func runArtifacts(args []string) (any, *model.VciError) {
 	}
 }
 
+// extractMachine pulls the optional --machine <name> flag from args.
+func extractMachine(args []string) (string, []string, *model.VciError) {
+	out := make([]string, 0, len(args))
+	var machine string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--machine" {
+			if i+1 >= len(args) {
+				return "", nil, model.NewError("invalid_arguments", model.FailureUsage, "--machine requires a value.", false)
+			}
+			machine = args[i+1]
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return machine, out, nil
+}
+
 // runArtifactsList runs artifacts ls.
 // Returns files and truncated flag.
 // Remote responses pass through unchanged.
 func runArtifactsList(args []string) (any, *model.VciError) {
+	machine, args, verr := extractMachine(args)
+	if verr != nil {
+		return nil, verr
+	}
 	if len(args) != 1 || !model.ValidRunID(model.RunID(args[0])) {
 		return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: artifacts ls <run-id>.", false)
 	}
@@ -49,7 +71,11 @@ func runArtifactsList(args []string) (any, *model.VciError) {
 		return nil, artifactsError(remoteErr)
 	}
 	if remoteConfigured {
-		raw, _, remoteErr := app.RemoteCommand(context.Background(), l, "artifacts", "ls", args[0])
+		cmdArgs := []string{"ls", args[0]}
+		if machine != "" {
+			cmdArgs = append(cmdArgs, "--machine", machine)
+		}
+		raw, _, remoteErr := app.RemoteCommand(context.Background(), l, "artifacts", cmdArgs...)
 		if remoteErr != nil {
 			return nil, artifactsError(remoteErr)
 		}
@@ -62,7 +88,11 @@ func runArtifactsList(args []string) (any, *model.VciError) {
 		}
 		return resp.Data, nil
 	}
-	files, truncated, err := app.ListArtifacts(l, model.RunID(args[0]))
+	target, terr := app.ResolveTarget(l, model.RunID(args[0]), machine)
+	if terr != nil {
+		return nil, artifactsError(terr)
+	}
+	files, truncated, err := app.ListArtifacts(l, target)
 	if err != nil {
 		return nil, artifactsError(err)
 	}
@@ -73,11 +103,18 @@ func runArtifactsList(args []string) (any, *model.VciError) {
 // Writes raw artifact bytes on success.
 // On failure, writes a JSON error envelope.
 func runArtifactsGet(args []string, stdout, stderr io.Writer) int {
+	machine, args, verr := extractMachine(args)
+	if verr != nil {
+		return writeFailure(stdout, "artifacts", verr)
+	}
 	if len(args) != 3 || !model.ValidRunID(model.RunID(args[1])) {
 		return writeFailure(stdout, "artifacts", model.NewError("invalid_arguments", model.FailureUsage, "Usage: artifacts get <run-id> <rel>.", false))
 	}
 	id := model.RunID(args[1])
 	rel := args[2]
+	if err := app.ValidateArtifactRel(rel); err != nil {
+		return writeFailure(stdout, "artifacts", artifactsError(err))
+	}
 	l, err := resolveLayout()
 	if err != nil {
 		return writeFailure(stdout, "artifacts", artifactsError(err))
@@ -87,12 +124,11 @@ func runArtifactsGet(args []string, stdout, stderr io.Writer) int {
 		return writeFailure(stdout, "artifacts", artifactsError(remoteErr))
 	}
 	if remoteConfigured {
-		raw, _, remoteErr := app.RemoteGetArtifact(context.Background(), l, id, rel)
+		raw, _, remoteErr := app.RemoteGetArtifact(context.Background(), l, id, machine, rel)
 		if remoteErr != nil {
 			return writeFailure(stdout, "artifacts", artifactsError(remoteErr))
 		}
 		if verr, ok := errorEnvelope(raw); ok {
-			// Return JSON envelope errors instead of raw bytes.
 			return writeFailure(stdout, "artifacts", verr)
 		}
 		if _, err := stdout.Write(raw); err != nil {
@@ -101,7 +137,11 @@ func runArtifactsGet(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	reader, _, err := app.GetArtifact(l, id, rel)
+	target, terr := app.ResolveTarget(l, id, machine)
+	if terr != nil {
+		return writeFailure(stdout, "artifacts", artifactsError(terr))
+	}
+	reader, _, err := app.GetArtifact(l, target, rel)
 	if err != nil {
 		return writeFailure(stdout, "artifacts", artifactsError(err))
 	}
@@ -119,6 +159,9 @@ func artifactsError(err error) *model.VciError {
 		return model.NewError("not_found", model.FailureConfiguration, err.Error(), false)
 	}
 	if errors.Is(err, app.ErrInvalidArtifactPath) {
+		return model.NewError("invalid_arguments", model.FailureUsage, err.Error(), false)
+	}
+	if errors.Is(err, app.ErrTargetSelect) {
 		return model.NewError("invalid_arguments", model.FailureUsage, err.Error(), false)
 	}
 	code, class, message, retryable := classify(err)
@@ -158,7 +201,7 @@ const tailMax = 100000
 // runLogs streams selected logs to stdout.
 // Binary output is preserved; coordinator handles tailing.
 func runLogs(args []string, stdout, stderr io.Writer) int {
-	id, stream, tail, verr := parseLogsArgs(args)
+	id, stream, tail, machine, verr := parseLogsArgs(args)
 	if verr != nil {
 		return writeFailure(stdout, "logs", verr)
 	}
@@ -171,7 +214,7 @@ func runLogs(args []string, stdout, stderr io.Writer) int {
 		return writeFailure(stdout, "logs", logsError(remoteErr))
 	}
 	if remoteConfigured {
-		raw, _, remoteErr := app.RemoteLog(context.Background(), l, id, stream, tail)
+		raw, _, remoteErr := app.RemoteLog(context.Background(), l, id, machine, stream, tail)
 		if remoteErr != nil {
 			return writeFailure(stdout, "logs", logsError(remoteErr))
 		}
@@ -185,7 +228,11 @@ func runLogs(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	reader, _, err := app.ReadLog(l, id, stream)
+	target, terr := app.ResolveTarget(l, id, machine)
+	if terr != nil {
+		return writeFailure(stdout, "logs", logsError(terr))
+	}
+	reader, _, err := app.ReadLog(l, target, stream)
 	if err != nil {
 		return writeFailure(stdout, "logs", logsError(err))
 	}
@@ -210,32 +257,39 @@ func runLogs(args []string, stdout, stderr io.Writer) int {
 }
 
 // parseLogsArgs parses `vci logs` arguments and validates usage.
-func parseLogsArgs(args []string) (model.RunID, string, int, *model.VciError) {
+func parseLogsArgs(args []string) (model.RunID, string, int, string, *model.VciError) {
 	if len(args) == 0 || !model.ValidRunID(model.RunID(args[0])) {
-		return "", "", 0, model.NewError("invalid_arguments", model.FailureUsage, "Usage: logs <run-id> [--stderr] [--tail <n>].", false)
+		return "", "", 0, "", model.NewError("invalid_arguments", model.FailureUsage, "Usage: logs <run-id> [--machine <name>] [--stderr] [--tail <n>].", false)
 	}
 	id := model.RunID(args[0])
 	stream := "stdout"
 	tail := 0
+	var machine string
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--stderr":
 			stream = "stderr"
+		case "--machine":
+			if i+1 >= len(args) {
+				return "", "", 0, "", model.NewError("invalid_arguments", model.FailureUsage, "--machine requires a value.", false)
+			}
+			machine = args[i+1]
+			i++
 		case "--tail":
 			if i+1 >= len(args) {
-				return "", "", 0, model.NewError("invalid_arguments", model.FailureUsage, "--tail requires a value between 1 and 100000.", false)
+				return "", "", 0, "", model.NewError("invalid_arguments", model.FailureUsage, "--tail requires a value between 1 and 100000.", false)
 			}
 			n, err := strconv.Atoi(args[i+1])
 			if err != nil || n < tailMin || n > tailMax {
-				return "", "", 0, model.NewError("invalid_arguments", model.FailureUsage, "--tail must be an integer between 1 and 100000.", false)
+				return "", "", 0, "", model.NewError("invalid_arguments", model.FailureUsage, "--tail must be an integer between 1 and 100000.", false)
 			}
 			tail = n
 			i++
 		default:
-			return "", "", 0, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown logs flag %q.", args[i]), false)
+			return "", "", 0, "", model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown logs flag %q.", args[i]), false)
 		}
 	}
-	return id, stream, tail, nil
+	return id, stream, tail, machine, nil
 }
 
 // tailLines returns the last n lines, emulating tail -n.
@@ -270,6 +324,9 @@ func logsError(err error) *model.VciError {
 		return model.NewError("not_found", model.FailureConfiguration, err.Error(), false)
 	}
 	if errors.Is(err, app.ErrInvalidLogStream) {
+		return model.NewError("invalid_arguments", model.FailureUsage, err.Error(), false)
+	}
+	if errors.Is(err, app.ErrTargetSelect) {
 		return model.NewError("invalid_arguments", model.FailureUsage, err.Error(), false)
 	}
 	code, class, message, retryable := classify(err)

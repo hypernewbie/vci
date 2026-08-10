@@ -351,3 +351,9 @@ func validateArtifactRel(rel string) error {
 	}
 	return nil
 }
+
+// ValidateArtifactRel exposes the artifact path validator for callers that
+// must reject a path before opening a run record.
+func ValidateArtifactRel(rel string) error {
+	return validateArtifactRel(rel)
+}

@@ -125,7 +125,11 @@ func TestPrepareFromSubmissionPersistsLocalChangesArchive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare from submission: %v", err)
 	}
-	lcPath, err := submissionLCPath(l, prepared.Record.ID)
+	children, err := (store.Store{Layout: l}).LoadChildren(prepared.Record.ID)
+	if err != nil || len(children) == 0 {
+		t.Fatalf("no children: %v", err)
+	}
+	lcPath, err := submissionLCPath(l, children[0].ID)
 	if err != nil {
 		t.Fatalf("lc path: %v", err)
 	}
@@ -419,6 +423,6 @@ func TestBuildFromSubmissionReconstructsFromSeedBundleAndLocalChanges(t *testing
 		t.Fatalf("build from submission: %v", err)
 	}
 	if result.State != model.RunSucceeded {
-		t.Fatalf("expected reconstructed build to succeed; state=%s failure=%s", result.State, result.Failure)
+		t.Fatalf("expected reconstructed build to succeed; state=%s", result.State)
 	}
 }

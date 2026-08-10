@@ -164,6 +164,45 @@ func ReserveAndPublish(l model.Layout, loader recordLoader, cfg config.Config, r
 	})
 }
 
+// Reserve claims one slot on a named machine for runID when capacity is
+// available, under the same cross-process lock as ReserveAndPublish. Unlike
+// ReserveAndPublish it does not choose among candidates or publish a record;
+// the caller has already persisted the target run. A busy machine returns
+// ErrNoCapacity so the caller leaves the run queued for a later dispatch.
+func Reserve(l model.Layout, loader recordLoader, cfg config.Config, machine string, runID model.RunID, now time.Time) error {
+	if !model.ValidName(machine) {
+		return fmt.Errorf("scheduler: invalid machine name %q", machine)
+	}
+	if !model.ValidRunID(runID) {
+		return fmt.Errorf("scheduler: invalid run id %q", runID)
+	}
+	if _, ok := cfg.Machines[machine]; !ok {
+		return fmt.Errorf("scheduler: machine %q is not in the inventory", machine)
+	}
+	now = now.UTC()
+	if now.After(time.Now().UTC().Add(time.Minute)) {
+		return fmt.Errorf("scheduler: now is in the future; refused to publish a doomed claim")
+	}
+	return withLock(l, func() error {
+		claimRoot := l.MachineClaimsDir()
+		if _, err := reapClaims(l, claimRoot, loader); err != nil {
+			return fmt.Errorf("scheduler: reap claims: %w", err)
+		}
+		active, err := countActiveByMachine(claimRoot)
+		if err != nil {
+			return fmt.Errorf("scheduler: count active: %w", err)
+		}
+		if active[machine] >= config.EffectiveCapacity(cfg.Machines[machine]) {
+			return ErrNoCapacity
+		}
+		claim := Claim{SchemaVersion: ClaimSchemaVersion, Machine: machine, RunID: string(runID), CreatedAt: now}
+		if err := writeClaim(l, machine, claim); err != nil {
+			return fmt.Errorf("scheduler: write claim: %w", err)
+		}
+		return nil
+	})
+}
+
 // Release removes the exact (machine, runID) claim.
 // The file must be validated before deletion.
 // Missing claims are ignored; invalid claims fail fast.

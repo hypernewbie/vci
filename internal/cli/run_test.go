@@ -93,11 +93,9 @@ func TestRunRejectsMalformedRunIDsAcrossCommands(t *testing.T) {
 	}
 }
 
-// TestLocalBuildDataIncludesMachine pins that a successful local
-// build response carries the selected machine name. The machine is
-// the public coordinate the client uses to map an accepted run id
-// back to a coordinator-local slot. Without it, only the run record
-// reveals the choice — which is private coordinator state.
+// TestLocalBuildDataIncludesMachine pins that a successful local build
+// response reports the attached target machines so a client can map the
+// accepted run id back to the slots the coordinator will run.
 func TestLocalBuildDataIncludesMachine(t *testing.T) {
 	prevRoot, hadRoot := os.LookupEnv("VCI_ROOT")
 	tmp := t.TempDir()
@@ -154,30 +152,22 @@ func TestLocalBuildDataIncludesMachine(t *testing.T) {
 	var data struct {
 		RunID   string `json:"run_id"`
 		State   string `json:"state"`
-		Machine string `json:"machine"`
+		Targets []struct {
+			Machine string `json:"machine"`
+			State   string `json:"state"`
+		} `json:"targets"`
 	}
-	switch v := got.Data.(type) {
-	case []byte:
-		if err := json.Unmarshal(v, &data); err != nil {
-			t.Fatalf("data decode: %v", err)
-		}
-	case map[string]any:
-		if id, ok := v["run_id"].(string); ok {
-			data.RunID = id
-		}
-		if state, ok := v["state"].(string); ok {
-			data.State = state
-		}
-		if machine, ok := v["machine"].(string); ok {
-			data.Machine = machine
-		}
-	default:
-		t.Fatalf("data is %T, want []byte or map[string]any", v)
+	raw, err := json.Marshal(got.Data)
+	if err != nil {
+		t.Fatalf("encode data: %v", err)
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatalf("data decode: %v", err)
 	}
 	if !strings.HasPrefix(data.RunID, "run_") {
 		t.Fatalf("missing run_id: %+v", data)
 	}
-	if data.Machine != "alpha" {
-		t.Fatalf("machine must be 'alpha', got %q", data.Machine)
+	if len(data.Targets) != 1 || data.Targets[0].Machine != "alpha" {
+		t.Fatalf("expected one target machine 'alpha', got %+v", data.Targets)
 	}
 }
