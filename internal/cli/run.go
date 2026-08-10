@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/hypernewbie/vci/internal/app"
 	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/store"
 )
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -207,8 +210,55 @@ func dispatch(command string, args []string) (Response, int) {
 			return Failure(command, artErr), 2
 		}
 		return Success(command, data), 0
+	case "wait-ready":
+		return runWaitReady(args)
 	default:
 		return Failure(command, model.NewError("unknown_command", model.FailureUsage, fmt.Sprintf("Command %q is not recognized.", command), false)), 2
+	}
+}
+
+// runWaitReady blocks until the coordinator has no live build. It is the
+// way callers line up behind single-flight admission so that `vci build`
+// on a busy coordinator does not need to poll on its own.
+func runWaitReady(args []string) (Response, int) {
+	const command = "wait-ready"
+	interval := 1 * time.Second
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--interval":
+			if i+1 >= len(args) {
+				return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "--interval requires a value.", false)), 2
+			}
+			secs, err := strconv.Atoi(args[i+1])
+			if err != nil || secs < 1 || secs > 3600 {
+				return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, "--interval must be an integer between 1 and 3600 seconds.", false)), 2
+			}
+			interval = time.Duration(secs) * time.Second
+			i++
+		default:
+			return Failure(command, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown wait-ready flag %q.", args[i]), false)), 2
+		}
+	}
+	l, err := resolveLayout()
+	if err != nil {
+		return appFailure(command, err), 2
+	}
+	remoteConfigured, remoteErr := app.RemoteConfigured(l)
+	if remoteErr != nil {
+		return appFailure(command, remoteErr), 2
+	}
+	if remoteConfigured {
+		raw, _, remoteErr := app.RemoteCommand(context.Background(), l, command, args...)
+		if remoteErr != nil {
+			return appFailure(command, remoteErr), 2
+		}
+		return decodeRemoteResponse(command, raw)
+	}
+	for {
+		if _, busy := (store.Store{Layout: l}).HasLiveBuild(); !busy {
+			return Success(command, map[string]any{"ready": true, "interval_seconds": int(interval.Seconds())}), 0
+		}
+		time.Sleep(interval)
 	}
 }
 

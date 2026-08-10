@@ -27,7 +27,7 @@ func Parse(args []string) (Command, *model.VciError) {
 	}
 	name := args[0]
 	switch name {
-	case "build", "check", "watch", "abort", "projects", "machines", "setup", "internal-run", "artifacts", "logs", "probe-seed":
+	case "build", "check", "watch", "abort", "projects", "machines", "setup", "internal-run", "artifacts", "logs", "probe-seed", "wait-ready":
 		return Command{Name: name, Args: append([]string(nil), args[1:]...)}, nil
 	default:
 		return Command{}, model.NewError("unknown_command", model.FailureUsage, fmt.Sprintf("Command %q is not recognized.", name), false)
@@ -90,6 +90,10 @@ func classify(err error) (string, model.FailureClass, string, bool) {
 	code, class, retryable := "operation_failed", model.FailureConfiguration, false
 	if errors.Is(err, scheduler.ErrNoCapacity) {
 		return "machine_unavailable", model.FailureState, message, true
+	}
+	var busy app.ErrBuildBusy
+	if errors.As(err, &busy) {
+		return "coordinator_busy", model.FailureState, busy.Error(), true
 	}
 	if errors.Is(err, source.ErrSubmoduleUnavailable) {
 		return "submodule_unavailable", model.FailureConfiguration, message, false

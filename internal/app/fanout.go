@@ -194,3 +194,31 @@ func ResolveTarget(l model.Layout, id model.RunID, machine string) (model.RunID,
 	}
 	return "", fmt.Errorf("%w: machine %q is not a target of run %s", ErrTargetSelect, machine, record.ID)
 }
+
+// ErrBuildBusy marks a build admission that was rejected because the
+// coordinator already has a build in flight. Live names the parent build
+// request that owns the busy state so the operator can wait for the right
+// thing.
+type ErrBuildBusy struct{ Live model.RunID }
+
+func (e ErrBuildBusy) Error() string {
+	return fmt.Sprintf("coordinator is running another build (%s); run \"vci wait-ready\" to block until it finishes", e.Live)
+}
+
+// admitAndStage serializes build admission. It takes the scheduler lock,
+// rejects with ErrBuildBusy when a live build is in flight, and otherwise
+// runs stage to persist the new build request. Holding the lock across the
+// busy check and record creation prevents two concurrent submissions from
+// both passing the check. DispatchPending takes the same lock independently,
+// so the lock is released before stage returns.
+func admitAndStage(l model.Layout, stage func() (store.RunRecord, error)) (store.RunRecord, error) {
+	unlock, err := store.Acquire(l.SchedulerLockPath())
+	if err != nil {
+		return store.RunRecord{}, err
+	}
+	defer unlock()
+	if live, busy := (store.Store{Layout: l}).HasLiveBuild(); busy {
+		return store.RunRecord{}, ErrBuildBusy{Live: live}
+	}
+	return stage()
+}

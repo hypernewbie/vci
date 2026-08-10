@@ -62,34 +62,35 @@ func Prepare(ctx context.Context, l model.Layout, sourcePath string) (PreparedRu
 	if err := l.Ensure(); err != nil {
 		return PreparedRun{}, err
 	}
-	cfg, err := config.Load(l.ConfigPath())
-	if err != nil {
-		return PreparedRun{}, err
-	}
-	repo, err := source.Discover(ctx, sourcePath, process.Native{})
-	if err != nil {
-		return PreparedRun{}, err
-	}
-	projectNames := make([]string, 0, len(cfg.Projects))
-	for name := range cfg.Projects {
-		projectNames = append(projectNames, name)
-	}
-	projectName, err := source.MatchProject(repo.Name, projectNames)
-	if err != nil {
-		return PreparedRun{}, err
-	}
-	project := cfg.Projects[projectName]
-	if len(project.Machines) == 0 {
-		return PreparedRun{}, fmt.Errorf("project %q has no attached machines", projectName)
-	}
-
-	// Reject uninitialized submodules and bad LFS pointers before staging.
-	if _, err := source.SelectBuildInput(ctx, repo.Root, process.Native{}); err != nil {
-		return PreparedRun{}, err
-	}
-	now := time.Now().UTC()
-	runStore := store.Store{Layout: l}
-	parent, err := stageFanout(l, runStore, cfg, projectName, project, repo.Root, "", "", nil, now)
+	parent, err := admitAndStage(l, func() (store.RunRecord, error) {
+		cfg, err := config.Load(l.ConfigPath())
+		if err != nil {
+			return store.RunRecord{}, err
+		}
+		repo, err := source.Discover(ctx, sourcePath, process.Native{})
+		if err != nil {
+			return store.RunRecord{}, err
+		}
+		projectNames := make([]string, 0, len(cfg.Projects))
+		for name := range cfg.Projects {
+			projectNames = append(projectNames, name)
+		}
+		projectName, err := source.MatchProject(repo.Name, projectNames)
+		if err != nil {
+			return store.RunRecord{}, err
+		}
+		project := cfg.Projects[projectName]
+		if len(project.Machines) == 0 {
+			return store.RunRecord{}, fmt.Errorf("project %q has no attached machines", projectName)
+		}
+		// Reject uninitialized submodules and bad LFS pointers before staging.
+		if _, err := source.SelectBuildInput(ctx, repo.Root, process.Native{}); err != nil {
+			return store.RunRecord{}, err
+		}
+		now := time.Now().UTC()
+		runStore := store.Store{Layout: l}
+		return stageFanout(l, runStore, cfg, projectName, project, repo.Root, "", "", nil, now)
+	})
 	if err != nil {
 		return PreparedRun{}, err
 	}
@@ -246,7 +247,9 @@ func PrepareHosted(ctx context.Context, l model.Layout, projectName string) (Pre
 	}
 	now := time.Now().UTC()
 	runStore := store.Store{Layout: l}
-	parent, err := stageFanout(l, runStore, cfg, projectName, project, "", manifest.Digest, validated.Commit, provenance, now)
+	parent, err := admitAndStage(l, func() (store.RunRecord, error) {
+		return stageFanout(l, runStore, cfg, projectName, project, "", manifest.Digest, validated.Commit, provenance, now)
+	})
 	if err != nil {
 		return PreparedRun{}, err
 	}

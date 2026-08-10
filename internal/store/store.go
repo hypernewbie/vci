@@ -123,6 +123,39 @@ func (s Store) LoadChildren(parent model.RunID) ([]RunRecord, error) {
 	return out, nil
 }
 
+// HasLiveBuild reports whether any target run is still executing. It returns
+// the parent build request id when one is live so admission callers can name
+// the busy build in their rejection. A target is live while it is queued,
+// staging, running, or committing; once every target of a build is terminal
+// the build is effectively done even before the reaper records it.
+func (s Store) HasLiveBuild() (model.RunID, bool) {
+	entries, err := os.ReadDir(s.Layout.RunsDir())
+	if err != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		var meta struct {
+			State       model.RunState `json:"state"`
+			ParentRunID model.RunID    `json:"parent_run_id"`
+		}
+		data, err := os.ReadFile(filepath.Join(s.Layout.RunsDir(), entry.Name(), "run.json"))
+		if err != nil {
+			continue
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if meta.ParentRunID == "" || model.IsTerminal(meta.State) {
+			continue
+		}
+		return meta.ParentRunID, true
+	}
+	return "", false
+}
+
 // AggregateState reduces a build request's target runs to one parent state and
 // a no-machine-responded flag. It returns RunAggregating while any target is
 // non-terminal. A failed, lost, or aborted target fails the request;
