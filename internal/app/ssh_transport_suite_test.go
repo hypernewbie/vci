@@ -258,13 +258,28 @@ func TestStagedTreeRecognizedBySourceDiscover(t *testing.T) {
 	if err := json.Unmarshal(env.Data, &data); err != nil {
 		t.Fatalf("json decode run_id: %v", err)
 	}
+	// A fan-out parent's persisted state stays `queued` until the
+	// reaper terminalizes it; the live aggregate is recomputed on
+	// demand by the coordinator's `check` path. Poll the public
+	// envelope, not the on-disk parent record.
 	deadline := time.Now().Add(20 * time.Second)
-	for remoteCheckState(t, fixture, data.RunID) != "succeeded" {
+	for {
 		if time.Now().After(deadline) {
 			t.Fatalf("remote build %s did not succeed", data.RunID)
 		}
-		if remoteCheckState(t, fixture, data.RunID) == "failed" {
-			t.Fatalf("remote build %s failed against the staged tree", data.RunID)
+		checkEnv := runClientBinary(t, fixture, clientRoot, "check", data.RunID)
+		if checkEnv.OK {
+			var checkData struct {
+				State string `json:"state"`
+			}
+			if jerr := json.Unmarshal(checkEnv.Data, &checkData); jerr == nil {
+				if checkData.State == "succeeded" {
+					break
+				}
+				if checkData.State == "failed" {
+					t.Fatalf("remote build %s failed against the staged tree", data.RunID)
+				}
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

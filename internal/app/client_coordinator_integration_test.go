@@ -541,31 +541,6 @@ func assertTargetsCover(t *testing.T, s submission, machines ...string) {
 	}
 }
 
-// remoteCheckState returns the coordinator run state for runID, or "" if absent.
-func remoteCheckState(t *testing.T, fixture *SSHFixture, runID string) string {
-	t.Helper()
-	dir := filepath.Join(fixture.coordinatorRoot, "state", "runs", runID)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	if len(entries) == 0 {
-		return ""
-	}
-	recordPath := filepath.Join(dir, "run.json")
-	data, err := os.ReadFile(recordPath)
-	if err != nil {
-		return ""
-	}
-	var rec struct {
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return ""
-	}
-	return rec.State
-}
-
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
