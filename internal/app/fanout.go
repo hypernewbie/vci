@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -33,11 +34,12 @@ func unavailableError(err error) error {
 
 // TargetView is one machine's public outcome in a build summary.
 type TargetView struct {
-	Machine  string         `json:"machine"`
-	State    model.RunState `json:"state"`
-	ExitCode int            `json:"exit_code,omitempty"`
-	Failure  string         `json:"failure,omitempty"`
-	Warnings []string       `json:"warnings,omitempty"`
+	Machine      string         `json:"machine"`
+	State        model.RunState `json:"state"`
+	ExitCode     int            `json:"exit_code,omitempty"`
+	Failure      string         `json:"failure,omitempty"`
+	ErrorContext string         `json:"error_context,omitempty"`
+	Warnings     []string       `json:"warnings,omitempty"`
 }
 
 // BuildSummary is the public aggregate for a build request.
@@ -92,6 +94,14 @@ func parentSummary(l model.Layout, parent store.RunRecord) (BuildSummary, error)
 					tv.Warnings = r.Warnings
 				}
 			}
+			// A failed or lost target carries the last lines of stderr
+			// inline so the caller sees the failure reason without a
+			// separate `vci logs` round trip. Gone for terminal
+			// successes, aborts, and unavailable targets — their
+			// context is either empty or already explained by state.
+			if child.State == model.RunFailed || child.State == model.RunLost {
+				tv.ErrorContext = tailErrorContext(l, child.ID)
+			}
 		}
 		switch child.State {
 		case model.RunSucceeded:
@@ -117,6 +127,43 @@ func parentSummary(l model.Layout, parent store.RunRecord) (BuildSummary, error)
 		sum.Warnings = append(sum.Warnings, fmt.Sprintf("%d of %d machines unavailable", sum.Unavailable, len(children)))
 	}
 	return sum, nil
+}
+
+// tailErrorContext returns the last few lines of a failed run's log
+// for inline display in the public check summary. It reads stderr
+// first and falls back to stdout when stderr is empty, since some
+// failure shapes (compile errors, script aborts) live on stderr and
+// others (test failures from `go test`) live on stdout. The output is
+// capped so a runaway log cannot bloat the summary. Mirrors `gh run
+// view`'s inline failure context: enough to recognise the error
+// without a separate log fetch.
+func tailErrorContext(l model.Layout, id model.RunID) string {
+	if data := tailLogStream(l, id, "stderr"); data != "" {
+		return data
+	}
+	return tailLogStream(l, id, "stdout")
+}
+
+func tailLogStream(l model.Layout, id model.RunID, stream string) string {
+	reader, _, err := ReadLog(l, id, stream)
+	if err != nil {
+		return ""
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	const maxBytes = 4096
+	if len(data) > maxBytes {
+		data = data[len(data)-maxBytes:]
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	const maxLines = 20
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func legacySummary(l model.Layout, record store.RunRecord) (any, error) {

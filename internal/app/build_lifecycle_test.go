@@ -446,3 +446,65 @@ func TestBuildFromSubmissionReconstructsFromSeedBundleAndLocalChanges(t *testing
 		t.Fatalf("expected reconstructed build to succeed; state=%s", result.State)
 	}
 }
+
+// TestCheckSummaryCarriesFailedTargetErrorContext proves that a failed
+// target's last stderr lines are carried in the public check summary so
+// callers see the failure reason without a separate `vci logs` round
+// trip. Mirrors `gh run view`'s inline failure context.
+func TestCheckSummaryCarriesFailedTargetErrorContext(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "ctx-fixture")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"go.mod":       "module fixture/ctx\n\ngo 1.26\n",
+		"main.go":      "package main\nfunc main() {}\n",
+		"main_test.go": "package main\nimport \"testing\"\nfunc TestFailure(t *testing.T) { t.Fatal(\"expected fixture failure\") }\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := (process.Native{}).Run(context.Background(), process.Command{Executable: "git", Args: []string{"init", "-q", repo}}); err != nil {
+		t.Fatal(err)
+	}
+	l := model.Layout{Root: filepath.Join(t.TempDir(), ".vci")}
+	if err := Initialize(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddMachine(l, "mac-local", config.Machine{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddProject(l, "ctx-fixture", config.Project{Machines: []string{"mac-local"}, Command: []string{"go", "test", "./..."}}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, prepErr := Prepare(context.Background(), l, repo)
+	if prepErr != nil {
+		t.Fatal(prepErr)
+	}
+	if _, err := ExecutePrepared(context.Background(), l, prepared.Record.ID); err != nil {
+		t.Fatal(err)
+	}
+	view, err := BuildSummaryView(l, prepared.Record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, ok := view.(BuildSummary)
+	if !ok {
+		t.Fatalf("view returned %T, want BuildSummary", view)
+	}
+	if len(summary.Targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(summary.Targets))
+	}
+	target := summary.Targets[0]
+	if target.State != model.RunFailed {
+		t.Fatalf("target state: %s", target.State)
+	}
+	if target.ErrorContext == "" {
+		t.Fatalf("failed target must carry error_context; got %+v", target)
+	}
+	if !strings.Contains(target.ErrorContext, "expected fixture failure") {
+		t.Fatalf("error_context should contain the test failure message; got %q", target.ErrorContext)
+	}
+}
