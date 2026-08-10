@@ -1,6 +1,6 @@
 ---
 name: vci-orchestrator
-description: Configure a Vci coordinator workspace or client orchestrator profile. Use when the user asks to initialize Vci state, configure the coordinator root, add or remove Vci machines or projects, set machine capacity/runtime/host, or point a client root at an already-working SSH coordinator. Do not use for running builds or diagnosing SSH/network access.
+description: Configure a Vci coordinator workspace or client orchestrator profile. Use when the user asks to initialize Vci state, configure the coordinator root, add or remove Vci machines or projects, set machine capacity/runtime/host or source-path seed, set project exclusions, or point a client root at an already-working SSH coordinator. Do not use for running builds or diagnosing SSH/network access.
 ---
 
 # Vci coordinator and workspace configuration
@@ -87,6 +87,27 @@ Do not remove a machine until `vci projects` confirms no project still uses it:
 VCI_ROOT=/absolute/vci-root vci setup machine remove <machine>
 ```
 
+### Source-path seed
+
+A machine's per-project source path is the local checkout Vci reconciles
+against instead of transferring the full tree. Set it with `setup machine
+update`, one `--source-path project=path` per project:
+
+```sh
+VCI_ROOT=/absolute/vci-root vci setup machine update mac-local \
+  --source-path my-repo=/Users/me/code/my-repo
+```
+
+An unset source path means the project has no local seed on that machine, so a
+remote worker falls back to its bounded bundle cache. `setup machine update`
+currently only sets source paths; it does not change host, runtime, image, or
+capacity.
+
+A machine's bundle-cache policy (`bundle_cache.max_entries`,
+`bundle_cache.max_bytes`, `bundle_cache.admission_bytes`) is coordinator
+configuration the public setup CLI does not expose. Report a requested policy
+change as not exposed by this setup interface rather than editing TOML by hand.
+
 ### Add projects
 
 A project names the checkout directory and the approved command Vci runs.
@@ -107,6 +128,18 @@ VCI_ROOT=/absolute/vci-root vci setup project add my-repo \
   --command make --arg test \
   --artifact 'build/*.zip'
 ```
+
+Hard workspace exclusions are coordinator-owned path globs removed from the
+reconstructed workspace before the build command runs. Set them with `setup
+project update`, repeating `--exclude`:
+
+```sh
+VCI_ROOT=/absolute/vci-root vci setup project update my-repo \
+  --exclude '.env' --exclude 'secrets/*'
+```
+
+`setup project update` currently only sets exclusions; it does not change
+machines, command, args, or artifacts.
 
 The public setup CLI does not set project environment variables. Do not edit
 TOML by hand to invent a workflow; report that the requested environment
