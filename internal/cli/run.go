@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hypernewbie/vci/internal/app"
@@ -43,6 +44,15 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if parsed.Name == "watch" {
 		return runWatch(parsed.Args, stdout, stderr)
+	}
+	// Internal worker commands (`internal-stage`, `internal-probe-cache`,
+	// `internal-acquire-claim`, `internal-release-claim`, `internal-reap-cache`,
+	// `internal-reconstruct`) speak plain stdout/stderr and an exit code so
+	// the SSH layer can map a non-zero exit to a remote-exit error without
+	// parsing a JSON envelope. The detached worker's `internal-run` stays on
+	// the JSON envelope path above.
+	if strings.HasPrefix(parsed.Name, "internal-") && parsed.Name != "internal-run" {
+		return runInternalCommand(parsed.Name, parsed.Args, os.Stdin, stdout, stderr)
 	}
 	response, exitCode := dispatch(parsed.Name, parsed.Args)
 	if err := Write(stdout, response); err != nil {

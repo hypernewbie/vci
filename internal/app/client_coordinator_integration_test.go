@@ -18,8 +18,8 @@ import (
 	"time"
 )
 
-// phase1Envelope is the minimal Vci response shape used by every integration assertion.
-type phase1Envelope struct {
+// clientEnvelope is the minimal Vci response shape used by every integration assertion.
+type clientEnvelope struct {
 	SchemaVersion int             `json:"schema_version"`
 	Command       string          `json:"command"`
 	OK            bool            `json:"ok"`
@@ -34,7 +34,7 @@ type phase1Envelope struct {
 
 const modelSchemaVersion = 1
 
-func runClientBinary(t *testing.T, fixture *SSHFixture, clientRoot string, args ...string) phase1Envelope {
+func runClientBinary(t *testing.T, fixture *SSHFixture, clientRoot string, args ...string) clientEnvelope {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -51,7 +51,7 @@ func runClientBinary(t *testing.T, fixture *SSHFixture, clientRoot string, args 
 		t.Logf("client run stderr:\n%s", stderr)
 		t.Fatalf("client binary %v exited with %v", args, err)
 	}
-	var env phase1Envelope
+	var env clientEnvelope
 	if jerr := json.Unmarshal([]byte(stdout.String()), &env); jerr != nil {
 		t.Logf("client run stderr:\n%s", stderr)
 		t.Fatalf("client did not return one Vci JSON document for %v: %v\nstdout:\n%s", args, jerr, stdout)
@@ -76,7 +76,7 @@ func initCoordinatorRootWithCapacity(t *testing.T, fixture *SSHFixture, capacity
 	}
 	body := "schema_version = 1\norchestrator = \"self\"\n\n[log_limits]\nstdout_bytes = 4194304\nstderr_bytes = 4194304\n\n[retention]\nmax_bytes = 536870912\n\n[machines.mac-local]\n" + capLine + "\n[projects.demo]\nmachines = [\"mac-local\"]\ncommand = [" + tomlSlice(allArgs) + "]\n"
 	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
-		t.Fatalf("phase1: write coordinator config: %v", err)
+		t.Fatalf("write  coordinator config: %v", err)
 	}
 }
 
@@ -100,12 +100,12 @@ func initClientRoot(t *testing.T, fixture *SSHFixture, alias string) string {
 	base := fixture.t.TempDir()
 	root := filepath.Join(base, "vci")
 	if err := os.MkdirAll(filepath.Join(root, "state", "tmp"), 0o700); err != nil {
-		t.Fatalf("phase1: mkdir client state: %v", err)
+		t.Fatalf("mkdir  client state: %v", err)
 	}
 	cfg := filepath.Join(root, "config.toml")
 	body := "schema_version = 1\norchestrator = \"" + alias + "\"\n"
 	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
-		t.Fatalf("phase1: write client config: %v", err)
+		t.Fatalf("write  client config: %v", err)
 	}
 	return root
 }
@@ -116,7 +116,7 @@ func TestClientMachinesProxiesToCoordinator(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := fixture.waitForSSHRoundtrip(ctx); err != nil {
-		t.Fatalf("phase1 ssh roundtrip: %v", err)
+		t.Fatalf("client ssh roundtrip: %v", err)
 	}
 	clientRoot := initClientRoot(t, fixture, fixture.SSHAlias())
 
@@ -141,7 +141,7 @@ func TestClientProjectsProxiesToCoordinator(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := fixture.waitForSSHRoundtrip(ctx); err != nil {
-		t.Fatalf("phase1 ssh roundtrip: %v", err)
+		t.Fatalf("client ssh roundtrip: %v", err)
 	}
 	initCoordinatorRoot(t, fixture, "echo")
 	clientRoot := initClientRoot(t, fixture, fixture.SSHAlias())
@@ -161,13 +161,14 @@ func TestClientProjectsProxiesToCoordinator(t *testing.T) {
 	}
 }
 
-// TestClientBuildRunsRemoteCommand verifies a client build triggers the remote worker.
+// TestClientBuildRunsRemoteCommand verifies a client build fans out to the
+// remote coordinator's attached machines and the aggregate reaches succeeded.
 func TestClientBuildRunsRemoteCommand(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := fixture.waitForSSHRoundtrip(ctx); err != nil {
-		t.Fatalf("phase1 ssh roundtrip: %v", err)
+		t.Fatalf("client ssh roundtrip: %v", err)
 	}
 
 	// Coordinator command: write a stamp file in the workspace and exit 0.
@@ -190,31 +191,31 @@ func TestClientBuildRunsRemoteCommand(t *testing.T) {
 	if !env.OK {
 		t.Fatalf("build not ok: %s", pretty(env))
 	}
-	var data struct {
-		RunID string `json:"run_id"`
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal(env.Data, &data); err != nil {
-		t.Fatalf("build data decode: %v", err)
-	}
-	if !strings.HasPrefix(data.RunID, "run_") {
-		t.Fatalf("client returned non-run id %q in %s", data.RunID, pretty(env))
-	}
+	sub := decodeSubmission(t, env)
+	assertTargetsCover(t, sub, "mac-local")
 
-	// Wait for the remote worker to publish its run record.
+	// The returned run id is the parent build request; its aggregate is
+	// recomputed from the target records, so the public check path is the
+	// live signal for a fan-out run.
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if time.Now().After(deadline) {
-			t.Fatalf("client got a run id %q but no remote run record appeared in 20s", data.RunID)
+			t.Fatalf("aggregate for %s did not reach succeeded in 20s", sub.RunID)
 		}
-		remoteState := remoteCheckState(t, fixture, data.RunID)
-		if remoteState == "succeeded" {
-			break
+		checkEnv := runClientBinary(t, fixture, clientRoot, "check", sub.RunID)
+		if checkEnv.OK {
+			var checked submission
+			if jerr := json.Unmarshal(checkEnv.Data, &checked); jerr == nil {
+				if checked.State == "succeeded" {
+					assertTargetsCover(t, checked, "mac-local")
+					break
+				}
+				if checked.State == "failed" {
+					t.Fatalf("remote build failed: %s", sub.RunID)
+				}
+			}
 		}
-		if remoteState == "failed" {
-			t.Fatalf("remote run failed: %s", data.RunID)
-		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	// Confirm the client never stored a local run record.
@@ -226,13 +227,14 @@ func TestClientBuildRunsRemoteCommand(t *testing.T) {
 	}
 }
 
-// TestClientJobFailureStaysJobFailure asserts a non-zero command stays a job failure, not infrastructure.
+// TestClientJobFailureStaysJobFailure asserts a non-zero command stays a job
+// failure, not infrastructure, and the fan-out aggregate preserves it.
 func TestClientJobFailureStaysJobFailure(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := fixture.waitForSSHRoundtrip(ctx); err != nil {
-		t.Fatalf("phase1 ssh roundtrip: %v", err)
+		t.Fatalf("client ssh roundtrip: %v", err)
 	}
 	initCoordinatorRoot(t, fixture, "sh", "-c", "exit 7")
 	clientRoot := initClientRoot(t, fixture, fixture.SSHAlias())
@@ -248,40 +250,37 @@ func TestClientJobFailureStaysJobFailure(t *testing.T) {
 
 	env := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
 	if !env.OK {
-		t.Fatalf("phase1 build must register run; got %s", pretty(env))
+		t.Fatalf("build must register run; got %s", pretty(env))
 	}
-	var data struct {
-		RunID string `json:"run_id"`
-	}
-	if err := json.Unmarshal(env.Data, &data); err != nil {
-		t.Fatalf("build data decode: %v", err)
-	}
-	// Wait for the worker to publish a final result.
+	sub := decodeSubmission(t, env)
+	// Wait for the aggregate to fail through the public check path.
 	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if time.Now().After(deadline) {
-			t.Fatalf("worker did not publish run record in 20s")
-		}
-		state := remoteCheckState(t, fixture, data.RunID)
-		if state == "failed" {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	// The client `check` must report the coordinator's failed run, not an infrastructure error.
-	check := runClientBinary(t, fixture, clientRoot, "check", data.RunID)
-	if !check.OK {
-		t.Fatalf("check must return the failed remote run: %s", pretty(check))
-	}
 	var checked struct {
 		State   string `json:"state"`
-		Failure string `json:"failure"`
+		Targets []struct {
+			Machine string `json:"machine"`
+			State   string `json:"state"`
+			Failure string `json:"failure"`
+		} `json:"targets"`
 	}
-	if err := json.Unmarshal(check.Data, &checked); err != nil {
-		t.Fatalf("decode check data: %v", err)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("aggregate for %s did not fail in 20s (last=%s)", sub.RunID, checked.State)
+		}
+		checkEnv := runClientBinary(t, fixture, clientRoot, "check", sub.RunID)
+		if checkEnv.OK {
+			if jerr := json.Unmarshal(checkEnv.Data, &checked); jerr == nil && checked.State == "failed" {
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	if checked.State != "failed" || checked.Failure != "job" {
-		t.Fatalf("expected remote job failure, got %s", pretty(check))
+	// The failed target keeps the aggregate failed with the job category; the
+	// client check must report the coordinator's failed run, not an
+	// infrastructure error.
+	if len(checked.Targets) != 1 || checked.Targets[0].Machine != "mac-local" ||
+		checked.Targets[0].State != "failed" || checked.Targets[0].Failure != "job" {
+		t.Fatalf("target outcomes: %+v", checked.Targets)
 	}
 }
 
@@ -324,7 +323,7 @@ func envOK(data []byte) bool {
 
 // envClass returns the envelope's failure class, or "ok" when healthy.
 func envClass(data []byte) string {
-	var e phase1Envelope
+	var e clientEnvelope
 	if json.Unmarshal(data, &e) != nil {
 		return ""
 	}
@@ -343,7 +342,7 @@ func TestClientMalformedResponseClassifiedAsInfrastructure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := fixture.waitForSSHRoundtrip(ctx); err != nil {
-		t.Fatalf("phase1 ssh roundtrip: %v", err)
+		t.Fatalf("client ssh roundtrip: %v", err)
 	}
 	initCoordinatorRoot(t, fixture, "true")
 	clientRoot := initClientRoot(t, fixture, fixture.SSHAlias())
@@ -378,13 +377,14 @@ func TestClientMalformedResponseClassifiedAsInfrastructure(t *testing.T) {
 	}
 }
 
-// TestClientAbortPropagatesRequest asserts a client abort transitions the coordinator run to aborted.
+// TestClientAbortPropagatesRequest asserts a client abort fans the
+// cancellation out to every non-terminal target and the aggregate follows.
 func TestClientAbortPropagatesRequest(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := fixture.waitForSSHRoundtrip(ctx); err != nil {
-		t.Fatalf("phase1 ssh roundtrip: %v", err)
+		t.Fatalf("client ssh roundtrip: %v", err)
 	}
 	initCoordinatorRoot(t, fixture, "sleep", "30")
 	clientRoot := initClientRoot(t, fixture, fixture.SSHAlias())
@@ -403,40 +403,141 @@ func TestClientAbortPropagatesRequest(t *testing.T) {
 	if !env.OK {
 		t.Fatalf("build not ok: %s", pretty(env))
 	}
-	var data struct {
-		RunID string `json:"run_id"`
-	}
-	if err := json.Unmarshal(env.Data, &data); err != nil {
-		t.Fatalf("build data decode: %v", err)
-	}
+	sub := decodeSubmission(t, env)
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if time.Now().After(deadline) {
-			t.Fatalf("run %s did not reach running/staging state in 10s", data.RunID)
+			t.Fatalf("target of %s did not reach running in 10s (last=%v)", sub.RunID, remoteTargets(t, fixture, sub.RunID))
 		}
-		st := remoteCheckState(t, fixture, data.RunID)
-		if st == "running" {
+		if states := remoteTargets(t, fixture, sub.RunID); states["mac-local"].State == "running" {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	abortEnv := runClientBinary(t, fixture, clientRoot, "abort", data.RunID)
+	abortEnv := runClientBinary(t, fixture, clientRoot, "abort", sub.RunID)
 	if !abortEnv.OK {
 		t.Fatalf("abort not ok: %s", pretty(abortEnv))
 	}
 
+	// Abort fans out: every non-terminal target must reach aborted.
 	abortDeadline := time.Now().Add(10 * time.Second)
 	for {
-		if time.Now().After(abortDeadline) {
-			t.Fatalf("run %s state was not aborted in 10s (got %q)", data.RunID, remoteCheckState(t, fixture, data.RunID))
+		states := remoteTargets(t, fixture, sub.RunID)
+		allAborted := true
+		for _, target := range states {
+			if target.State != "aborted" {
+				allAborted = false
+			}
 		}
-		st := remoteCheckState(t, fixture, data.RunID)
-		if st == "aborted" {
+		if allAborted {
 			break
 		}
+		if time.Now().After(abortDeadline) {
+			t.Fatalf("targets of %s did not all abort in 10s (last=%v)", sub.RunID, states)
+		}
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The public aggregate reflects the aborted request.
+	checkEnv := runClientBinary(t, fixture, clientRoot, "check", sub.RunID)
+	if !checkEnv.OK {
+		t.Fatalf("check after abort not ok: %s", pretty(checkEnv))
+	}
+	var checked submission
+	if err := json.Unmarshal(checkEnv.Data, &checked); err != nil {
+		t.Fatalf("decode check data: %v", err)
+	}
+	if checked.State != "aborted" {
+		t.Fatalf("aggregate after abort: %s", pretty(checkEnv))
+	}
+	assertTargetsCover(t, checked, "mac-local")
+}
+
+// remoteTargets returns the coordinator's durable child records of a build
+// request, keyed by machine. A fan-out parent's own record stays queued until
+// a maintenance pass terminalizes it, so the target records are the live
+// per-machine signal.
+func remoteTargets(t *testing.T, fixture *SSHFixture, parentID string) map[string]targetRecord {
+	t.Helper()
+	parentData, err := os.ReadFile(filepath.Join(fixture.coordinatorRoot, "state", "runs", parentID, "run.json"))
+	if err != nil {
+		t.Fatalf("read parent record: %v", err)
+	}
+	var parent struct {
+		Children []string `json:"children"`
+	}
+	if err := json.Unmarshal(parentData, &parent); err != nil {
+		t.Fatalf("decode parent record: %v", err)
+	}
+	out := map[string]targetRecord{}
+	for _, childID := range parent.Children {
+		childData, err := os.ReadFile(filepath.Join(fixture.coordinatorRoot, "state", "runs", childID, "run.json"))
+		if err != nil {
+			t.Fatalf("read child record %s: %v", childID, err)
+		}
+		var child struct {
+			Machine string `json:"machine"`
+			State   string `json:"state"`
+		}
+		if err := json.Unmarshal(childData, &child); err != nil {
+			t.Fatalf("decode child record %s: %v", childID, err)
+		}
+		out[child.Machine] = targetRecord{ID: childID, Machine: child.Machine, State: child.State}
+	}
+	return out
+}
+
+// targetRecord is one machine's durable child record of a build request.
+type targetRecord struct {
+	ID      string
+	Machine string
+	State   string
+}
+
+// buildTarget is one machine's outcome in a fan-out submission response.
+type buildTarget struct {
+	Machine string `json:"machine"`
+	State   string `json:"state"`
+}
+
+// submission is the parent build response: one run id and one target per
+// attached machine.
+type submission struct {
+	RunID   string        `json:"run_id"`
+	State   string        `json:"state"`
+	Targets []buildTarget `json:"targets"`
+}
+
+// decodeSubmission parses a build response envelope into a submission.
+func decodeSubmission(t *testing.T, env clientEnvelope) submission {
+	t.Helper()
+	var s submission
+	if err := json.Unmarshal(env.Data, &s); err != nil {
+		t.Fatalf("build data decode: %v: %s", err, pretty(env))
+	}
+	if !strings.HasPrefix(s.RunID, "run_") {
+		t.Fatalf("build returned non-run id %q in %s", s.RunID, pretty(env))
+	}
+	return s
+}
+
+// assertTargetsCover fails unless the submission's targets name exactly the
+// given machines, proving one fan-out child per attached machine.
+func assertTargetsCover(t *testing.T, s submission, machines ...string) {
+	t.Helper()
+	if len(s.Targets) != len(machines) {
+		t.Fatalf("build must stage one target per attached machine; got %v", s.Targets)
+	}
+	got := map[string]bool{}
+	for _, target := range s.Targets {
+		got[target.Machine] = true
+	}
+	for _, machine := range machines {
+		if !got[machine] {
+			t.Fatalf("targets %v must cover %q", s.Targets, machine)
+		}
 	}
 }
 
@@ -483,7 +584,7 @@ func mustGitInit(t *testing.T, dir string) {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("phase1 git %v: %v\n%s", args, err, out)
+			t.Fatalf("git  %v: %v\n%s", args, err, out)
 		}
 	}
 }
@@ -497,7 +598,7 @@ func mustGitAddCommit(t *testing.T, dir, message string) {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("phase1 git %v: %v\n%s", args, err, out)
+			t.Fatalf("git  %v: %v\n%s", args, err, out)
 		}
 	}
 }
@@ -506,12 +607,12 @@ func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("phase1 read %s: %v", path, err)
+		t.Fatalf("read  %s: %v", path, err)
 	}
 	return data
 }
 
-func pretty(env phase1Envelope) string {
+func pretty(env clientEnvelope) string {
 	out, _ := json.Marshal(env)
 	return string(out)
 }

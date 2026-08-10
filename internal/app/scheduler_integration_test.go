@@ -2,13 +2,17 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hypernewbie/vci/internal/config"
+	"github.com/hypernewbie/vci/internal/model"
+	"github.com/hypernewbie/vci/internal/scheduler"
+	"github.com/hypernewbie/vci/internal/store"
 )
 
 // initCoordinatorMultiMachineRoot writes a coordinator config that
@@ -24,13 +28,14 @@ func initCoordinatorMultiMachineRoot(t *testing.T, fixture *SSHFixture, command 
 	}
 }
 
-// TestSchedulerTwoSlotsBothRunDistinctMachines pins the multi-machine
-// path: two local slots, two blocking jobs, distinct selected machine
-// names; a third submission is rejected with `machine_unavailable`.
-// After releasing one, a fourth submission is accepted.
+// TestSchedulerTwoSlotsBothRunDistinctMachines pins the fan-out dispatch
+// contract on two capacity-one machines: every submission stages one child
+// per attached machine, a busy machine's child stays queued while its
+// sibling runs, and freeing the slot lets the next dispatch pass launch the
+// queued child. No submission is rejected.
 func TestSchedulerTwoSlotsBothRunDistinctMachines(t *testing.T) {
 	fixture := NewSSHFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	if err := fixture.waitForSSHRoundtrip(ctx); err != nil {
 		t.Fatalf("ssh roundtrip: %v", err)
@@ -46,135 +51,111 @@ func TestSchedulerTwoSlotsBothRunDistinctMachines(t *testing.T) {
 	mustWriteFile(t, filepath.Join(sourceDir, "README.md"), "# demo\n")
 	mustGitAddCommit(t, sourceDir, "init")
 
+	// First submission: both machines are free, so both children run on
+	// distinct machines.
 	env1 := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
 	if !env1.OK {
 		t.Fatalf("build 1 not ok: %s", pretty(env1))
 	}
-	var d1 struct {
-		RunID   string `json:"run_id"`
-		State   string `json:"state"`
-		Machine string `json:"machine"`
-	}
-	if err := json.Unmarshal(env1.Data, &d1); err != nil {
-		t.Fatal(err)
-	}
-	if !isMultiMachineMember(d1.Machine) {
-		t.Fatalf("public machine must be alpha or beta; got %q in %s", d1.Machine, pretty(env1))
-	}
-	waitState(t, fixture, d1.RunID, "running", 10*time.Second)
+	p1 := decodeSubmission(t, env1)
+	assertTargetsCover(t, p1, "alpha", "beta")
+	waitTarget(t, fixture, p1.RunID, "alpha", "running", 15*time.Second)
+	waitTarget(t, fixture, p1.RunID, "beta", "running", 15*time.Second)
 
+	// The coordinator runs one build at a time; finish build 1 so build 2 can
+	// be admitted.
+	abortEnv := runClientBinary(t, fixture, clientRoot, "abort", p1.RunID)
+	if !abortEnv.OK {
+		t.Fatalf("abort build 1 not ok: %s", pretty(abortEnv))
+	}
+	waitTarget(t, fixture, p1.RunID, "alpha", "aborted", 15*time.Second)
+	waitTarget(t, fixture, p1.RunID, "beta", "aborted", 15*time.Second)
+
+	// Second submission with beta's slot occupied: the beta child must
+	// stay queued while the alpha child runs.
+	legacyID := holdMachineSlot(t, fixture, "beta")
 	env2 := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
 	if !env2.OK {
-		t.Fatalf("build 2 not ok: %s", pretty(env2))
+		t.Fatalf("build 2 must not be rejected for a busy target; got %s", pretty(env2))
 	}
-	var d2 struct {
-		RunID   string `json:"run_id"`
-		State   string `json:"state"`
-		Machine string `json:"machine"`
+	p2 := decodeSubmission(t, env2)
+	assertTargetsCover(t, p2, "alpha", "beta")
+	waitTarget(t, fixture, p2.RunID, "alpha", "running", 15*time.Second)
+	states := remoteTargets(t, fixture, p2.RunID)
+	if states["beta"].State != "queued" {
+		t.Fatalf("busy beta target must stay queued while alpha runs; got %v", states)
 	}
-	if err := json.Unmarshal(env2.Data, &d2); err != nil {
-		t.Fatal(err)
-	}
-	if !isMultiMachineMember(d2.Machine) {
-		t.Fatalf("public machine must be alpha or beta; got %q in %s", d2.Machine, pretty(env2))
-	}
-	waitState(t, fixture, d2.RunID, "running", 10*time.Second)
-
-	m1 := readMachine(t, fixture, d1.RunID)
-	m2 := readMachine(t, fixture, d2.RunID)
-	if m1 != d1.Machine {
-		t.Fatalf("public machine %q must match private run.json machine %q", d1.Machine, m1)
-	}
-	if m2 != d2.Machine {
-		t.Fatalf("public machine %q must match private run.json machine %q", d2.Machine, m2)
-	}
-	if m1 == m2 {
-		t.Fatalf("two slots must run on distinct machines, got both on %q", m1)
-	}
-	if !isMultiMachineMember(m1) || !isMultiMachineMember(m2) {
-		t.Fatalf("machines must be alpha or beta; got %q and %q", m1, m2)
+	if states["alpha"].State != "running" {
+		t.Fatalf("alpha target must run while beta is busy; got %v", states)
 	}
 
-	// 3. Third submission is rejected with machine_unavailable, retryable true.
-	env3 := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
-	if env3.OK {
-		t.Fatalf("third submission must be rejected: %s", pretty(env3))
+	// Free the slot; the next dispatch pass (via setup reap) launches the
+	// queued child on the freed machine.
+	l := model.Layout{Root: fixture.coordinatorRoot}
+	if err := scheduler.Release(l, "beta", legacyID); err != nil {
+		t.Fatalf("release beta slot: %v", err)
 	}
-	if env3.Error == nil {
-		t.Fatalf("third submission must carry an error envelope: %s", pretty(env3))
+	reapCmd := exec.Command(fixture.binary, "setup", "reap")
+	reapCmd.Env = append(os.Environ(), "VCI_ROOT="+fixture.coordinatorRoot)
+	if out, err := reapCmd.CombinedOutput(); err != nil {
+		t.Fatalf("setup reap failed: %v: %s", err, out)
 	}
-	if env3.Error.Code != "machine_unavailable" || !env3.Error.Retryable || env3.Error.Class != "state" {
-		t.Fatalf("unexpected error: %+v", env3.Error)
-	}
-	// No third run record or claim is created.
-	runsDir := filepath.Join(fixture.coordinatorRoot, "state", "runs")
-	if entries, err := os.ReadDir(runsDir); err == nil {
-		for _, e := range entries {
-			if e.Name() != d1.RunID && e.Name() != d2.RunID {
-				t.Fatalf("third submission must not create a run record, found %s", e.Name())
-			}
-		}
-	}
-
-	// 4. Release one job; a fourth submission is accepted.
-	abortEnv := runClientBinary(t, fixture, clientRoot, "abort", d1.RunID)
-	if !abortEnv.OK {
-		t.Fatalf("abort not ok: %s", pretty(abortEnv))
-	}
-	waitState(t, fixture, d1.RunID, "aborted", 10*time.Second)
-	env4 := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
-	if !env4.OK {
-		t.Fatalf("build 4 not ok: %s", pretty(env4))
-	}
-	var d4 struct {
-		RunID   string `json:"run_id"`
-		State   string `json:"state"`
-		Machine string `json:"machine"`
-	}
-	if err := json.Unmarshal(env4.Data, &d4); err != nil {
-		t.Fatal(err)
-	}
-	if !isMultiMachineMember(d4.Machine) {
-		t.Fatalf("public machine must be alpha or beta; got %q in %s", d4.Machine, pretty(env4))
-	}
-	waitState(t, fixture, d4.RunID, "running", 10*time.Second)
+	waitTarget(t, fixture, p2.RunID, "beta", "running", 15*time.Second)
 }
 
-func isMultiMachineMember(name string) bool {
-	return name == "alpha" || name == "beta"
-}
-
-func waitState(t *testing.T, fixture *SSHFixture, runID, want string, max time.Duration) {
+// waitTarget polls a build request's target on machine until its durable
+// state reaches want.
+func waitTarget(t *testing.T, fixture *SSHFixture, parentID, machine, want string, max time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(max)
 	for time.Now().Before(deadline) {
-		if got := remoteCheckState(t, fixture, runID); got == want {
+		if remoteTargets(t, fixture, parentID)[machine].State == want {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("run %s state did not reach %q within %s (last=%q)", runID, want, max, remoteCheckState(t, fixture, runID))
+	t.Fatalf("target %s of run %s did not reach %q within %s (last=%v)", machine, parentID, want, max, remoteTargets(t, fixture, parentID))
 }
 
-func readMachine(t *testing.T, fixture *SSHFixture, runID string) string {
+// holdMachineSlot creates a legacy single-machine run on the coordinator and
+// reserves a scheduler slot for it, occupying the machine's capacity so a
+// fan-out build's child on that machine queues instead of running. The lease
+// keeps the reaper from treating the staging run as abandoned.
+func holdMachineSlot(t *testing.T, fixture *SSHFixture, machine string) model.RunID {
 	t.Helper()
-	dir := filepath.Join(fixture.coordinatorRoot, "state", "runs", runID)
-	data, err := os.ReadFile(filepath.Join(dir, "run.json"))
+	l := model.Layout{Root: fixture.coordinatorRoot}
+	runStore := store.Store{Layout: l}
+	cfg, err := config.Load(l.ConfigPath())
 	if err != nil {
-		t.Fatalf("read run record: %v", err)
+		t.Fatalf("load coordinator config: %v", err)
 	}
-	var rec struct {
-		Machine string `json:"machine"`
+	now := time.Now().UTC()
+	id, err := store.NewRunID(now)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := json.Unmarshal(data, &rec); err != nil {
-		t.Fatalf("decode run record: %v", err)
+	legacy, err := store.NewRunFromID(id, "demo", machine, []string{"sleep", "30"}, "", map[string]any{}, now)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return rec.Machine
+	if err := runStore.Save(legacy); err != nil {
+		t.Fatalf("save legacy run: %v", err)
+	}
+	if _, err := runStore.Transition(id, model.RunStaging, now); err != nil {
+		t.Fatalf("promote legacy run: %v", err)
+	}
+	if err := scheduler.Reserve(l, runStore, cfg, machine, id, now); err != nil {
+		t.Fatalf("reserve %s for legacy run: %v", machine, err)
+	}
+	if err := store.Claim(l, id, "scheduler-integration-test", now, 30*time.Minute); err != nil {
+		t.Fatalf("lease legacy run: %v", err)
+	}
+	return id
 }
 
 // TestSchedulerReapPreservesActiveClaims pins that `setup reap`
-// during active jobs preserves their claims. The reaper counts
-// active bytes and only releases terminal claims.
+// during an active fan-out build preserves every target's scheduler
+// claim. The reaper only releases claims whose run record is terminal.
 func TestSchedulerReapPreservesActiveClaims(t *testing.T) {
 	fixture := NewSSHFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -193,50 +174,36 @@ func TestSchedulerReapPreservesActiveClaims(t *testing.T) {
 	mustWriteFile(t, filepath.Join(sourceDir, "README.md"), "# demo\n")
 	mustGitAddCommit(t, sourceDir, "init")
 
-	env1 := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
-	if !env1.OK {
-		t.Fatalf("build 1 not ok: %s", pretty(env1))
+	env := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
+	if !env.OK {
+		t.Fatalf("build not ok: %s", pretty(env))
 	}
-	var d1 struct {
-		RunID string `json:"run_id"`
-	}
-	json.Unmarshal(env1.Data, &d1)
-	waitState(t, fixture, d1.RunID, "running", 10*time.Second)
-
-	env2 := runClientBinary(t, fixture, clientRoot, "build", sourceDir)
-	if !env2.OK {
-		t.Fatalf("build 2 not ok: %s", pretty(env2))
-	}
-	var d2 struct {
-		RunID string `json:"run_id"`
-	}
-	json.Unmarshal(env2.Data, &d2)
-	waitState(t, fixture, d2.RunID, "running", 10*time.Second)
+	parent := decodeSubmission(t, env)
+	assertTargetsCover(t, parent, "alpha", "beta")
+	waitTarget(t, fixture, parent.RunID, "alpha", "running", 15*time.Second)
+	waitTarget(t, fixture, parent.RunID, "beta", "running", 15*time.Second)
 
 	// setup reap on the coordinator. The client root rejects setup
 	// mutations by role, so the coordinator's own binary is invoked
 	// against the coordinator root.
 	reapCmd := exec.Command(fixture.binary, "setup", "reap")
 	reapCmd.Env = append(os.Environ(), "VCI_ROOT="+fixture.coordinatorRoot)
-	reapOut, reapErr := reapCmd.CombinedOutput()
-	if reapErr != nil {
+	if reapOut, reapErr := reapCmd.CombinedOutput(); reapErr != nil {
 		t.Fatalf("setup reap failed: %v: %s", reapErr, string(reapOut))
 	}
 
-	// Both claims must still exist (active runs).
+	// Every live target's claim must still exist after the reap cycle.
 	claimsDir := filepath.Join(fixture.coordinatorRoot, "state", "machine-claims")
-	for _, runID := range []string{d1.RunID, d2.RunID} {
-		found := false
-		if machines, err := os.ReadDir(claimsDir); err == nil {
-			for _, m := range machines {
-				if _, err := os.Stat(filepath.Join(claimsDir, m.Name(), runID+".json")); err == nil {
-					found = true
-					break
-				}
-			}
+	for _, target := range remoteTargets(t, fixture, parent.RunID) {
+		claimPath := filepath.Join(claimsDir, target.Machine, target.ID+".json")
+		if _, err := os.Stat(claimPath); err != nil {
+			t.Fatalf("reap removed live claim for %s (%s): %v", target.Machine, target.ID, err)
 		}
-		if !found {
-			t.Fatalf("reap removed live claim for %s", runID)
+	}
+	// The reap cycle must not disturb the running targets.
+	for _, machine := range []string{"alpha", "beta"} {
+		if got := remoteTargets(t, fixture, parent.RunID)[machine].State; got != "running" {
+			t.Fatalf("reap disturbed target %s (state=%s)", machine, got)
 		}
 	}
 }

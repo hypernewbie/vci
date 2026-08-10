@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/process"
@@ -595,11 +597,11 @@ func TestStageNoSeedReconstructOversizedBundleOneShot(t *testing.T) {
 		t.Fatalf("runner invoked %d times, want 2 (probe + stream)", len(runner.commands))
 	}
 	probe := runner.commands[0]
-	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || !strings.HasSuffix(probe.Args[3], "/complete") {
+	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "vci" || probe.Args[2] != "internal-probe-cache" || !strings.HasPrefix(probe.Args[3], "~/.vci/state/bundle-cache/v1/Vci/") {
 		t.Errorf("unexpected probe command: %+v", probe)
 	}
 	stream := runner.commands[1]
-	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+	if stream.Executable != "ssh" || len(stream.Args) != 5 || stream.Args[0] != "builder" || stream.Args[2] != "internal-reconstruct" || stream.Args[4] != "--no-seed" {
 		t.Errorf("unexpected stream command: %+v", stream)
 	}
 
@@ -616,15 +618,19 @@ func TestStageNoSeedReconstructOversizedBundleOneShot(t *testing.T) {
 		t.Errorf("warning missing the configured max_bytes %d: %s", maxBundleBytes, warning)
 	}
 
-	// The one-shot shell imports the payload bundle entry-free and never
-	// touches the worker bundle cache: it unbundles .vci-payload/bundle
-	// directly and references no workerCacheRoot path at all.
-	s := stream.Args[1]
-	if !strings.Contains(s, "git bundle unbundle .vci-payload/bundle") {
-		t.Errorf("one-shot shell missing the entry-free bundle import: %s", s)
+	// The one-shot command imports the payload bundle entry-free and never
+	// touches the worker bundle cache: it carries no --cache flag and
+	// references no workerCacheRoot path at all.
+	for _, want := range []string{"vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "--no-seed"} {
+		if !slices.Contains(stream.Args, want) {
+			t.Errorf("one-shot command missing %q: %q", want, stream.Args)
+		}
 	}
-	if strings.Contains(s, workerCacheRoot) {
-		t.Errorf("one-shot shell must not reference the worker bundle cache (%q): %s", workerCacheRoot, s)
+	if slices.Contains(stream.Args, "--cache") {
+		t.Errorf("one-shot command must not reference the worker bundle cache: %q", stream.Args)
+	}
+	if strings.Contains(strings.Join(stream.Args, " "), workerCacheRoot) {
+		t.Errorf("one-shot command must not reference the worker bundle cache (%q): %q", workerCacheRoot, stream.Args)
 	}
 }
 
@@ -643,7 +649,7 @@ type noSeedRouteRunner struct {
 
 func (r *noSeedRouteRunner) Run(_ context.Context, command process.Command) (process.Result, error) {
 	r.commands = append(r.commands, command)
-	if len(r.commands) == 1 { // ProbeBundleCache: `ssh <host> test -f <entry>/complete`.
+	if len(r.commands) == 1 { // ProbeBundleCache: `ssh <host> vci internal-probe-cache <entry>`.
 		if r.probeHit {
 			return process.Result{ExitCode: 0}, nil
 		}
@@ -720,7 +726,7 @@ func TestStageNoSeedReconstructRoutesCacheHitAndMiss(t *testing.T) {
 			// Both routes begin with the same bundle-cache probe for the
 			// submitted head's first parent.
 			probe := runner.commands[0]
-			if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || probe.Args[2] != "-f" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base+"/complete" {
+			if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "vci" || probe.Args[2] != "internal-probe-cache" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base {
 				t.Errorf("unexpected probe command: %+v", probe)
 			}
 
@@ -731,33 +737,41 @@ func TestStageNoSeedReconstructRoutesCacheHitAndMiss(t *testing.T) {
 				acquire := runner.commands[1]
 				stream := runner.commands[2]
 				release := runner.commands[3]
-				wantAcquire := "test -f ~/.vci/state/bundle-cache/v1/Vci/" + base + "/complete && mkdir -p ~/.vci/state/bundle-cache/v1/Vci/" + base + "/claims && : > ~/.vci/state/bundle-cache/v1/Vci/" + base + "/claims/run_abc"
-				if acquire.Executable != "ssh" || len(acquire.Args) != 2 || acquire.Args[0] != "builder" || acquire.Args[1] != wantAcquire {
+				entry := "~/.vci/state/bundle-cache/v1/Vci/" + base
+				wantAcquire := []string{"builder", "vci", "internal-acquire-claim", entry, "run_abc"}
+				if acquire.Executable != "ssh" || len(acquire.Args) != len(wantAcquire) {
 					t.Errorf("unexpected acquire command: %+v", acquire)
-				}
-				wantRelease := "rm -f ~/.vci/state/bundle-cache/v1/Vci/" + base + "/claims/run_abc"
-				if release.Executable != "ssh" || len(release.Args) != 2 || release.Args[0] != "builder" || release.Args[1] != wantRelease {
-					t.Errorf("unexpected release command: %+v", release)
-				}
-				if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
-					t.Errorf("unexpected stream command: %+v", stream)
-				}
-				// The hit shell seeds the repository from the cached entry
-				// bundle and treats the payload bundle as an optional delta;
-				// it never admits or evicts.
-				s := stream.Args[1]
-				for _, want := range []string{
-					"git init -q",
-					"git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/" + base + "/bundle",
-					"if [ -s .vci-payload/bundle ]",
-				} {
-					if !strings.Contains(s, want) {
-						t.Errorf("hit shell missing %q: %s", want, s)
+				} else {
+					for i := range wantAcquire {
+						if acquire.Args[i] != wantAcquire[i] {
+							t.Errorf("acquire arg %d: %q want %q", i, acquire.Args[i], wantAcquire[i])
+						}
 					}
 				}
-				for _, banned := range []string{"complete", "while :; do"} {
-					if strings.Contains(s, banned) {
-						t.Errorf("hit shell must not admit or evict (%q): %s", banned, s)
+				wantRelease := []string{"builder", "vci", "internal-release-claim", entry, "run_abc"}
+				if release.Executable != "ssh" || len(release.Args) != len(wantRelease) {
+					t.Errorf("unexpected release command: %+v", release)
+				} else {
+					for i := range wantRelease {
+						if release.Args[i] != wantRelease[i] {
+							t.Errorf("release arg %d: %q want %q", i, release.Args[i], wantRelease[i])
+						}
+					}
+				}
+				wantStream := []string{"builder", "vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "--no-seed", "--cache", entry, "--use-cached"}
+				if stream.Executable != "ssh" || len(stream.Args) != len(wantStream) {
+					t.Errorf("unexpected stream command: %+v", stream)
+				} else {
+					for i := range wantStream {
+						if stream.Args[i] != wantStream[i] {
+							t.Errorf("stream arg %d: %q want %q", i, stream.Args[i], wantStream[i])
+						}
+					}
+				}
+				// The hit command never asks the worker to admit or evict.
+				for _, banned := range []string{"--admit", "--evict"} {
+					if slices.Contains(stream.Args, banned) {
+						t.Errorf("hit command must not admit or evict (%q): %q", banned, stream.Args)
 					}
 				}
 				if runner.payload == nil {
@@ -769,27 +783,29 @@ func TestStageNoSeedReconstructRoutesCacheHitAndMiss(t *testing.T) {
 			// A miss above AdmissionBytes streams the full bundle and runs
 			// admission plus LRU eviction on the worker.
 			stream := runner.commands[1]
-			if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
-				t.Errorf("unexpected stream command: %+v", stream)
-			}
 			members := assertPayload(t, io.NopCloser(bytes.NewReader(runner.payload)), head, lcBytes, true)
-			s := stream.Args[1]
-			if !strings.Contains(s, "git bundle unbundle .vci-payload/bundle") {
-				t.Errorf("miss shell missing the full-bundle import: %s", s)
+			entry := "~/.vci/state/bundle-cache/v1/Vci/" + base
+			wantPrefix := []string{
+				"builder", "vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "--no-seed",
+				"--cache", entry,
+				"--admit", fmt.Sprintf("%d", len(members[1].Data)),
 			}
-			if strings.Contains(s, "git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/"+base+"/bundle") {
-				t.Errorf("miss shell must not import the cached entry: %s", s)
-			}
-			for _, want := range []string{
-				"mkdir -p ~/.vci/state/bundle-cache/v1/Vci/" + base,
-				"cp .vci-payload/bundle ~/.vci/state/bundle-cache/v1/Vci/" + base + "/bundle",
-				fmt.Sprintf(`printf '{"bytes":%d,"last_used":`, len(members[1].Data)),
-				"> ~/.vci/state/bundle-cache/v1/Vci/" + base + "/meta.json",
-				": > ~/.vci/state/bundle-cache/v1/Vci/" + base + "/complete",
-				"while :; do",
-			} {
-				if !strings.Contains(s, want) {
-					t.Errorf("miss shell missing %q: %s", want, s)
+			if stream.Executable != "ssh" || len(stream.Args) < len(wantPrefix)+3 {
+				t.Errorf("unexpected stream command: %+v", stream)
+			} else {
+				for i := range wantPrefix {
+					if stream.Args[i] != wantPrefix[i] {
+						t.Errorf("stream arg %d: %q want %q", i, stream.Args[i], wantPrefix[i])
+					}
+				}
+				// The admission timestamp is generated at call time; the
+				// eviction limits come from the machine's effective policy.
+				tail := stream.Args[len(wantPrefix):]
+				if len(tail) != 4 || tail[1] != "--evict" || tail[2] != "5" || tail[3] != "1073741824" {
+					t.Errorf("miss command must run LRU eviction with the policy limits: %q", stream.Args)
+				}
+				if _, err := time.Parse(time.RFC3339, tail[0]); err != nil {
+					t.Errorf("admission timestamp %q is not RFC3339: %v", tail[0], err)
 				}
 			}
 		})
@@ -863,11 +879,11 @@ func TestStageNoSeedReconstructBelowAdmissionOneShot(t *testing.T) {
 		t.Fatalf("runner invoked %d times, want 2 (probe + stream)", len(runner.commands))
 	}
 	probe := runner.commands[0]
-	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || probe.Args[2] != "-f" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base+"/complete" {
+	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "vci" || probe.Args[2] != "internal-probe-cache" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base {
 		t.Errorf("unexpected probe command: %+v", probe)
 	}
 	stream := runner.commands[1]
-	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+	if stream.Executable != "ssh" || len(stream.Args) != 5 || stream.Args[0] != "builder" || stream.Args[2] != "internal-reconstruct" || stream.Args[4] != "--no-seed" {
 		t.Errorf("unexpected stream command: %+v", stream)
 	}
 
@@ -875,15 +891,16 @@ func TestStageNoSeedReconstructBelowAdmissionOneShot(t *testing.T) {
 	// the durable lc.tar byte-for-byte.
 	assertPayload(t, io.NopCloser(bytes.NewReader(runner.payload)), head, lcBytes, true)
 
-	// The one-shot shell imports the payload bundle entry-free and never
-	// touches the worker bundle cache: no cached entry path, no admission,
-	// and no LRU eviction.
-	s := stream.Args[1]
-	if !strings.Contains(s, "git bundle unbundle .vci-payload/bundle") {
-		t.Errorf("one-shot shell missing the entry-free bundle import: %s", s)
+	// The one-shot command imports the payload bundle entry-free and never
+	// touches the worker bundle cache: no --cache flag, no admission, and no
+	// LRU eviction.
+	for _, want := range []string{"vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "--no-seed"} {
+		if !slices.Contains(stream.Args, want) {
+			t.Errorf("one-shot command missing %q: %q", want, stream.Args)
+		}
 	}
-	if strings.Contains(s, workerCacheRoot) {
-		t.Errorf("one-shot shell must not reference the worker bundle cache (%q): %s", workerCacheRoot, s)
+	if slices.Contains(stream.Args, "--cache") || strings.Contains(strings.Join(stream.Args, " "), workerCacheRoot) {
+		t.Errorf("one-shot command must not reference the worker bundle cache (%q): %q", workerCacheRoot, stream.Args)
 	}
 }
 
@@ -940,11 +957,11 @@ func TestStageNoSeedReconstructStreamErrorFallsBack(t *testing.T) {
 		t.Fatalf("runner invoked %d times, want 2 (probe + failed stream)", len(runner.commands))
 	}
 	probe := runner.commands[0]
-	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "test" || probe.Args[2] != "-f" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base+"/complete" {
+	if probe.Executable != "ssh" || len(probe.Args) != 4 || probe.Args[0] != "builder" || probe.Args[1] != "vci" || probe.Args[2] != "internal-probe-cache" || probe.Args[3] != "~/.vci/state/bundle-cache/v1/Vci/"+base {
 		t.Errorf("unexpected probe command: %+v", probe)
 	}
 	stream := runner.commands[1]
-	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+	if stream.Executable != "ssh" || len(stream.Args) != 5 || stream.Args[0] != "builder" || stream.Args[2] != "internal-reconstruct" || stream.Args[4] != "--no-seed" {
 		t.Errorf("unexpected stream command: %+v", stream)
 	}
 	if len(runner.payload) == 0 {
@@ -957,7 +974,7 @@ func TestStageNoSeedReconstructStreamErrorFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh stub log: %v", err)
 	}
-	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+	for _, want := range []string{"builder", "vci", "internal-stage", "~/.vci/state/work/run_abc"} {
 		if !strings.Contains(string(sshOut), want) {
 			t.Errorf("stage command missing %q: %s", want, sshOut)
 		}

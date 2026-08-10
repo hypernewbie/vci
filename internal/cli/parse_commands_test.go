@@ -3,7 +3,7 @@ package cli
 import "testing"
 
 func TestParseCommands(t *testing.T) {
-	for _, args := range [][]string{{"build", "."}, {"check", "run_1"}, {"watch", "run_1"}, {"projects"}, {"machines"}, {"setup", "init"}, {"logs", "run_1"}} {
+	for _, args := range [][]string{{"build", "."}, {"check", "run_1"}, {"watch", "run_1"}, {"projects"}, {"machines"}, {"setup", "init"}, {"logs", "run_1"}, {"internal-stage", "~/.vci/state/work/run_1"}, {"internal-probe-cache", "~/.vci/state/bundle-cache/v1/Vci/abc"}, {"internal-acquire-claim", "~/.vci/state/bundle-cache/v1/Vci/abc", "run_1"}, {"internal-release-claim", "~/.vci/state/bundle-cache/v1/Vci/abc", "run_1"}, {"internal-reap-cache", "a", "b", "c", "d", "e", "f", "1", "2"}, {"internal-reconstruct", "~/.vci/state/work/run_1", "--no-seed"}} {
 		got, err := Parse(args)
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", args, err)

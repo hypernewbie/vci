@@ -195,35 +195,40 @@ func TestBuildAbortTerminatesOwnedCommand(t *testing.T) {
 	if err := AddProject(l, "abort-fixture", config.Project{Machines: []string{"mac-local"}, Command: []string{"sh", "-c", "sleep 30"}}); err != nil {
 		t.Fatal(err)
 	}
+	prepared, err := Prepare(context.Background(), l, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := prepared.Record.ID
+	runStore := store.Store{Layout: l}
+	children, err := runStore.LoadChildren(parentID)
+	if err != nil || len(children) != 1 {
+		t.Fatalf("build must stage one target per attached machine; got %d children: %v", len(children), err)
+	}
+	childID := children[0].ID
+
 	var result BuildResult
 	var buildErr error
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		prepared, prepErr := Prepare(context.Background(), l, repo)
-		if prepErr != nil {
-			buildErr = prepErr
-			return
-		}
-		result, buildErr = ExecutePrepared(context.Background(), l, prepared.Record.ID)
+		// Executing the parent reserves the first target's machine and runs
+		// that target, the same path `vci internal-run <parent>` takes.
+		result, buildErr = ExecutePrepared(context.Background(), l, parentID)
 	}()
 	deadline := time.Now().Add(10 * time.Second)
-	var id model.RunID
 	for time.Now().Before(deadline) {
-		entries, _ := os.ReadDir(l.RunsDir())
-		if len(entries) > 0 {
-			id = model.RunID(entries[0].Name())
-			if record, err := (store.Store{Layout: l}).Load(id); err == nil && record.State == model.RunRunning {
-				break
-			}
+		if record, err := runStore.Load(childID); err == nil && record.State == model.RunRunning {
+			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if id == "" {
-		t.Fatal("build never reached running")
+	if record, err := runStore.Load(childID); err != nil || record.State != model.RunRunning {
+		t.Fatalf("target %s never reached running: %+v", childID, record)
 	}
-	if _, err := Abort(l, id); err != nil {
+	// Aborting the parent fans the cancellation out to every live target.
+	if _, err := Abort(l, parentID); err != nil {
 		t.Fatal(err)
 	}
 	wg.Wait()
@@ -233,12 +238,27 @@ func TestBuildAbortTerminatesOwnedCommand(t *testing.T) {
 	if result.State != model.RunAborted {
 		t.Fatalf("result: %+v", result)
 	}
-	checked, err := Check(l, id)
+	// Every non-terminal target reaches aborted, and the aggregate follows.
+	for _, child := range children {
+		if record, err := runStore.Load(child.ID); err != nil || record.State != model.RunAborted {
+			t.Fatalf("target %s on %s ended %q, want aborted", child.ID, child.Machine, record.State)
+		}
+	}
+	checked, err := Check(l, parentID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data, ok := checked.(map[string]any); !ok || data["state"] != string(model.RunAborted) {
-		t.Fatalf("checked: %#v", checked)
+	summary, ok := checked.(BuildSummary)
+	if !ok {
+		t.Fatalf("check returned %T, want BuildSummary", checked)
+	}
+	if summary.State != model.RunAborted {
+		t.Fatalf("aggregate: %+v", summary)
+	}
+	for _, target := range summary.Targets {
+		if target.State != model.RunAborted {
+			t.Fatalf("target %s ended %q, want aborted", target.Machine, target.State)
+		}
 	}
 }
 

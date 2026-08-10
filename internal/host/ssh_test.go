@@ -276,8 +276,8 @@ func TestRunRemoteRejectsBadInput(t *testing.T) {
 }
 
 // TestStageRemoteStreamsWorkspace pins that staging pipes a tar of
-// the local workspace into `ssh <host> "rm -rf <workDir> && mkdir -p
-// <workDir> && cd <workDir> && tar -xpf -"`.
+// the local workspace into `ssh <host> vci internal-stage <workDir>`,
+// the worker-side replacement for the shell rm/mkdir/tar composition.
 func TestStageRemoteStreamsWorkspace(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires Unix ssh")
@@ -294,50 +294,17 @@ func TestStageRemoteStreamsWorkspace(t *testing.T) {
 	}
 	log, _ := os.ReadFile(logPath)
 	s := string(log)
-	for _, want := range []string{"builder", "rm -rf ~/.vci/state/work/run_abc", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+	for _, want := range []string{"builder", "vci", "internal-stage", "~/.vci/state/work/run_abc"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("stage command missing %q: %s", want, s)
 		}
 	}
-}
-
-// TestStageRemoteClearsWorkDir pins that staging removes the validated
-// remote work dir before mkdir and tar extraction, so seed and
-// .vci-payload residue from a failed reconstruction cannot contaminate
-// fallback staging.
-func TestStageRemoteClearsWorkDir(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("requires Unix ssh")
-	}
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "ssh.log")
-	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\ncat >/dev/null 2>&1\nexit 0\n")
-	workspace := t.TempDir()
-	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := StageRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", workspace); err != nil {
-		t.Fatalf("stage: %v", err)
-	}
-	log, _ := os.ReadFile(logPath)
-	s := string(log)
-	ordered := []string{
-		"rm -rf ~/.vci/state/work/run_abc",
-		"mkdir -p ~/.vci/state/work/run_abc",
-		"cd ~/.vci/state/work/run_abc",
-		"tar -xpf -",
-	}
-	last := -1
-	for _, want := range ordered {
-		i := strings.Index(s, want)
-		if i < 0 {
-			t.Errorf("stage shell missing %q: %s", want, s)
-			continue
+	// No shell fragment may cross the wire: the worker-side subcommand
+	// owns clearing, creating, and extracting.
+	for _, banned := range []string{"rm -rf", "mkdir -p", "tar -xpf"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("stage command must not embed shell fragments (%q): %s", banned, s)
 		}
-		if i < last {
-			t.Errorf("stage shell order violated for %q: %s", want, s)
-		}
-		last = i
 	}
 }
 
@@ -597,14 +564,12 @@ func TestProbeSeedHeadRejectsBadInput(t *testing.T) {
 	}
 }
 
-// TestClientStreamReconstructPinsShell pins that StreamReconstruct hands
-// `ssh <host> <shell>` to the runner with the payload wired to stdin, and that
-// the shell reconstructs in the documented order: extract the payload into a
-// private directory, tar-copy the seed, unbundle when a bundle is present,
-// checkout the submitted head, apply the lc patch, restore the untracked
-// "f/" tree with --strip-components=1, and remove the payload directory. The
-// seed copy must never use cp -a.
-func TestClientStreamReconstructPinsShell(t *testing.T) {
+// TestClientStreamReconstructPinsCommand pins that StreamReconstruct hands
+// `ssh <host> vci internal-reconstruct <workDir> <seed>` to the runner with
+// the payload wired to stdin. The worker-side subcommand owns payload
+// extraction, the seed copy, bundle import, checkout, local-change
+// application, and payload removal.
+func TestClientStreamReconstructPinsCommand(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
 	payload := bytes.NewReader([]byte("payload-tar"))
 	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/code/vidl", "~/.vci/state/work/run_abc", payload)
@@ -618,103 +583,33 @@ func TestClientStreamReconstructPinsShell(t *testing.T) {
 	if cmd.Executable != "ssh" {
 		t.Errorf("executable: %q", cmd.Executable)
 	}
-	if len(cmd.Args) != 2 || cmd.Args[0] != "charon" {
+	want := []string{"charon", "vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "$HOME/code/vidl"}
+	if len(cmd.Args) != len(want) {
 		t.Fatalf("args: %q", cmd.Args)
+	}
+	for i := range want {
+		if cmd.Args[i] != want[i] {
+			t.Errorf("arg %d: %q want %q", i, cmd.Args[i], want[i])
+		}
 	}
 	if cmd.Stdin != io.Reader(payload) {
 		t.Errorf("payload not wired to ssh stdin")
-	}
-	s := cmd.Args[1]
-	ordered := []string{
-		"mkdir -p ~/.vci/state/work/run_abc",
-		"cd ~/.vci/state/work/run_abc",
-		"mkdir -p .vci-payload",
-		"tar -xf - -C .vci-payload",
-		"tar -cf - -C $HOME/code/vidl . | tar -xf -",
-		"head=$(cat .vci-payload/head)",
-		"if [ -s .vci-payload/bundle ]",
-		"git bundle unbundle .vci-payload/bundle",
-		`git checkout -q "$head"`,
-		"git apply --binary --whitespace=nowarn .vci-payload/patch",
-		"--strip-components=1 f/",
-		"rm -rf .vci-payload",
-	}
-	last := -1
-	for _, want := range ordered {
-		i := strings.Index(s, want)
-		if i < 0 {
-			t.Errorf("shell missing %q: %s", want, s)
-			continue
-		}
-		if i < last {
-			t.Errorf("shell order violated for %q: %s", want, s)
-		}
-		last = i
-	}
-	if strings.Contains(s, "cp -a") {
-		t.Errorf("shell copies the seed with cp -a: %s", s)
-	}
-}
-
-// TestClientStreamReconstructValidatesLCArchive pins that the reconstruction
-// shell validates the complete lc.tar archive with `tar -tf` redirected to
-// /dev/null before any optional patch/f member handling, so a corrupt archive
-// fails the && chain while a valid archive with no patch or f members still
-// proceeds. The validation must be a bare && step, not an if-guarded one.
-func TestClientStreamReconstructValidatesLCArchive(t *testing.T) {
-	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
-	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil))
-	if err != nil {
-		t.Fatalf("reconstruct: %v", err)
-	}
-	if len(runner.commands) != 1 {
-		t.Fatalf("runner invoked %d times", len(runner.commands))
-	}
-	s := runner.commands[0].Args[1]
-
-	// The complete archive is listed with stdout discarded, chained directly
-	// after the checkout as a bare && step, so a corrupt lc.tar aborts the
-	// reconstruction instead of being absorbed by an if-guard.
-	validation := "tar -tf .vci-payload/lc.tar >/dev/null"
-	bare := "git checkout -q \"$head\" && " + validation + " && if tar -xOf .vci-payload/lc.tar patch"
-	if !strings.Contains(s, bare) {
-		t.Errorf("lc.tar validation is not a bare && step before the optional patch member logic: %s", s)
-	}
-
-	// The complete-archive validation runs before both optional member checks.
-	ordered := []string{
-		validation,
-		"if tar -xOf .vci-payload/lc.tar patch",
-		"if tar -tf .vci-payload/lc.tar f/",
-	}
-	last := -1
-	prev := ""
-	for _, want := range ordered {
-		i := strings.Index(s, want)
-		if i < 0 {
-			t.Errorf("shell missing %q: %s", want, s)
-			continue
-		}
-		if i < last {
-			t.Errorf("shell order violated: %q appears before %q: %s", want, prev, s)
-		}
-		last = i
-		prev = want
 	}
 }
 
 // TestClientStreamReconstructQuotesSeed pins that a seed path needing shell
 // quoting renders as `$HOME` plus a single-quoted suffix, so the tilde is
-// never quoted and a suffix holding spaces stays one intact tar -C argument.
+// never quoted and a suffix holding spaces stays one intact argument after
+// the remote login shell unquotes it.
 func TestClientStreamReconstructQuotesSeed(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
 	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/my code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil))
 	if err != nil {
 		t.Fatalf("reconstruct: %v", err)
 	}
-	s := runner.commands[0].Args[1]
-	if !strings.Contains(s, "tar -cf - -C $HOME'/my code/vidl' . | tar -xf -") {
-		t.Errorf("seed not rendered as $HOME plus quoted suffix: %s", s)
+	cmd := runner.commands[0]
+	if len(cmd.Args) != 5 || cmd.Args[4] != "$HOME'/my code/vidl'" {
+		t.Errorf("seed not rendered as $HOME plus quoted suffix: %q", cmd.Args)
 	}
 }
 
@@ -777,9 +672,9 @@ func TestClientStreamReconstructRejectsBadInput(t *testing.T) {
 }
 
 // TestProbeBundleCacheHitAndMiss pins that ProbeBundleCache runs
-// `ssh <host> test -f <root>/v1/<project>/<base>/complete` and maps a zero
-// remote exit to a hit and any nonzero remote exit to a miss, with or without
-// a runner error.
+// `ssh <host> vci internal-probe-cache <entry>` and maps a zero remote exit
+// to a hit and any nonzero remote exit to a miss, with or without a runner
+// error.
 func TestProbeBundleCacheHitAndMiss(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
 	hit, err := (Client{Runner: runner}).ProbeBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123")
@@ -796,7 +691,7 @@ func TestProbeBundleCacheHitAndMiss(t *testing.T) {
 	if cmd.Executable != "ssh" {
 		t.Errorf("executable: %q", cmd.Executable)
 	}
-	want := []string{"charon", "test", "-f", "~/.vci/state/bundle-cache/v1/Vci/abc123/complete"}
+	want := []string{"charon", "vci", "internal-probe-cache", "~/.vci/state/bundle-cache/v1/Vci/abc123"}
 	if len(cmd.Args) != len(want) {
 		t.Fatalf("args: %q", cmd.Args)
 	}
@@ -873,10 +768,12 @@ func TestProbeBundleCacheRejectsBadInput(t *testing.T) {
 	}
 }
 
-// TestAcquireAndReleaseBundleClaimPinShells pins the claim shell commands:
-// acquire guards on the complete marker, creates the claims dir, and writes
-// the claim marker; release removes the marker with rm -f.
-func TestAcquireAndReleaseBundleClaimPinShells(t *testing.T) {
+// TestAcquireAndReleaseBundleClaimPinCommands pins the claim commands:
+// acquire invokes `vci internal-acquire-claim <entry> <claimID>` and release
+// invokes `vci internal-release-claim <entry> <claimID>`. The worker-side
+// subcommands own the complete-marker guard, claims dir creation, marker
+// write, and rm -f semantics.
+func TestAcquireAndReleaseBundleClaimPinCommands(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
 	if err := (Client{Runner: runner}).AcquireBundleClaim(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", "abc123", "run_1"); err != nil {
 		t.Fatalf("acquire: %v", err)
@@ -887,18 +784,29 @@ func TestAcquireAndReleaseBundleClaimPinShells(t *testing.T) {
 	if len(runner.commands) != 2 {
 		t.Fatalf("runner invoked %d times, want 2", len(runner.commands))
 	}
+	entry := "~/.vci/state/bundle-cache/v1/Vci/abc123"
 	acquire := runner.commands[0]
-	if acquire.Executable != "ssh" || len(acquire.Args) != 2 || acquire.Args[0] != "charon" {
+	if acquire.Executable != "ssh" {
 		t.Fatalf("acquire command: %+v", acquire)
 	}
-	wantAcquire := "test -f ~/.vci/state/bundle-cache/v1/Vci/abc123/complete && mkdir -p ~/.vci/state/bundle-cache/v1/Vci/abc123/claims && : > ~/.vci/state/bundle-cache/v1/Vci/abc123/claims/run_1"
-	if acquire.Args[1] != wantAcquire {
-		t.Errorf("acquire shell:\n  %s\nwant:\n  %s", acquire.Args[1], wantAcquire)
+	wantAcquire := []string{"charon", "vci", "internal-acquire-claim", entry, "run_1"}
+	if len(acquire.Args) != len(wantAcquire) {
+		t.Fatalf("acquire args: %q", acquire.Args)
+	}
+	for i := range wantAcquire {
+		if acquire.Args[i] != wantAcquire[i] {
+			t.Errorf("acquire arg %d: %q want %q", i, acquire.Args[i], wantAcquire[i])
+		}
 	}
 	release := runner.commands[1]
-	wantRelease := "rm -f ~/.vci/state/bundle-cache/v1/Vci/abc123/claims/run_1"
-	if release.Args[1] != wantRelease {
-		t.Errorf("release shell:\n  %s\nwant:\n  %s", release.Args[1], wantRelease)
+	wantRelease := []string{"charon", "vci", "internal-release-claim", entry, "run_1"}
+	if len(release.Args) != len(wantRelease) {
+		t.Fatalf("release args: %q", release.Args)
+	}
+	for i := range wantRelease {
+		if release.Args[i] != wantRelease[i] {
+			t.Errorf("release arg %d: %q want %q", i, release.Args[i], wantRelease[i])
+		}
 	}
 }
 
@@ -948,11 +856,12 @@ func TestAcquireAndReleaseBundleClaimRejectBadInput(t *testing.T) {
 	}
 }
 
-// TestClientStreamNoSeedReconstructPinsShell pins the one-shot no-seed
-// reconstruction shell: init an empty repository, import the payload's full
-// bundle, checkout the submitted head, apply the lc patch and f/ overlay, and
-// remove the payload — with no cache steps at all.
-func TestClientStreamNoSeedReconstructPinsShell(t *testing.T) {
+// TestClientStreamNoSeedReconstructPinsCommand pins the one-shot no-seed
+// reconstruction invocation: `vci internal-reconstruct <workDir> --no-seed`
+// with no cache flags at all. The worker-side subcommand owns repository
+// initialization, bundle import, checkout, local-change application, and
+// payload removal.
+func TestClientStreamNoSeedReconstructPinsCommand(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
 	payload := bytes.NewReader([]byte("payload-tar"))
 	err := (Client{Runner: runner}).StreamNoSeedReconstruct(context.Background(), "charon", "~/.vci/state/work/run_abc", NoSeedCacheSpec{}, payload)
@@ -963,99 +872,64 @@ func TestClientStreamNoSeedReconstructPinsShell(t *testing.T) {
 		t.Fatalf("runner invoked %d times", len(runner.commands))
 	}
 	cmd := runner.commands[0]
-	if cmd.Executable != "ssh" || len(cmd.Args) != 2 || cmd.Args[0] != "charon" {
+	if cmd.Executable != "ssh" {
 		t.Fatalf("command: %+v", cmd)
+	}
+	want := []string{"charon", "vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "--no-seed"}
+	if len(cmd.Args) != len(want) {
+		t.Fatalf("args: %q", cmd.Args)
+	}
+	for i := range want {
+		if cmd.Args[i] != want[i] {
+			t.Errorf("arg %d: %q want %q", i, cmd.Args[i], want[i])
+		}
 	}
 	if cmd.Stdin != io.Reader(payload) {
 		t.Errorf("payload not wired to ssh stdin")
 	}
-	s := cmd.Args[1]
-	ordered := []string{
-		"mkdir -p ~/.vci/state/work/run_abc",
-		"cd ~/.vci/state/work/run_abc",
-		"mkdir -p .vci-payload",
-		"tar -xf - -C .vci-payload",
-		"git init -q",
-		"git bundle unbundle .vci-payload/bundle",
-		"head=$(cat .vci-payload/head)",
-		`git checkout -q "$head"`,
-		"git apply --binary --whitespace=nowarn .vci-payload/patch",
-		"--strip-components=1 f/",
-		"rm -rf .vci-payload",
-	}
-	last := -1
-	for _, want := range ordered {
-		i := strings.Index(s, want)
-		if i < 0 {
-			t.Errorf("shell missing %q: %s", want, s)
-			continue
-		}
-		if i < last {
-			t.Errorf("shell order violated for %q: %s", want, s)
-		}
-		last = i
-	}
 	for _, banned := range []string{"state/bundle-cache", "complete", "meta.json"} {
-		if strings.Contains(s, banned) {
-			t.Errorf("one-shot shell must not touch the cache (%q): %s", banned, s)
+		if strings.Contains(strings.Join(cmd.Args, " "), banned) {
+			t.Errorf("one-shot command must not touch the cache (%q): %q", banned, cmd.Args)
 		}
 	}
 }
 
-// TestClientStreamNoSeedReconstructHitShell pins the cache-hit shell: recency
-// is updated by touching the entry's meta.json as a bare && step chained
-// before the cached bundle import, the repository is seeded from the cached
-// entry bundle, the payload's delta bundle is imported only when present, and
-// no admission or eviction steps run.
-func TestClientStreamNoSeedReconstructHitShell(t *testing.T) {
+// TestClientStreamNoSeedReconstructHitCommand pins the cache-hit invocation:
+// `vci internal-reconstruct <workDir> --no-seed --cache <entry> --use-cached`.
+// The worker-side subcommand seeds the repository from the cached entry
+// bundle and treats the payload bundle as an optional delta; no admission or
+// eviction flags are passed.
+func TestClientStreamNoSeedReconstructHitCommand(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
 	cache := NoSeedCacheSpec{Root: "~/.vci/state/bundle-cache", Project: "Vci", Base: "abc123", UseCached: true}
 	err := (Client{Runner: runner}).StreamNoSeedReconstruct(context.Background(), "charon", "~/.vci/state/work/run_abc", cache, bytes.NewReader(nil))
 	if err != nil {
 		t.Fatalf("reconstruct: %v", err)
 	}
-	s := runner.commands[0].Args[1]
-
-	// The touch is a bare && step chained directly after git init and before
-	// the cached bundle unbundle, so a hit refreshes the entry's recency.
-	bare := "git init -q && touch ~/.vci/state/bundle-cache/v1/Vci/abc123/meta.json && git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/abc123/bundle"
-	if !strings.Contains(s, bare) {
-		t.Errorf("meta.json touch is not a bare && step before the cached unbundle: %s", s)
+	cmd := runner.commands[0]
+	want := []string{"charon", "vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "--no-seed", "--cache", "~/.vci/state/bundle-cache/v1/Vci/abc123", "--use-cached"}
+	if len(cmd.Args) != len(want) {
+		t.Fatalf("args: %q", cmd.Args)
 	}
-
-	ordered := []string{
-		"git init -q",
-		"touch ~/.vci/state/bundle-cache/v1/Vci/abc123/meta.json",
-		"git bundle unbundle ~/.vci/state/bundle-cache/v1/Vci/abc123/bundle",
-		"if [ -s .vci-payload/bundle ]",
-		`git checkout -q "$head"`,
-	}
-	last := -1
-	for _, want := range ordered {
-		i := strings.Index(s, want)
-		if i < 0 {
-			t.Errorf("shell missing %q: %s", want, s)
-			continue
+	for i := range want {
+		if cmd.Args[i] != want[i] {
+			t.Errorf("arg %d: %q want %q", i, cmd.Args[i], want[i])
 		}
-		if i < last {
-			t.Errorf("shell order violated for %q: %s", want, s)
-		}
-		last = i
 	}
-	// The hit path never writes cache entries (bundle/complete) or evicts.
-	for _, banned := range []string{"complete", "while :; do"} {
-		if strings.Contains(s, banned) {
-			t.Errorf("hit shell must not admit or evict (%q): %s", banned, s)
+	// The hit path never asks the worker to admit or evict.
+	joined := strings.Join(cmd.Args, " ")
+	for _, banned := range []string{"--admit", "--evict"} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("hit command must not admit or evict (%q): %q", banned, cmd.Args)
 		}
 	}
 }
 
-// TestClientStreamNoSeedReconstructAdmitShell pins the cache-miss admission
-// shell: after the reconstruction steps the streamed bundle is written into
-// the entry, meta.json carries the byte size and last-used timestamp, the
-// complete marker is written last, and the LRU eviction loop runs after
-// admission with the policy limits embedded.
-func TestClientStreamNoSeedReconstructAdmitShell(t *testing.T) {
+// TestClientStreamNoSeedReconstructAdmitCommand pins the cache-miss
+// invocation: the streamed bundle is admitted (`--admit <bytes> <rfc3339>`)
+// and the LRU eviction loop runs after admission with the policy limits
+// embedded (`--evict <maxEntries> <maxBytes>`).
+func TestClientStreamNoSeedReconstructAdmitCommand(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
 	now := time.Date(2026, 8, 9, 12, 34, 56, 0, time.UTC)
 	cache := NoSeedCacheSpec{
@@ -1066,30 +940,20 @@ func TestClientStreamNoSeedReconstructAdmitShell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconstruct: %v", err)
 	}
-	s := runner.commands[0].Args[1]
-	ordered := []string{
-		"mkdir -p ~/.vci/state/bundle-cache/v1/Vci/abc123",
-		"cp .vci-payload/bundle ~/.vci/state/bundle-cache/v1/Vci/abc123/bundle",
-		`printf '{"bytes":12345,"last_used":"2026-08-09T12:34:56Z"}' > ~/.vci/state/bundle-cache/v1/Vci/abc123/meta.json`,
-		": > ~/.vci/state/bundle-cache/v1/Vci/abc123/complete",
-		"while :; do",
-		`[ "$n" -le 5 ] && [ "$b" -le 5368709120 ]`,
-		`[ -n "$(ls -A "$d/claims" 2>/dev/null)" ] && continue`,
-		`[ "$d/meta.json" -ot "$o/meta.json" ]`,
-		`rm -rf "$o"`,
-		"rm -rf .vci-payload",
+	cmd := runner.commands[0]
+	want := []string{
+		"charon", "vci", "internal-reconstruct", "~/.vci/state/work/run_abc", "--no-seed",
+		"--cache", "~/.vci/state/bundle-cache/v1/Vci/abc123",
+		"--admit", "12345", "2026-08-09T12:34:56Z",
+		"--evict", "5", "5368709120",
 	}
-	last := -1
-	for _, want := range ordered {
-		i := strings.Index(s, want)
-		if i < 0 {
-			t.Errorf("shell missing %q: %s", want, s)
-			continue
+	if len(cmd.Args) != len(want) {
+		t.Fatalf("args: %q", cmd.Args)
+	}
+	for i := range want {
+		if cmd.Args[i] != want[i] {
+			t.Errorf("arg %d: %q want %q", i, cmd.Args[i], want[i])
 		}
-		if i < last {
-			t.Errorf("shell order violated for %q: %s", want, s)
-		}
-		last = i
 	}
 }
 
@@ -1140,19 +1004,19 @@ func TestClientStreamNoSeedReconstructRejectsBadInput(t *testing.T) {
 }
 
 // TestClientReapBundleCache pins the remote bundle-cache reaping pass through
-// a scripted runner: validation happens before any subprocess, the shell
-// removes stale incomplete entries and claim markers by comparing mtimes
-// against reference files touched to the 30-minute cutoffs, then enforces the
-// project LRU limits with a counting loop, and the client parses the printed
-// `stale=N evicted=M` line. Nonzero remote exits stay remote-exit failures
-// and runner failures without a remote exit stay wrapped transport errors.
+// a scripted runner: validation happens before any subprocess, the invocation
+// is `vci internal-reap-cache` with the project dir, the derived reference
+// paths, the RFC3339 cutoff timestamps, and the policy limits, and the client
+// parses the printed `stale=N evicted=M` line. Nonzero remote exits stay
+// remote-exit failures and runner failures without a remote exit stay wrapped
+// transport errors.
 func TestClientReapBundleCache(t *testing.T) {
 	projDir := "~/.vci/state/bundle-cache/v1/Vci"
 	refDir := projDir + "/.vci-reap"
 	now := time.Date(2026, 8, 9, 12, 34, 56, 0, time.UTC)
-	cutoff := "202608091204.56"
+	cutoff := "2026-08-09T12:04:56Z"
 
-	t.Run("pins shell and parses counts", func(t *testing.T) {
+	t.Run("pins command and parses counts", func(t *testing.T) {
 		runner := &stdoutRunner{stdout: "stale=3 evicted=2\n"}
 		got, err := (Client{Runner: runner}).ReapBundleCache(context.Background(), "charon", "~/.vci/state/bundle-cache", "Vci", config.BundleCachePolicy{MaxEntries: 5, MaxBytes: 5 << 30}, now)
 		if err != nil {
@@ -1165,48 +1029,21 @@ func TestClientReapBundleCache(t *testing.T) {
 			t.Fatalf("runner invoked %d times", len(runner.commands))
 		}
 		cmd := runner.commands[0]
-		if cmd.Executable != "ssh" || len(cmd.Args) != 2 || cmd.Args[0] != "charon" {
+		if cmd.Executable != "ssh" {
 			t.Fatalf("command: %+v", cmd)
 		}
-		s := cmd.Args[1]
-		ordered := []string{
-			"mkdir -p " + refDir,
-			"TZ=UTC touch -t " + cutoff + " " + refDir + "/partial",
-			"TZ=UTC touch -t " + cutoff + " " + refDir + "/claim",
-			`[ -f "$d/complete" ] && continue`,
-			`[ "$d/meta.json" -ot ` + refDir + "/partial ]",
-			`[ -d "$d/claims" ] || continue`,
-			`[ "$c" -ot ` + refDir + "/claim ]",
-			"while :; do",
-			`[ "$n" -le 5 ] && [ "$b" -le 5368709120 ]`,
-			`e=$((e+1)); rm -rf "$o" || exit`,
-			"rm -f " + refDir + "/partial " + refDir + "/claim",
-			"rmdir " + refDir,
-			`printf 'stale=%d evicted=%d\n' "$((p+q))" "$e"`,
+		want := []string{
+			"charon", "vci", "internal-reap-cache",
+			projDir, refDir, refDir + "/partial", refDir + "/claim",
+			cutoff, cutoff,
+			"5", "5368709120",
 		}
-		last := -1
-		for _, want := range ordered {
-			i := strings.Index(s, want)
-			if i < 0 {
-				t.Errorf("shell missing %q: %s", want, s)
-				continue
-			}
-			if i < last {
-				t.Errorf("shell order violated for %q: %s", want, s)
-			}
-			last = i
+		if len(cmd.Args) != len(want) {
+			t.Fatalf("args: %q", cmd.Args)
 		}
-		// The pass must stay portable POSIX sh: staleness is decided by -ot
-		// against reference files, never GNU-only find time flags or a remote
-		// scripting runtime, and removals abort the shell on failure.
-		for _, banned := range []string{"find ", "-mmin", "-delete", "python"} {
-			if strings.Contains(s, banned) {
-				t.Errorf("shell must not use %q: %s", banned, s)
-			}
-		}
-		for _, want := range []string{`rm -rf "$d" || exit`, `rm -f "$c" || exit`} {
-			if !strings.Contains(s, want) {
-				t.Errorf("shell missing %q: %s", want, s)
+		for i := range want {
+			if cmd.Args[i] != want[i] {
+				t.Errorf("arg %d: %q want %q", i, cmd.Args[i], want[i])
 			}
 		}
 	})
@@ -1231,9 +1068,11 @@ func TestClientReapBundleCache(t *testing.T) {
 		if got.Stale != 1 || got.Evicted != 0 {
 			t.Fatalf("counts: %+v", got)
 		}
-		s := runner.commands[0].Args[1]
-		if !strings.Contains(s, "e=0 && : && rm -f "+refDir+"/partial "+refDir+"/claim && rmdir "+refDir+" && printf 'stale=%d evicted=%d\\n'") {
-			t.Errorf("no-limit shell must keep the no-op eviction, clean up the reference directory, and print the count line: %s", s)
+		// With no positive limits the worker skips the eviction loop and
+		// reports zero evictions; the limits travel as zero decimal args.
+		cmd := runner.commands[0]
+		if got := cmd.Args[len(cmd.Args)-2:]; got[0] != "0" || got[1] != "0" {
+			t.Errorf("no-limit command must carry zero limits: %q", cmd.Args)
 		}
 	})
 

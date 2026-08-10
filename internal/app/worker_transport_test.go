@@ -90,7 +90,7 @@ func TestStageOrReconstructIneligibleFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh stub log: %v", err)
 	}
-	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+	for _, want := range []string{"builder", "vci", "internal-stage", "~/.vci/state/work/run_abc"} {
 		if !strings.Contains(string(sshOut), want) {
 			t.Errorf("stage command missing %q: %s", want, sshOut)
 		}
@@ -157,7 +157,7 @@ func TestStageOrReconstructProbeErrorFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh stub log: %v", err)
 	}
-	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+	for _, want := range []string{"builder", "vci", "internal-stage", "~/.vci/state/work/run_abc"} {
 		if !strings.Contains(string(sshOut), want) {
 			t.Errorf("stage command missing %q: %s", want, sshOut)
 		}
@@ -293,7 +293,7 @@ func TestStageOrReconstructStreamsSeeded(t *testing.T) {
 		t.Errorf("unexpected probe command: %+v", probe)
 	}
 	stream := runner.commands[1]
-	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+	if stream.Executable != "ssh" || len(stream.Args) != 5 || stream.Args[0] != "builder" || stream.Args[2] != "internal-reconstruct" || stream.Args[4] != "$HOME/vci-seed" {
 		t.Errorf("unexpected stream command: %+v", stream)
 	}
 	if len(runner.streamed) == 0 {
@@ -401,7 +401,7 @@ func TestStageOrReconstructStreamErrorFallsBack(t *testing.T) {
 		t.Errorf("unexpected probe command: %+v", probe)
 	}
 	stream := runner.commands[1]
-	if stream.Executable != "ssh" || len(stream.Args) != 2 || stream.Args[0] != "builder" {
+	if stream.Executable != "ssh" || len(stream.Args) != 5 || stream.Args[0] != "builder" || stream.Args[2] != "internal-reconstruct" || stream.Args[4] != "$HOME/vci-seed" {
 		t.Errorf("unexpected stream command: %+v", stream)
 	}
 	if len(runner.streamed) == 0 {
@@ -417,7 +417,7 @@ func TestStageOrReconstructStreamErrorFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh stub log: %v", err)
 	}
-	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+	for _, want := range []string{"builder", "vci", "internal-stage", "~/.vci/state/work/run_abc"} {
 		if !strings.Contains(string(sshOut), want) {
 			t.Errorf("stage command missing %q: %s", want, sshOut)
 		}
@@ -499,7 +499,7 @@ func TestStageOrReconstructEmptySubmittedHeadFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh stub log: %v", err)
 	}
-	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+	for _, want := range []string{"builder", "vci", "internal-stage", "~/.vci/state/work/run_abc"} {
 		if !strings.Contains(string(sshOut), want) {
 			t.Errorf("stage command missing %q: %s", want, sshOut)
 		}

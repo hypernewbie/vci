@@ -154,10 +154,10 @@ func validateSeed(seed string) error {
 	return nil
 }
 
-// StreamReconstruct sends a worker payload tar over SSH stdin to a remote
-// reconstruction shell. The shell seeds a VCI-owned work directory from the
-// machine's seed checkout with tar, imports the bundle the payload carries
-// (when present), checks out the submitted head, applies the durable
+// StreamReconstruct sends a worker payload tar over SSH stdin to the remote
+// `vci internal-reconstruct` subcommand. The worker seeds a VCI-owned work
+// directory from the machine's seed checkout, imports the bundle the payload
+// carries (when present), checks out the submitted head, applies the durable
 // local-change archive, and removes the extracted payload. Any remote failure
 // is an error so the caller can fall back to full workspace staging.
 func (c Client) StreamReconstruct(ctx context.Context, host, seed, workDir string, payload io.Reader) error {
@@ -170,13 +170,15 @@ func (c Client) StreamReconstruct(ctx context.Context, host, seed, workDir strin
 	if c.Runner == nil {
 		return fmt.Errorf("ssh runner is required")
 	}
-	shell, err := reconstructShell(seed, workDir)
-	if err != nil {
+	if err := validateSeed(seed); err != nil {
+		return err
+	}
+	if err := ValidateRemotePath(workDir); err != nil {
 		return err
 	}
 	result, err := c.Runner.Run(ctx, process.Command{
 		Executable: "ssh",
-		Args:       []string{host, shell},
+		Args:       []string{host, "vci", "internal-reconstruct", workDir, shellSeed(seed)},
 		Stdin:      payload,
 	})
 	if ctx.Err() != nil {
@@ -217,10 +219,13 @@ type NoSeedCacheSpec struct {
 	Now         time.Time // admission timestamp; zero means time.Now
 }
 
-// validCacheSegment mirrors bundlecache's single-segment rule: non-empty
-// letters, digits, dot, dash, and underscore with no slashes, and not "." or
-// "..". Project, base, and claim ids must all be such segments before they
-// are composed into a remote shell path.
+// ValidCacheSegment reports whether s is a single safe cache path segment:
+// letters, digits, '.', '-', '_', no slashes, and not "." or "..". Project,
+// base, and claim ids must all be such segments before they are composed
+// into a remote path. The worker-side cache subcommands validate their
+// segment arguments with the same rule the coordinator applies.
+func ValidCacheSegment(s string) bool { return validCacheSegment(s) }
+
 func validCacheSegment(s string) bool {
 	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, `\/`) {
 		return false
@@ -271,10 +276,10 @@ func cacheEntryPath(cacheRoot, project, base string) (string, error) {
 }
 
 // ProbeBundleCache asks a worker whether its bundle cache holds a complete
-// entry for project/base by running `ssh <host> test -f
-// <root>/v1/<project>/<base>/complete`. A zero remote exit is a hit; any
-// nonzero remote exit is a miss; only a runner failure without a remote exit
-// is a wrapped transport error.
+// entry for project/base by running `ssh <host> vci internal-probe-cache
+// <root>/v1/<project>/<base>`. A zero remote exit is a hit; any nonzero
+// remote exit is a miss; only a runner failure without a remote exit is a
+// wrapped transport error.
 func (c Client) ProbeBundleCache(ctx context.Context, host, cacheRoot, project, base string) (bool, error) {
 	if err := ValidateHost(host); err != nil {
 		return false, err
@@ -288,7 +293,7 @@ func (c Client) ProbeBundleCache(ctx context.Context, host, cacheRoot, project, 
 	}
 	result, err := c.Runner.Run(ctx, process.Command{
 		Executable: "ssh",
-		Args:       []string{host, "test", "-f", entry + "/complete"},
+		Args:       []string{host, "vci", "internal-probe-cache", entry},
 	})
 	if ctx.Err() != nil {
 		return false, ctx.Err()
@@ -303,9 +308,10 @@ func (c Client) ProbeBundleCache(ctx context.Context, host, cacheRoot, project, 
 }
 
 // AcquireBundleClaim writes an active-claim marker for entry project/base on
-// the worker so LRU eviction skips the entry while the coordinator uses it.
-// The complete marker must already exist; the claims dir is created on
-// demand, mirroring bundlecache.AcquireActiveClaim.
+// the worker so LRU eviction skips the entry while the coordinator uses it,
+// via `ssh <host> vci internal-acquire-claim <entry> <claimID>`. The worker
+// requires the complete marker to already exist, mirrors
+// bundlecache.AcquireActiveClaim.
 func (c Client) AcquireBundleClaim(ctx context.Context, host, cacheRoot, project, base, claimID string) error {
 	if err := ValidateHost(host); err != nil {
 		return err
@@ -320,8 +326,7 @@ func (c Client) AcquireBundleClaim(ctx context.Context, host, cacheRoot, project
 	if err != nil {
 		return err
 	}
-	shell := "test -f " + entry + "/complete && mkdir -p " + entry + "/claims && : > " + entry + "/claims/" + claimID
-	result, err := c.Runner.Run(ctx, process.Command{Executable: "ssh", Args: []string{host, shell}})
+	result, err := c.Runner.Run(ctx, process.Command{Executable: "ssh", Args: []string{host, "vci", "internal-acquire-claim", entry, claimID}})
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -337,8 +342,9 @@ func (c Client) AcquireBundleClaim(ctx context.Context, host, cacheRoot, project
 	return nil
 }
 
-// ReleaseBundleClaim removes an active-claim marker on the worker. A missing
-// marker is not an error, mirroring bundlecache.ReleaseActiveClaim.
+// ReleaseBundleClaim removes an active-claim marker on the worker via
+// `ssh <host> vci internal-release-claim <entry> <claimID>`. A missing marker
+// is not an error, mirroring bundlecache.ReleaseActiveClaim.
 func (c Client) ReleaseBundleClaim(ctx context.Context, host, cacheRoot, project, base, claimID string) error {
 	if err := ValidateHost(host); err != nil {
 		return err
@@ -353,8 +359,7 @@ func (c Client) ReleaseBundleClaim(ctx context.Context, host, cacheRoot, project
 	if err != nil {
 		return err
 	}
-	shell := "rm -f " + entry + "/claims/" + claimID
-	result, err := c.Runner.Run(ctx, process.Command{Executable: "ssh", Args: []string{host, shell}})
+	result, err := c.Runner.Run(ctx, process.Command{Executable: "ssh", Args: []string{host, "vci", "internal-release-claim", entry, claimID}})
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -379,12 +384,13 @@ type ReapBundleCacheResult struct {
 }
 
 // ReapBundleCache runs the worker-side bundle-cache maintenance pass for one
-// project over SSH: it removes incomplete entries and claim markers untouched
-// for the 30-minute windows, evicts claim-free complete entries beyond the
-// policy limits, then removes the reap reference directory before the shell
-// prints `stale=N evicted=M`, which the client parses into
-// ReapBundleCacheResult. A nonzero remote exit is a reaping failure; a runner
-// failure without a remote exit is a wrapped transport error.
+// project over SSH by invoking `vci internal-reap-cache`: it removes
+// incomplete entries and claim markers untouched for the 30-minute windows,
+// evicts claim-free complete entries beyond the policy limits, then removes
+// the reap reference directory. The worker prints `stale=N evicted=M`, which
+// the client parses into ReapBundleCacheResult. A nonzero remote exit is a
+// reaping failure; a runner failure without a remote exit is a wrapped
+// transport error.
 func (c Client) ReapBundleCache(ctx context.Context, host, cacheRoot, project string, policy config.BundleCachePolicy, now time.Time) (ReapBundleCacheResult, error) {
 	if err := ValidateHost(host); err != nil {
 		return ReapBundleCacheResult{}, err
@@ -396,11 +402,26 @@ func (c Client) ReapBundleCache(ctx context.Context, host, cacheRoot, project st
 	if err != nil {
 		return ReapBundleCacheResult{}, err
 	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	refDir := projDir + "/.vci-reap"
+	partialRef := refDir + "/partial"
+	claimRef := refDir + "/claim"
+	partialCutoff := now.Add(-bundleCachePartialTTL).Format(time.RFC3339)
+	claimCutoff := now.Add(-bundleCacheClaimTTL).Format(time.RFC3339)
 	var stdout bytes.Buffer
 	result, err := c.Runner.Run(ctx, process.Command{
 		Executable: "ssh",
-		Args:       []string{host, cacheReapShell(projDir, policy, now)},
-		Stdout:     &stdout,
+		Args: []string{
+			host, "vci", "internal-reap-cache",
+			projDir, refDir, partialRef, claimRef,
+			partialCutoff, claimCutoff,
+			strconv.Itoa(policy.MaxEntries),
+			strconv.FormatInt(policy.MaxBytes, 10),
+		},
+		Stdout: &stdout,
 	})
 	if ctx.Err() != nil {
 		return ReapBundleCacheResult{}, ctx.Err()
@@ -417,14 +438,14 @@ func (c Client) ReapBundleCache(ctx context.Context, host, cacheRoot, project st
 	return parseReapOutput(stdout.String())
 }
 
-// StreamNoSeedReconstruct sends a worker payload tar over SSH stdin to a
-// remote reconstruction shell for a machine with no seed. The shell
-// initializes an empty repository, imports a full bundle (or, on a cache
-// hit, the cached entry bundle plus the optional delta the payload carries),
-// checks out the submitted head, applies the durable local-change archive,
-// and — on a cache miss at or above the admission threshold — writes the
-// bundle into the cache entry and evicts LRU entries. Any remote failure is
-// an error so the caller can fall back to full workspace staging.
+// StreamNoSeedReconstruct sends a worker payload tar over SSH stdin to the
+// remote `vci internal-reconstruct` subcommand for a machine with no seed.
+// The worker initializes an empty repository, imports a full bundle (or, on a
+// cache hit, the cached entry bundle plus the optional delta the payload
+// carries), checks out the submitted head, applies the durable local-change
+// archive, and — on a cache miss at or above the admission threshold — writes
+// the bundle into the cache entry and evicts LRU entries. Any remote failure
+// is an error so the caller can fall back to full workspace staging.
 func (c Client) StreamNoSeedReconstruct(ctx context.Context, host, workDir string, cache NoSeedCacheSpec, payload io.Reader) error {
 	if err := ValidateHost(host); err != nil {
 		return err
@@ -435,13 +456,37 @@ func (c Client) StreamNoSeedReconstruct(ctx context.Context, host, workDir strin
 	if c.Runner == nil {
 		return fmt.Errorf("ssh runner is required")
 	}
-	shell, err := noSeedReconstructShell(workDir, cache)
-	if err != nil {
+	if err := ValidateRemotePath(workDir); err != nil {
 		return err
+	}
+	args := []string{host, "vci", "internal-reconstruct", workDir, "--no-seed"}
+	entry := ""
+	if cache.Root != "" {
+		var err error
+		entry, err = cacheEntryPath(cache.Root, cache.Project, cache.Base)
+		if err != nil {
+			return err
+		}
+	}
+	if (cache.UseCached || cache.Admit) && entry == "" {
+		return fmt.Errorf("no-seed cache reconstruction requires a cache entry")
+	}
+	if cache.UseCached {
+		args = append(args, "--cache", entry, "--use-cached")
+	}
+	if cache.Admit {
+		now := cache.Now
+		if now.IsZero() {
+			now = time.Now()
+		}
+		args = append(args, "--cache", entry, "--admit", strconv.FormatInt(cache.BundleBytes, 10), now.UTC().Format(time.RFC3339))
+		if cache.Evict {
+			args = append(args, "--evict", strconv.Itoa(cache.MaxEntries), strconv.FormatInt(cache.MaxBytes, 10))
+		}
 	}
 	result, err := c.Runner.Run(ctx, process.Command{
 		Executable: "ssh",
-		Args:       []string{host, shell},
+		Args:       args,
 		Stdin:      payload,
 	})
 	if ctx.Err() != nil {
@@ -459,126 +504,6 @@ func (c Client) StreamNoSeedReconstruct(ctx context.Context, host, workDir strin
 	return nil
 }
 
-// noSeedReconstructShell builds the remote shell that turns a streamed worker
-// payload into a reconstructed workspace on a machine with no seed. The
-// payload tar carries head, a bundle, and the durable lc.tar. Without a cache
-// entry the bundle must cover the full reachable history; on a cache hit the
-// shell imports the cached entry bundle first and then the payload's delta
-// bundle when present. On a miss with admission enabled the shell writes the
-// streamed bundle into the cache entry (meta.json, then the complete marker
-// last so an interrupted admission is never a hit) and evicts LRU entries
-// beyond the policy limits. Every step is chained with && so any failure
-// aborts the reconstruction instead of leaving a half-built workspace.
-func noSeedReconstructShell(workDir string, cache NoSeedCacheSpec) (string, error) {
-	if err := ValidateRemotePath(workDir); err != nil {
-		return "", err
-	}
-	entry := ""
-	if cache.Root != "" {
-		var err error
-		entry, err = cacheEntryPath(cache.Root, cache.Project, cache.Base)
-		if err != nil {
-			return "", err
-		}
-	}
-	if (cache.UseCached || cache.Admit) && entry == "" {
-		return "", fmt.Errorf("no-seed cache reconstruction requires a cache entry")
-	}
-
-	var b strings.Builder
-	b.WriteString("mkdir -p " + workDir)
-	b.WriteString(" && cd " + workDir)
-	b.WriteString(" && mkdir -p .vci-payload")
-	b.WriteString(" && tar -xf - -C .vci-payload")
-	b.WriteString(" && git init -q")
-	if cache.UseCached {
-		b.WriteString(" && touch " + entry + "/meta.json")
-		b.WriteString(" && git bundle unbundle " + entry + "/bundle >/dev/null 2>&1")
-		b.WriteString(" && if [ -s .vci-payload/bundle ]; then git bundle unbundle .vci-payload/bundle >/dev/null 2>&1; fi")
-	} else {
-		b.WriteString(" && git bundle unbundle .vci-payload/bundle >/dev/null 2>&1")
-	}
-	b.WriteString(" && head=$(cat .vci-payload/head)")
-	b.WriteString(" && git checkout -q \"$head\"")
-	b.WriteString(" && tar -tf .vci-payload/lc.tar >/dev/null")
-	b.WriteString(" && if tar -xOf .vci-payload/lc.tar patch > .vci-payload/patch 2>/dev/null; then git apply --binary --whitespace=nowarn .vci-payload/patch; fi")
-	b.WriteString(" && if tar -tf .vci-payload/lc.tar f/ >/dev/null 2>&1; then tar -xf .vci-payload/lc.tar -C . --strip-components=1 f/; fi")
-	if cache.Admit {
-		admit, err := cacheAdmitShell(entry, cache.BundleBytes, cache.Now)
-		if err != nil {
-			return "", err
-		}
-		b.WriteString(" && " + admit)
-		if cache.Evict {
-			evict, err := cacheEvictShell(entry, cache.MaxEntries, cache.MaxBytes)
-			if err != nil {
-				return "", err
-			}
-			b.WriteString(" && " + evict)
-		}
-	}
-	b.WriteString(" && rm -rf .vci-payload")
-	return b.String(), nil
-}
-
-// cacheAdmitShell writes the streamed payload bundle into a cache entry and
-// marks it complete, writing the complete marker last so an interrupted
-// admission is never a hit. meta.json carries the byte size and an RFC3339
-// last-used timestamp in the same shape bundlecache.Admit persists.
-func cacheAdmitShell(entry string, bundleBytes int64, now time.Time) (string, error) {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	meta := fmt.Sprintf(`{"bytes":%d,"last_used":%q}`, bundleBytes, now.UTC().Format(time.RFC3339))
-	return "mkdir -p " + entry +
-		" && cp .vci-payload/bundle " + entry + "/bundle" +
-		" && printf '" + meta + "' > " + entry + "/meta.json" +
-		" && : > " + entry + "/complete", nil
-}
-
-// cacheEvictLoop returns a POSIX sh loop that removes the
-// least-recently-used claim-free complete entries of projDir until both
-// positive limits are satisfied, mirroring bundlecache.EvictLRU. A non-empty
-// counter tallies removals into that shell variable and aborts the shell when
-// a removal fails so the loop cannot spin on an undeletable entry; an empty
-// counter keeps the bare rm shape the reconstruction shell relies on. With no
-// positive limits the loop is the no-op ":", matching EvictLRU's
-// within-limits short-circuit.
-func cacheEvictLoop(projDir string, maxEntries int, maxBytes int64, counter string) string {
-	parts := make([]string, 0, 2)
-	if maxEntries > 0 {
-		parts = append(parts, `[ "$n" -le `+strconv.Itoa(maxEntries)+` ]`)
-	}
-	if maxBytes > 0 {
-		parts = append(parts, `[ "$b" -le `+strconv.FormatInt(maxBytes, 10)+` ]`)
-	}
-	if len(parts) == 0 {
-		return ":"
-	}
-	within := parts[0]
-	if len(parts) == 2 {
-		within = parts[0] + " && " + parts[1]
-	}
-	remove := `rm -rf "$o"`
-	if counter != "" {
-		remove = counter + "=$((" + counter + "+1)); " + remove + " || exit"
-	}
-	return `while :; do n=0; b=0; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; n=$((n+1)); v=$(sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p' "$d/meta.json"); [ -n "$v" ] || v=0; b=$((b+v)); done; if ` + within + `; then break; fi; o=; for d in ` + projDir + `/*/; do [ -f "$d/complete" ] || continue; [ -n "$(ls -A "$d/claims" 2>/dev/null)" ] && continue; if [ -z "$o" ] || [ "$d/meta.json" -ot "$o/meta.json" ]; then o=$d; fi; done; [ -n "$o" ] || break; ` + remove + `; done`
-}
-
-// cacheEvictShell returns a POSIX sh loop that removes the
-// least-recently-used claim-free complete entries of a project until both
-// positive policy limits are satisfied, mirroring bundlecache.EvictLRU. entry
-// is <root>/v1/<project>/<base>; the loop operates on the project directory
-// that holds it.
-func cacheEvictShell(entry string, maxEntries int, maxBytes int64) (string, error) {
-	slash := strings.LastIndex(entry, "/")
-	if slash < 0 {
-		return "", fmt.Errorf("invalid cache entry path %q", entry)
-	}
-	return cacheEvictLoop(entry[:slash], maxEntries, maxBytes, ""), nil
-}
-
 // bundleCachePartialTTL and bundleCacheClaimTTL bound how long an incomplete
 // entry or a claim marker may go untouched before remote reaping removes it.
 const (
@@ -586,41 +511,8 @@ const (
 	bundleCacheClaimTTL   = 30 * time.Minute
 )
 
-// cacheReapShell builds the remote POSIX sh body that reaps one cache
-// project: it drops incomplete entries and claim markers older than the
-// 30-minute partial and claim windows, evicts claim-free complete entries
-// beyond the policy limits, removes the reference directory, and prints
-// `stale=N evicted=M`. Each window is a reference file touched to exactly
-// now-cutoff under a dot directory the `*/` entry globs never match, so
-// staleness uses plain POSIX `-ot` mtime comparisons — no GNU-only find
-// time flags and no remote scripting runtime. Removals abort the shell on
-// failure (`|| exit`) so a stuck rm cannot spin the eviction loop or
-// silently under-count.
-func cacheReapShell(projDir string, policy config.BundleCachePolicy, now time.Time) string {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	now = now.UTC()
-	refDir := projDir + "/.vci-reap"
-	partialRef := refDir + "/partial"
-	claimRef := refDir + "/claim"
-	partialCutoff := now.Add(-bundleCachePartialTTL).Format("200601021504.05")
-	claimCutoff := now.Add(-bundleCacheClaimTTL).Format("200601021504.05")
-
-	var b strings.Builder
-	b.WriteString("mkdir -p " + refDir)
-	b.WriteString(" && TZ=UTC touch -t " + partialCutoff + " " + partialRef)
-	b.WriteString(" && TZ=UTC touch -t " + claimCutoff + " " + claimRef)
-	b.WriteString(" && p=0 && for d in " + projDir + `/*/; do [ -d "$d" ] || continue; [ -f "$d/complete" ] && continue; if [ -f "$d/meta.json" ]; then [ "$d/meta.json" -ot ` + partialRef + ` ] || continue; else [ "$d" -ot ` + partialRef + ` ] || continue; fi; rm -rf "$d" || exit; p=$((p+1)); done`)
-	b.WriteString(" && q=0 && for d in " + projDir + `/*/; do [ -d "$d" ] || continue; [ -d "$d/claims" ] || continue; for c in "$d"/claims/*; do [ -f "$c" ] || continue; [ "$c" -ot ` + claimRef + ` ] || continue; rm -f "$c" || exit; q=$((q+1)); done; done`)
-	b.WriteString(" && e=0 && " + cacheEvictLoop(projDir, policy.MaxEntries, policy.MaxBytes, "e"))
-	b.WriteString(" && rm -f " + partialRef + " " + claimRef + " && rmdir " + refDir)
-	b.WriteString(` && printf 'stale=%d evicted=%d\n' "$((p+q))" "$e"`)
-	return b.String()
-}
-
-// reapOutputRe matches the machine-readable removal line the reaping shell
-// prints.
+// reapOutputRe matches the machine-readable removal line the reaping
+// subcommand prints.
 var reapOutputRe = regexp.MustCompile(`stale=(\d+) evicted=(\d+)`)
 
 // parseReapOutput decodes the reaping shell's removal-count line. A missing
@@ -643,8 +535,9 @@ func parseReapOutput(out string) (ReapBundleCacheResult, error) {
 }
 
 // StageRemote clears the validated remote work dir, then tars a local
-// workspace and streams it to remoteWorkDir over SSH. The command uses
-// tar data only, with no shell content from the workspace payload.
+// workspace and streams it to the remote `vci internal-stage` subcommand over
+// SSH. The command uses tar data only, with no shell content from the
+// workspace payload.
 func StageRemote(ctx context.Context, host, remoteWorkDir, localWorkspace string) error {
 	if err := ValidateHost(host); err != nil {
 		return err
@@ -663,14 +556,12 @@ func StageRemote(ctx context.Context, host, remoteWorkDir, localWorkspace string
 		return fmt.Errorf("local workspace is not a directory")
 	}
 	tarCmd := exec.CommandContext(ctx, "tar", "-cf", "-", "-C", localWorkspace, ".")
-	sshCmd := exec.CommandContext(ctx, "ssh", host, "rm -rf "+remoteWorkDir+" && mkdir -p "+remoteWorkDir+" && cd "+remoteWorkDir+" && tar -xpf -")
+	sshCmd := exec.CommandContext(ctx, "ssh", host, "vci", "internal-stage", remoteWorkDir)
 	tarOut, err := tarCmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("tar stdout: %w", err)
 	}
 	sshCmd.Stdin = tarOut
-	var stderr bytes.Buffer
-	sshCmd.Stderr = &stderr
 	if err := tarCmd.Start(); err != nil {
 		return fmt.Errorf("start tar: %w", err)
 	}
@@ -680,11 +571,7 @@ func StageRemote(ctx context.Context, host, remoteWorkDir, localWorkspace string
 		return fmt.Errorf("archive workspace: %w", tarErr)
 	}
 	if sshErr != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = sshErr.Error()
-		}
-		return fmt.Errorf("ssh %s: %s", host, message)
+		return fmt.Errorf("ssh %s: %w", host, sshErr)
 	}
 	return nil
 }
@@ -712,37 +599,6 @@ func FetchRemote(ctx context.Context, host, remoteWorkDir, localDest string) err
 		return fmt.Errorf("scp %s: %s", host, message)
 	}
 	return nil
-}
-
-// reconstructShell builds the remote `sh -c` body that turns a streamed
-// worker payload into a reconstructed workspace at workDir. The payload tar
-// carries head, an optional bundle, and the durable lc.tar; the shell extracts
-// it into a private dot-directory, seeds the workspace from the machine's
-// checkout with tar, imports the bundle when present, checks out the submitted
-// head, validates the complete lc.tar archive with `tar -tf` redirected to
-// /dev/null, applies the tracked-change patch, restores untracked files by
-// stripping the lc.tar "f/" prefix, and removes the payload directory. Every
-// step is chained with && so any failure aborts the reconstruction instead of
-// leaving a half-built workspace.
-func reconstructShell(seed, workDir string) (string, error) {
-	if err := ValidateRemotePath(workDir); err != nil {
-		return "", err
-	}
-	if err := validateSeed(seed); err != nil {
-		return "", err
-	}
-	return "mkdir -p " + workDir +
-		" && cd " + workDir +
-		" && mkdir -p .vci-payload" +
-		" && tar -xf - -C .vci-payload" +
-		" && tar -cf - -C " + shellSeed(seed) + " . | tar -xf -" +
-		" && head=$(cat .vci-payload/head)" +
-		" && if [ -s .vci-payload/bundle ]; then git bundle unbundle .vci-payload/bundle >/dev/null 2>&1; fi" +
-		" && git checkout -q \"$head\"" +
-		" && tar -tf .vci-payload/lc.tar >/dev/null" +
-		" && if tar -xOf .vci-payload/lc.tar patch > .vci-payload/patch 2>/dev/null; then git apply --binary --whitespace=nowarn .vci-payload/patch; fi" +
-		" && if tar -tf .vci-payload/lc.tar f/ >/dev/null 2>&1; then tar -xf .vci-payload/lc.tar -C . --strip-components=1 f/; fi" +
-		" && rm -rf .vci-payload", nil
 }
 
 // shellSeed renders a seed path as a remote shell word. A leading `~/` is
