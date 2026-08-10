@@ -274,8 +274,8 @@ func TestRunRemoteRejectsBadInput(t *testing.T) {
 }
 
 // TestStageRemoteStreamsWorkspace pins that staging pipes a tar of
-// the local workspace into `ssh <host> "mkdir -p <workDir> && cd
-// <workDir> && tar -xpf -"`.
+// the local workspace into `ssh <host> "rm -rf <workDir> && mkdir -p
+// <workDir> && cd <workDir> && tar -xpf -"`.
 func TestStageRemoteStreamsWorkspace(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires Unix ssh")
@@ -292,10 +292,50 @@ func TestStageRemoteStreamsWorkspace(t *testing.T) {
 	}
 	log, _ := os.ReadFile(logPath)
 	s := string(log)
-	for _, want := range []string{"builder", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
+	for _, want := range []string{"builder", "rm -rf ~/.vci/state/work/run_abc", "mkdir -p ~/.vci/state/work/run_abc", "cd ~/.vci/state/work/run_abc", "tar -xpf -"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("stage command missing %q: %s", want, s)
 		}
+	}
+}
+
+// TestStageRemoteClearsWorkDir pins that staging removes the validated
+// remote work dir before mkdir and tar extraction, so seed and
+// .vci-payload residue from a failed reconstruction cannot contaminate
+// fallback staging.
+func TestStageRemoteClearsWorkDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\ncat >/dev/null 2>&1\nexit 0\n")
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := StageRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", workspace); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	log, _ := os.ReadFile(logPath)
+	s := string(log)
+	ordered := []string{
+		"rm -rf ~/.vci/state/work/run_abc",
+		"mkdir -p ~/.vci/state/work/run_abc",
+		"cd ~/.vci/state/work/run_abc",
+		"tar -xpf -",
+	}
+	last := -1
+	for _, want := range ordered {
+		i := strings.Index(s, want)
+		if i < 0 {
+			t.Errorf("stage shell missing %q: %s", want, s)
+			continue
+		}
+		if i < last {
+			t.Errorf("stage shell order violated for %q: %s", want, s)
+		}
+		last = i
 	}
 }
 
@@ -422,6 +462,315 @@ func TestClientRunRemoteTransportError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ssh builder") || !errors.Is(err, runner.err) {
 		t.Errorf("error: %v", err)
+	}
+}
+
+// stdoutRunner is a scriptRunner that also writes scripted output to
+// the command's stdout writer before replaying the recorded result.
+type stdoutRunner struct {
+	scriptRunner
+	stdout string
+}
+
+func (r *stdoutRunner) Run(ctx context.Context, command process.Command) (process.Result, error) {
+	if command.Stdout != nil {
+		io.WriteString(command.Stdout, r.stdout)
+	}
+	return r.scriptRunner.Run(ctx, command)
+}
+
+// TestProbeSeedHeadReturnsHead pins that ProbeSeedHead runs
+// `ssh <host> git -C <seed> rev-parse HEAD` through the runner, with a
+// `~/` seed rendered as `$HOME` plus its suffix, and returns the trimmed
+// stdout as the seed head. A `~/` seed whose suffix holds a space renders
+// as `$HOME` plus a single-quoted suffix.
+func TestProbeSeedHeadReturnsHead(t *testing.T) {
+	runner := &stdoutRunner{stdout: "deadbeef\n  "}
+	head, err := (Client{Runner: runner}).ProbeSeedHead(context.Background(), "charon", "~/code/vidl")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if head != "deadbeef" {
+		t.Fatalf("head: %q", head)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("runner invoked %d times", len(runner.commands))
+	}
+	cmd := runner.commands[0]
+	if cmd.Executable != "ssh" {
+		t.Errorf("executable: %q", cmd.Executable)
+	}
+	want := []string{"charon", "git", "-C", "$HOME/code/vidl", "rev-parse", "HEAD"}
+	if len(cmd.Args) != len(want) {
+		t.Fatalf("args: %q", cmd.Args)
+	}
+	for i := range want {
+		if cmd.Args[i] != want[i] {
+			t.Errorf("arg %d: %q want %q", i, cmd.Args[i], want[i])
+		}
+	}
+
+	// A `~/` seed with a space in its suffix renders as $HOME plus a
+	// single-quoted suffix, never with the tilde inside the quotes.
+	spaceRunner := &stdoutRunner{stdout: "c0ffee\n"}
+	if _, err := (Client{Runner: spaceRunner}).ProbeSeedHead(context.Background(), "charon", "~/my code/vidl"); err != nil {
+		t.Fatalf("probe space seed: %v", err)
+	}
+	if len(spaceRunner.commands) != 1 {
+		t.Fatalf("runner invoked %d times for space seed", len(spaceRunner.commands))
+	}
+	if got := spaceRunner.commands[0].Args[3]; got != "$HOME'/my code/vidl'" {
+		t.Errorf("space seed -C arg: %q want %q", got, "$HOME'/my code/vidl'")
+	}
+}
+
+// TestProbeSeedHeadNonzeroExit pins that a nonzero remote exit (the
+// seed is not a Git checkout) is an empty head, not an error.
+func TestProbeSeedHeadNonzeroExit(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 128}, err: errors.New("exit status 128")}
+	head, err := (Client{Runner: runner}).ProbeSeedHead(context.Background(), "charon", "~/code/vidl")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if head != "" {
+		t.Fatalf("head: %q", head)
+	}
+}
+
+// TestProbeSeedHeadNonzeroExitWithoutError pins that a runner
+// reporting a nonzero exit without an error still yields an empty
+// head rather than a transport error.
+func TestProbeSeedHeadNonzeroExitWithoutError(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 3}}
+	head, err := (Client{Runner: runner}).ProbeSeedHead(context.Background(), "charon", "~/code/vidl")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if head != "" {
+		t.Fatalf("head: %q", head)
+	}
+}
+
+// TestProbeSeedHeadTransportError pins that an ssh-level failure with
+// no remote exit is a wrapped transport error.
+func TestProbeSeedHeadTransportError(t *testing.T) {
+	runner := &scriptRunner{err: errors.New("connection refused")}
+	head, err := (Client{Runner: runner}).ProbeSeedHead(context.Background(), "charon", "~/code/vidl")
+	if err == nil {
+		t.Fatal("transport error not reported")
+	}
+	if head != "" {
+		t.Fatalf("head: %q", head)
+	}
+	if !strings.Contains(err.Error(), "ssh charon") || !errors.Is(err, runner.err) {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestProbeSeedHeadRejectsBadInput pins that invalid hosts and seeds
+// and a nil runner fail before any subprocess starts.
+func TestProbeSeedHeadRejectsBadInput(t *testing.T) {
+	runner := &scriptRunner{}
+	cases := []struct {
+		name   string
+		client Client
+		host   string
+		seed   string
+	}{
+		{"empty host", Client{Runner: runner}, "", "~/code/vidl"},
+		{"empty seed", Client{Runner: runner}, "charon", ""},
+		{"dash seed", Client{Runner: runner}, "charon", "-seed"},
+		{"control seed", Client{Runner: runner}, "charon", "a\nb"},
+		{"nil runner", Client{}, "charon", "~/code/vidl"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.client.ProbeSeedHead(context.Background(), tc.host, tc.seed); err == nil {
+				t.Errorf("accepted host %q seed %q", tc.host, tc.seed)
+			}
+		})
+	}
+	if len(runner.commands) != 0 {
+		t.Errorf("runner invoked %d times for rejected input", len(runner.commands))
+	}
+}
+
+// TestClientStreamReconstructPinsShell pins that StreamReconstruct hands
+// `ssh <host> <shell>` to the runner with the payload wired to stdin, and that
+// the shell reconstructs in the documented order: extract the payload into a
+// private directory, tar-copy the seed, unbundle when a bundle is present,
+// checkout the submitted head, apply the lc patch, restore the untracked
+// "f/" tree with --strip-components=1, and remove the payload directory. The
+// seed copy must never use cp -a.
+func TestClientStreamReconstructPinsShell(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	payload := bytes.NewReader([]byte("payload-tar"))
+	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/code/vidl", "~/.vci/state/work/run_abc", payload)
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("runner invoked %d times", len(runner.commands))
+	}
+	cmd := runner.commands[0]
+	if cmd.Executable != "ssh" {
+		t.Errorf("executable: %q", cmd.Executable)
+	}
+	if len(cmd.Args) != 2 || cmd.Args[0] != "charon" {
+		t.Fatalf("args: %q", cmd.Args)
+	}
+	if cmd.Stdin != io.Reader(payload) {
+		t.Errorf("payload not wired to ssh stdin")
+	}
+	s := cmd.Args[1]
+	ordered := []string{
+		"mkdir -p ~/.vci/state/work/run_abc",
+		"cd ~/.vci/state/work/run_abc",
+		"mkdir -p .vci-payload",
+		"tar -xf - -C .vci-payload",
+		"tar -cf - -C $HOME/code/vidl . | tar -xf -",
+		"head=$(cat .vci-payload/head)",
+		"if [ -s .vci-payload/bundle ]",
+		"git bundle unbundle .vci-payload/bundle",
+		`git checkout -q "$head"`,
+		"git apply --binary --whitespace=nowarn .vci-payload/patch",
+		"--strip-components=1 f/",
+		"rm -rf .vci-payload",
+	}
+	last := -1
+	for _, want := range ordered {
+		i := strings.Index(s, want)
+		if i < 0 {
+			t.Errorf("shell missing %q: %s", want, s)
+			continue
+		}
+		if i < last {
+			t.Errorf("shell order violated for %q: %s", want, s)
+		}
+		last = i
+	}
+	if strings.Contains(s, "cp -a") {
+		t.Errorf("shell copies the seed with cp -a: %s", s)
+	}
+}
+
+// TestClientStreamReconstructValidatesLCArchive pins that the reconstruction
+// shell validates the complete lc.tar archive with `tar -tf` redirected to
+// /dev/null before any optional patch/f member handling, so a corrupt archive
+// fails the && chain while a valid archive with no patch or f members still
+// proceeds. The validation must be a bare && step, not an if-guarded one.
+func TestClientStreamReconstructValidatesLCArchive(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("runner invoked %d times", len(runner.commands))
+	}
+	s := runner.commands[0].Args[1]
+
+	// The complete archive is listed with stdout discarded, chained directly
+	// after the checkout as a bare && step, so a corrupt lc.tar aborts the
+	// reconstruction instead of being absorbed by an if-guard.
+	validation := "tar -tf .vci-payload/lc.tar >/dev/null"
+	bare := "git checkout -q \"$head\" && " + validation + " && if tar -xOf .vci-payload/lc.tar patch"
+	if !strings.Contains(s, bare) {
+		t.Errorf("lc.tar validation is not a bare && step before the optional patch member logic: %s", s)
+	}
+
+	// The complete-archive validation runs before both optional member checks.
+	ordered := []string{
+		validation,
+		"if tar -xOf .vci-payload/lc.tar patch",
+		"if tar -tf .vci-payload/lc.tar f/",
+	}
+	last := -1
+	prev := ""
+	for _, want := range ordered {
+		i := strings.Index(s, want)
+		if i < 0 {
+			t.Errorf("shell missing %q: %s", want, s)
+			continue
+		}
+		if i < last {
+			t.Errorf("shell order violated: %q appears before %q: %s", want, prev, s)
+		}
+		last = i
+		prev = want
+	}
+}
+
+// TestClientStreamReconstructQuotesSeed pins that a seed path needing shell
+// quoting renders as `$HOME` plus a single-quoted suffix, so the tilde is
+// never quoted and a suffix holding spaces stays one intact tar -C argument.
+func TestClientStreamReconstructQuotesSeed(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 0}}
+	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/my code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	s := runner.commands[0].Args[1]
+	if !strings.Contains(s, "tar -cf - -C $HOME'/my code/vidl' . | tar -xf -") {
+		t.Errorf("seed not rendered as $HOME plus quoted suffix: %s", s)
+	}
+}
+
+// TestClientStreamReconstructNonzeroExit pins that a non-zero remote exit is a
+// reconstruction failure, not a transport error.
+func TestClientStreamReconstructNonzeroExit(t *testing.T) {
+	runner := &scriptRunner{result: process.Result{ExitCode: 9}, err: errors.New("exit status 9")}
+	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil))
+	if err == nil {
+		t.Fatal("nonzero remote exit not reported")
+	}
+	if !strings.Contains(err.Error(), "reconstruct charon: remote exit 9") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestClientStreamReconstructTransportError pins that a runner failure without
+// a remote exit is a wrapped ssh transport error.
+func TestClientStreamReconstructTransportError(t *testing.T) {
+	runner := &scriptRunner{err: errors.New("connection refused")}
+	err := (Client{Runner: runner}).StreamReconstruct(context.Background(), "charon", "~/code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil))
+	if err == nil {
+		t.Fatal("transport error not reported")
+	}
+	if !strings.Contains(err.Error(), "ssh charon") || !errors.Is(err, runner.err) {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestClientStreamReconstructRejectsBadInput pins that invalid hosts, seeds,
+// work dirs, a nil payload, and a nil runner fail before any subprocess runs.
+func TestClientStreamReconstructRejectsBadInput(t *testing.T) {
+	runner := &scriptRunner{}
+	tc := []struct {
+		name    string
+		client  Client
+		host    string
+		seed    string
+		workDir string
+		payload io.Reader
+	}{
+		{"empty host", Client{Runner: runner}, "", "~/code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil)},
+		{"empty seed", Client{Runner: runner}, "charon", "", "~/.vci/state/work/run_abc", bytes.NewReader(nil)},
+		{"dash seed", Client{Runner: runner}, "charon", "-seed", "~/.vci/state/work/run_abc", bytes.NewReader(nil)},
+		{"control seed", Client{Runner: runner}, "charon", "a\nb", "~/.vci/state/work/run_abc", bytes.NewReader(nil)},
+		{"bad work dir", Client{Runner: runner}, "charon", "~/code/vidl", "/tmp/other", bytes.NewReader(nil)},
+		{"nil payload", Client{Runner: runner}, "charon", "~/code/vidl", "~/.vci/state/work/run_abc", nil},
+		{"nil runner", Client{}, "charon", "~/code/vidl", "~/.vci/state/work/run_abc", bytes.NewReader(nil)},
+	}
+	for _, tc := range tc {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.client.StreamReconstruct(context.Background(), tc.host, tc.seed, tc.workDir, tc.payload); err == nil {
+				t.Errorf("accepted host %q seed %q workDir %q", tc.host, tc.seed, tc.workDir)
+			}
+		})
+	}
+	if len(runner.commands) != 0 {
+		t.Errorf("runner invoked %d times for rejected input", len(runner.commands))
 	}
 }
 

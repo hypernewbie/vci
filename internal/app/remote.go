@@ -1,9 +1,11 @@
 package app
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/hypernewbie/vci/internal/config"
 	"github.com/hypernewbie/vci/internal/host"
@@ -308,10 +310,119 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
+// workerPayload assembles the private tar streamed to a worker machine for a
+// submission-backed remote build. It carries the submitted commit as "head",
+// the Git objects the worker lacks as "bundle" (omitted when the worker
+// already has head), and the run's durable local-change archive as "lc.tar",
+// copied byte-for-byte so the worker reconstructs exactly the submitted
+// state. sourceRoot is the submitted source checkout; CreateBundle only
+// touches transient refs, never the working tree or index.
+func workerPayload(ctx context.Context, sourceRoot, have, head, lcPath string) (io.ReadCloser, error) {
+	var bundle []byte
+	bundleRC, err := source.CreateBundle(ctx, sourceRoot, have, head, process.Native{})
+	if err != nil && !errors.Is(err, source.ErrBundleEmpty) {
+		return nil, fmt.Errorf("create worker bundle: %w", err)
+	}
+	if bundleRC != nil {
+		bundle, err = io.ReadAll(bundleRC)
+		_ = bundleRC.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read worker bundle: %w", err)
+		}
+	}
+	lc, err := os.ReadFile(lcPath)
+	if err != nil {
+		return nil, fmt.Errorf("read durable local-change archive: %w", err)
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := writePayloadEntry(tw, "head", []byte(strings.TrimSpace(head)+"\n")); err != nil {
+		return nil, err
+	}
+	if len(bundle) > 0 {
+		if err := writePayloadEntry(tw, "bundle", bundle); err != nil {
+			return nil, err
+		}
+	}
+	if err := writePayloadEntry(tw, "lc.tar", lc); err != nil {
+		return nil, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+}
+
+// writePayloadEntry writes one regular-file member into a worker payload tar.
+func writePayloadEntry(tw *tar.Writer, name string, data []byte) error {
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(data)), Typeflag: tar.TypeReg}); err != nil {
+		return err
+	}
+	_, err := tw.Write(data)
+	return err
+}
+
+// seededReconstructionEligible reports whether a machine can reconstruct the
+// submitted local changes onto its own source checkout: the machine must have
+// a source path seeded for the project, the project must declare no hard
+// workspace exclusions (which the seeded overlay cannot honor), and the
+// durable local-change archive must be present as a regular file.
+func seededReconstructionEligible(machine config.Machine, project config.Project, projectName, lcPath string) bool {
+	if machine.SourcePaths[projectName] == "" {
+		return false
+	}
+	if len(project.ExcludedPaths) != 0 {
+		return false
+	}
+	info, err := os.Stat(lcPath)
+	return err == nil && info.Mode().IsRegular()
+}
+
+// stageOrReconstruct prepares a worker's remote workspace for a
+// submission-backed remote build. When the machine is eligible for seeded
+// reconstruction it probes the machine's seed checkout for its head and
+// streams a reconstruction payload; any probe, payload, or stream failure
+// falls back to full workspace staging exactly as executeRemote stages it.
+// runner supplies the ssh transport for the probe and the stream.
+// submittedHead is the submitted commit used as the payload head; the
+// probed seed head is the bundle base, so the worker receives exactly the
+// objects it lacks.
+func stageOrReconstruct(ctx context.Context, runner process.Runner, machine config.Machine, project config.Project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir string) error {
+	if !seededReconstructionEligible(machine, project, projectName, lcPath) {
+		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
+			return fmt.Errorf("stage remote workspace: %w", err)
+		}
+		return nil
+	}
+	seed := machine.SourcePaths[projectName]
+	client := host.Client{Runner: runner}
+	seedHead, err := client.ProbeSeedHead(ctx, machine.Host, seed)
+	if err != nil || seedHead == "" {
+		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
+			return fmt.Errorf("stage remote workspace: %w", err)
+		}
+		return nil
+	}
+	payload, err := workerPayload(ctx, sourceRoot, seedHead, submittedHead, lcPath)
+	if err != nil {
+		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
+			return fmt.Errorf("stage remote workspace: %w", err)
+		}
+		return nil
+	}
+	if err := client.StreamReconstruct(ctx, machine.Host, seed, remoteWorkDir, payload); err != nil {
+		if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
+			return fmt.Errorf("stage remote workspace: %w", err)
+		}
+		return nil
+	}
+	return nil
+}
+
 // executeRemote stages workspace on a remote host via ssh, runs the command,
 // fetches artifacts if requested, and best-effort cleans the remote workspace.
 // Uses `ssh`, `tar`, and `scp` only and returns runtime.Result with matches.
-func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir string, machine config.Machine, workspace string, project config.Project, pair process.Pair) (runtime.Result, []string, bool, error) {
+func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir string, machine config.Machine, sourceRoot string, workspace string, project config.Project, projectName, lcPath, submittedHead string, pair process.Pair) (runtime.Result, []string, bool, error) {
 	remoteWorkDir, err := host.RemoteWorkDir(id)
 	if err != nil {
 		return runtime.Result{}, nil, false, err
@@ -323,8 +434,8 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 		_ = reaper.CleanupRemote(context.Background(), machine.Host, remoteWorkDir)
 	}()
 
-	if err := host.StageRemote(ctx, machine.Host, remoteWorkDir, workspace); err != nil {
-		return runtime.Result{}, nil, false, fmt.Errorf("stage remote workspace: %w", err)
+	if err := stageOrReconstruct(ctx, process.Native{}, machine, project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir); err != nil {
+		return runtime.Result{}, nil, false, err
 	}
 	argv, err := remoteArgv(machine, remoteWorkDir, project.Command)
 	if err != nil {

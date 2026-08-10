@@ -239,8 +239,9 @@ func TestPrepareHostedRequiresConfiguredProject(t *testing.T) {
 
 // TestPrepareHostedAdditiveSourceProvenance pins that the staged
 // record's ConfigSnapshot contains the additive source_provenance
-// block (kind=hosted_git, validated URL, pinned commit) but a
-// direct Prepare call on the same project produces no such block.
+// block (kind=hosted_git, validated URL, pinned commit) and a
+// top-level source_head equal to the validated commit, but a
+// direct Prepare call on the same project produces no such fields.
 // The test does not exercise a real checkout; instead it stubs the
 // source-owned checkout by writing a fixture git repo into the
 // expected checkout path ahead of time. The fake approach would
@@ -265,9 +266,14 @@ func TestPrepareHostedAdditiveSourceProvenance(t *testing.T) {
 	// pipeline via a real local fixture repo and a fork-style call.
 	// The simplest way to assert the snapshot shape without a real
 	// fetch is to test the build-staged-snapshot helper directly.
+	fallback := config.HostedFallback{URL: "https://example.com/o/r.git", Commit: hostedFixtureCommit}
+	validated, err := fallback.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
 	provenance := map[string]any{"kind": "hosted_git", "url": "https://example.com/o/r.git", "commit": hostedFixtureCommit}
 	cfg := config.Config{LogLimits: config.DefaultLogLimits, Retention: config.DefaultRetention}
-	snap := buildStagedSnapshot("demo", config.Project{Machines: []string{"mac-local"}, Command: []string{"true"}}, "mac-local", cfg, provenance)
+	snap := buildStagedSnapshot("demo", config.Project{Machines: []string{"mac-local"}, Command: []string{"true"}}, "mac-local", cfg, validated.Commit, provenance)
 	data, err := json.Marshal(snap)
 	if err != nil {
 		t.Fatal(err)
@@ -289,8 +295,18 @@ func TestPrepareHostedAdditiveSourceProvenance(t *testing.T) {
 	if prov["commit"] != hostedFixtureCommit {
 		t.Fatalf("commit: %v", prov["commit"])
 	}
+	// The staged snapshot must carry the validated commit as the
+	// top-level source_head; decoding into the same runSnapshot shape
+	// ExecutePrepared decodes must yield exactly the validated commit.
+	var decoded runSnapshot
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.SourceHead != validated.Commit {
+		t.Fatalf("source_head: %v, want %v", decoded.SourceHead, validated.Commit)
+	}
 	// Direct (no provenance) variant must omit the key.
-	direct := buildStagedSnapshot("demo", config.Project{Machines: []string{"mac-local"}, Command: []string{"true"}}, "mac-local", cfg, nil)
+	direct := buildStagedSnapshot("demo", config.Project{Machines: []string{"mac-local"}, Command: []string{"true"}}, "mac-local", cfg, "", nil)
 	directData, _ := json.Marshal(direct)
 	var directOut map[string]any
 	_ = json.Unmarshal(directData, &directOut)

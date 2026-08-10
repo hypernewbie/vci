@@ -195,7 +195,7 @@ func TestSnapshotMachinesPersisted(t *testing.T) {
 		},
 		Projects: map[string]config.Project{"demo": project},
 	}
-	out := buildStagedSnapshot("demo", project, "linux-docker", cfg, nil)
+	out := buildStagedSnapshot("demo", project, "linux-docker", cfg, "", nil)
 	raw, _ := json.Marshal(out)
 	if !bytes.Contains(raw, []byte(`"machines"`)) {
 		t.Errorf("snapshot missing machines: %s", raw)

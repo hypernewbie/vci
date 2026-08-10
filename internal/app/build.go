@@ -51,6 +51,7 @@ type PreparedRun struct {
 type runSnapshot struct {
 	ProjectConfig config.Project            `json:"project_config"`
 	Machine       string                    `json:"machine,omitempty"`
+	SourceHead    string                    `json:"source_head,omitempty"`
 	Machines      map[string]config.Machine `json:"machines"`
 	LogLimits     config.LogLimits          `json:"log_limits"`
 }
@@ -93,7 +94,7 @@ func Prepare(ctx context.Context, l model.Layout, sourcePath string) (PreparedRu
 	}
 	var staged store.RunRecord
 	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
-		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, "", buildStagedSnapshot(projectName, project, machineName, cfg, nil), now)
+		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, "", buildStagedSnapshot(projectName, project, machineName, cfg, "", nil), now)
 		if buildErr != nil {
 			return buildErr
 		}
@@ -122,7 +123,7 @@ func buildDraftSnapshot(projectName string, project config.Project, cfg config.C
 }
 
 // buildStagedSnapshot returns the staged config snapshot, optionally with source_provenance.
-func buildStagedSnapshot(projectName string, project config.Project, machineName string, cfg config.Config, provenance map[string]any) map[string]any {
+func buildStagedSnapshot(projectName string, project config.Project, machineName string, cfg config.Config, sourceHead string, provenance map[string]any) map[string]any {
 	out := map[string]any{
 		"schema_version": config.SchemaVersion,
 		"project":        projectName,
@@ -131,6 +132,9 @@ func buildStagedSnapshot(projectName string, project config.Project, machineName
 		"machines":       cfg.Machines,
 		"log_limits":     cfg.LogLimits,
 		"retention":      cfg.Retention,
+	}
+	if sourceHead != "" {
+		out["source_head"] = sourceHead
 	}
 	if provenance != nil {
 		out["source_provenance"] = provenance
@@ -207,7 +211,7 @@ func PrepareHosted(ctx context.Context, l model.Layout, projectName string) (Pre
 	}
 	var staged store.RunRecord
 	err = scheduler.ReserveAndPublish(l, runStore, cfg, draftRecord.ID, project.Machines, now, func(machineName string) error {
-		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, buildStagedSnapshot(projectName, project, machineName, cfg, provenance), now)
+		record, buildErr := store.NewStagedRunFromID(draftRecord.ID, projectName, machineName, project.Command, manifest.Digest, buildStagedSnapshot(projectName, project, machineName, cfg, validated.Commit, provenance), now)
 		if buildErr != nil {
 			return buildErr
 		}
@@ -422,7 +426,7 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		_, _ = runStore.Transition(id, model.RunLost, time.Now().UTC())
 		return BuildResult{}, err
 	}
-	cleanReconstructStaging(l, record.SourcePath)
+	defer cleanReconstructStaging(l, record.SourcePath)
 	if cancellationRequested(runStore, id) {
 		_ = removeOwned(workspace)
 		_, _ = runStore.Transition(id, model.RunAborted, time.Now().UTC())
@@ -458,7 +462,18 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 	var artifactsTruncated bool
 	if machine.Host != "" {
 		// Remote path: run via ssh on the target host.
-		execResult, collectedArtifacts, artifactsTruncated, execErr = executeRemote(workerCtx, l, id, runDir, machine, workspace, project, pair)
+		lcPath, _ := submissionLCPath(l, id)
+		submittedHead := snapshot.SourceHead
+		if submittedHead == "" && record.SourcePath != "" {
+			identity, err := source.CaptureIdentity(workerCtx, record.SourcePath, process.Native{})
+			if err == nil {
+				submittedHead = identity.Head
+			}
+		}
+		// Leave an unresolvable submittedHead empty and proceed to
+		// executeRemote: stageOrReconstruct falls back to full workspace
+		// staging whenever reconstruction cannot proceed.
+		execResult, collectedArtifacts, artifactsTruncated, execErr = executeRemote(workerCtx, l, id, runDir, machine, record.SourcePath, workspace, project, record.Project, lcPath, submittedHead, pair)
 	} else {
 		execResult, execErr = execRunner.ExecuteSupervised(workerCtx, runtime.Request{Executable: project.Command[0], Args: project.Command[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
 			execution := process.Execution{SchemaVersion: model.SchemaVersion, RunID: id, Owner: owner, PID: running.PID, PGID: running.PGID, StartedAt: running.StartedAt, CancellationPhase: process.CancellationNone}
