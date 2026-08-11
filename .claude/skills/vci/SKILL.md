@@ -5,10 +5,11 @@ description: Run CI through Vci and report where it ran, whether it passed, and 
 
 # Vci: run CI on an already configured installation
 
-Vci runs the coordinator-configured build command for this repository on a
-configured machine and keeps the run ID, machine, exit code, logs, and
-artifacts with the result. It is a single binary with no web service,
-dashboard, queue, or custom protocol.
+Vci runs the coordinator-configured build command for this repository on
+every attached machine and keeps the run ID, per-target exit code, logs,
+and artifacts with the result. It is a single binary with no web service,
+dashboard, queue, or custom protocol. The coordinator runs at most one
+build at a time across all attached machines.
 
 This skill runs builds and can bootstrap **only this client** to use an
 already-working remote coordinator. It never administers a coordinator.
@@ -54,7 +55,21 @@ not run them as mandatory preflight.
 
 ## Workflow
 
-### 1. Submit a build
+### 1. Wait for the coordinator to be ready
+
+The coordinator runs at most one build at a time. When a previous build
+may still be running, block on it so the submit does not need to poll:
+
+```sh
+vci wait-ready
+vci wait-ready --interval 2   # seconds, 1..3600, default 1
+```
+
+`wait-ready` returns one JSON envelope with `data.ready: true` once the
+coordinator has no live build. Skip it when the coordinator is known
+to be idle; it is the safe gate before a build that follows a prior run.
+
+### 2. Submit a build
 
 ```sh
 vci build .
@@ -66,28 +81,28 @@ vci build .
 - **Capture and retain the run ID.** The command returns one JSON
   envelope on stdout; the ID is `data.run_id`. Treat it as opaque
   (`run_...`). There is no command to list or search past runs.
-- The current submission response has `data.state: "staging"` and
-  `data.machine` for the selected machine.
 - The CLI exits 0 when the build is **submitted**, not when it finishes.
   The build's own process exit code appears later in `check` output.
-- If the build fails immediately with error code `machine_unavailable`
-  and `retryable:true`, all eligible machine slots are busy: wait a
-  short time, then submit a new build. A retry is always a **new** run
-  with a new run ID.
+- If the build fails immediately with error code `coordinator_busy`
+  and `retryable:true`, another build is already in flight: run
+  `vci wait-ready` and resubmit. A retry is always a **new** run with a
+  new run ID.
 
-### 2. Inspect once
+### 3. Inspect once
 
 ```sh
 vci check <run-id>
 ```
 
-Returns the current run record. For a terminal run with a published
-result—normally `succeeded`, `failed`, and some `aborted` runs—`data`
-also includes exit code, failure category, truncation flags, and artifact
-fields. A `lost` or early-aborted run can have only its terminal record;
-treat absent result fields as unavailable.
+Returns the aggregate for the build request. `data` carries the overall
+`state`, an ordered `targets` array (one entry per attached machine, each
+with `machine`, `state`, `exit_code`, `failure`, `error_context`, and
+`warnings`), and aggregate counts (`succeeded`, `failed`, `lost`,
+`unavailable`, `aborted`, `no_machine_responded`). A `lost` or
+early-aborted target can have only its terminal record; treat absent
+result fields as unavailable.
 
-### 3. Wait / watch
+### 4. Wait / watch
 
 Use the built-in watcher when you want Vci to wait for completion:
 
@@ -113,19 +128,22 @@ minutes, or a user-given cap) is hit; never busy-loop. `watch` itself has no
 deadline; interrupt it or use bounded `check` polling when a deadline is
 required.
 
-### 4. Read logs
+### 5. Read logs
 
 ```sh
-vci logs <run-id>              # stdout stream
-vci logs <run-id> --stderr     # stderr stream
-vci logs <run-id> --tail <n>   # last n lines (1..100000)
+vci logs <run-id> --machine <name>              # that target's stdout
+vci logs <run-id> --machine <name> --stderr     # that target's stderr
+vci logs <run-id> --machine <name> --tail <n>   # last n lines (1..100000)
 ```
 
+- Fan-out builds have one log stream per attached machine. The
+  `--machine <name>` flag selects which target's log to read; pass the
+  name from `data.targets[].machine` returned by `check`.
 - Raw bytes on success; there is **no `logs --follow`**.
-- A `lost` run has no published final result. Its logs can be absent or
-  contain partial diagnostics written before the worker was lost.
+- A `lost` target has no published final result. Its logs can be absent
+  or contain partial diagnostics written before the worker was lost.
 
-### 5. Artifacts
+### 6. Artifacts
 
 ```sh
 vci artifacts ls <run-id>              # JSON: data.files, data.truncated
@@ -134,7 +152,7 @@ vci artifacts get <run-id> <rel>       # raw bytes to stdout
 
 `artifacts get` streams the exact bytes; direct it to a file when saving.
 
-### 6. Abort a known live run
+### 7. Abort a known live run
 
 ```sh
 vci abort <run-id>
@@ -145,7 +163,7 @@ run becomes aborted immediately; other live runs receive a cancellation
 request. Poll until any terminal state, normally `aborted`. Aborting an
 already `lost` run currently succeeds as a no-op and leaves it `lost`.
 
-### 7. Rerun
+### 8. Rerun
 
 There is **no retry/rerun command**. To rerun, submit a new build
 explicitly with `vci build .` and treat the new run ID as authoritative.
@@ -178,14 +196,15 @@ After a run reaches a terminal state, report:
 
 ```text
 Vci build <run-id>
-Machine: <data.machine>
-Final state: <succeeded | failed | lost | aborted>
-Exit code: <data.exit_code> or unavailable
-Failure category: <data.failure> or unavailable
-Cause: <first actionable error from a bounded stderr/stdout tail, if needed>
+Machines: <comma-separated list of data.targets[].machine>
+Final state: <succeeded | failed | lost | aborted | aggregating>
+Per-target: <machine>: <state> (exit_code=<n>, failure=<category>)
+Cause: <first actionable error from targets[].error_context, if any>
 Artifacts: <relevant files, none, or unavailable>
 ```
 
-For failed runs, read a bounded stderr tail and, if needed, a stdout tail.
+For failed targets, prefer `data.targets[].error_context` as the first
+signal — it already carries the last lines of stderr (or stdout, when
+stderr is empty). Fetch full logs only when the context is insufficient.
 Use `data.failure` only as Vci's broad failure category. Keep the report
 short and factual; do not dump full logs unless requested.
