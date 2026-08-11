@@ -192,19 +192,51 @@ edits made after submission do not change the run.
 
 ## Operational result report
 
-After a run reaches a terminal state, report:
+After a run reaches a terminal state, give the user a concise, human-readable
+report based only on the final JSON. The formats below are suggestions, not a
+rigid template; adapt the detail to the result and the user's request.
 
-```text
-Vci build <run-id>
-Machines: <comma-separated list of data.targets[].machine>
-Final state: <succeeded | failed | lost | aborted | aggregating>
-Per-target: <machine>: <state> (exit_code=<n>, failure=<category>)
-Cause: <first actionable error from targets[].error_context, if any>
-Artifacts: <relevant files, none, or unavailable>
-```
+Do not dump raw JSON unless requested. Do not put the report or its Markdown
+table inside a code fence or preformatted block. Render tables as ordinary
+Markdown.
 
-For failed targets, prefer `data.targets[].error_context` as the first
-signal — it already carries the last lines of stderr (or stdout, when
-stderr is empty). Fetch full logs only when the context is insufficient.
-Use `data.failure` only as Vci's broad failure category. Keep the report
-short and factual; do not dump full logs unless requested.
+For one target or an all-successful run, a compact summary is usually enough:
+
+**✅ VCI build succeeded**
+
+- **Run:** `<run-id>`
+- **Duration:** `<duration, if present>`
+- **Targets:** `<count>` passed
+- **Artifacts:** `<files or none>`
+
+For fan-out or multi-target runs, prefer a real Markdown matrix:
+
+| Machine | State | Exit | Duration | Failure or notes |
+|---|---|---:|---:|---|
+| `<machine>` | `<state>` | `<exit_code>` | `<duration, if present>` | `<failure, warning, or —>` |
+
+Keep the matrix compact when every target succeeds. When a target fails, is
+lost, unavailable, or is aborted, keep the matrix and add a short section
+below it:
+
+### Failure
+
+- **Machine:** `<machine>`
+- **Reported failure:** `<failure category, if present>`
+- **Command:** `<command, only if returned or already known>`
+
+> `<first actionable line from error_context>`
+
+Use `data.targets[].error_context` before fetching logs; it already contains
+the last useful stderr lines, or stdout when stderr is empty. Fetch full logs
+only when that context is insufficient. Do not invent a root cause. Report
+`lost`, `unavailable`, and `aborted` as their actual states rather than calling
+them test failures.
+
+For a detailed or PR-style report, use a heading such as `## VCI build — ❌ Failed`,
+followed by the run ID, duration, target matrix, failure details, artifacts,
+and a relevant next step such as `vci logs <run-id> --machine <machine>` or
+`vci artifacts ls <run-id>`. Include only fields present in the JSON; use
+`unavailable` when Vci did not publish a result. Use `data.failure` only for
+Vci's broad aggregate failure category. Keep the final report factual and
+proportionate to the outcome.
