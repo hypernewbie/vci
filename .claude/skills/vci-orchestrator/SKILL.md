@@ -140,6 +140,12 @@ Pair `--os windows` with a per-machine command override when the
 project's default command is not portable (for example `python3` on
 POSIX vs `python` on Windows); see "Per-machine command overrides".
 
+A project environment value must not contain `%` on a `windows` worker:
+`cmd.exe` expands `%VAR%` inside `set "KEY=VALUE"`, so a value with a
+`%` is mis-expanded and there is no reliable command-line escape. Avoid
+`%` in `[projects.<name>.environment]` for any project attached to a
+Windows worker.
+
 ### Source-path seed
 
 A machine's per-project source path is the local checkout Vci reconciles
