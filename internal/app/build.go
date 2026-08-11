@@ -148,7 +148,7 @@ func stageFanout(l model.Layout, runStore store.Store, cfg config.Config, projec
 			rollbackRuns(l, created)
 			return store.RunRecord{}, err
 		}
-		child, err := store.NewRunFromID(childID, projectName, machine, project.Command, sourceDigest, buildStagedSnapshot(projectName, project, machine, cfg, sourceHead, provenance), now)
+		child, err := store.NewRunFromID(childID, projectName, machine, project.ResolveCommand(machine), sourceDigest, buildStagedSnapshot(projectName, project, machine, cfg, sourceHead, provenance), now)
 		if err != nil {
 			rollbackRuns(l, created)
 			return store.RunRecord{}, err

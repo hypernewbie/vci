@@ -15,7 +15,14 @@ import (
 	"unicode"
 )
 
-const SchemaVersion = 1
+// SchemaVersion is the current config schema. Older versions are
+// accepted on decode so existing configs keep working; new fields are
+// optional so a v1 config still decodes into the v2 shape.
+const SchemaVersion = 2
+
+// supportedSchemaVersions is the set of config schema versions Decode
+// accepts. A version not in this set is rejected as unsupported.
+var supportedSchemaVersions = map[int]bool{1: true, 2: true}
 
 // OrchestratorSelf selects local coordination.
 // Non-empty values are SSH hosts for clients.
@@ -100,6 +107,12 @@ func EffectiveCapacity(m Machine) int {
 type Project struct {
 	Machines    []string          `toml:"machines" json:"machines"`
 	Command     []string          `toml:"command" json:"command"`
+	// Commands holds per-machine command overrides. A target machine's
+	// override wins over the project-wide Command when set; the runner
+	// resolves the command at staging time so each child carries the
+	// invocation it must actually run. The coordinator never infers the
+	// command from the host OS — every override is operator-declared.
+	Commands     map[string][]string `toml:"commands,omitempty" json:"commands,omitempty"`
 	Environment map[string]string `toml:"environment" json:"environment,omitempty"`
 	// Artifacts are optional workspace-relative glob patterns.
 	// Matching regular files are copied into run artifacts; symlinks, devices,
@@ -112,6 +125,17 @@ type Project struct {
 	// HostedFallback is optional source data for `vci build --hosted`.
 	// URL and Commit must both be set or both be empty.
 	HostedFallback HostedFallback `toml:"hosted_fallback" json:"hosted_fallback,omitempty"`
+}
+
+// ResolveCommand returns the command a target machine should run. A
+// per-machine override in Commands wins; otherwise the project-wide
+// Command is used. The machine argument is taken from the target list
+// at staging time and never resolved from the host OS.
+func (p Project) ResolveCommand(machine string) []string {
+	if cmd, ok := p.Commands[machine]; ok && len(cmd) > 0 {
+		return cmd
+	}
+	return p.Command
 }
 
 // DefaultLogLimits and DefaultRetention are coordinator defaults for new roots
@@ -160,7 +184,7 @@ func Decode(data []byte) (Config, error) {
 
 // Validate enforces role-aware configuration rules for coordinator and client roots.
 func Validate(cfg Config) error {
-	if cfg.SchemaVersion != SchemaVersion {
+	if !supportedSchemaVersions[cfg.SchemaVersion] {
 		return fmt.Errorf("unsupported config schema version %d", cfg.SchemaVersion)
 	}
 	if err := ValidateOrchestrator(cfg.Orchestrator); err != nil {
@@ -285,6 +309,17 @@ func validateCoordinator(cfg Config) error {
 			seen[machine] = true
 			if _, ok := cfg.Machines[machine]; !ok {
 				return fmt.Errorf("project %q references missing machine %q", name, machine)
+			}
+		}
+		// Every per-machine command override must target a machine this
+		// project actually runs on; an override for a detached machine
+		// is dead config and a likely operator mistake.
+		for machine, cmd := range project.Commands {
+			if !seen[machine] {
+				return fmt.Errorf("project %q has command override for unattached machine %q", name, machine)
+			}
+			if len(cmd) == 0 || strings.TrimSpace(cmd[0]) == "" {
+				return fmt.Errorf("project %q has empty command override for machine %q", name, machine)
 			}
 		}
 	}

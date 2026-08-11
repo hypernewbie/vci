@@ -297,3 +297,102 @@ func TestValidateExcludedPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveCommandOverride(t *testing.T) {
+	cfg := `schema_version = 2
+
+[log_limits]
+stdout_bytes = 100
+stderr_bytes = 100
+
+[retention]
+max_bytes = 1000
+
+[machines.mac-local]
+[machines.win11]
+
+[projects.vidl]
+machines = ["mac-local", "win11"]
+command = ["python3", "test.py"]
+[projects.vidl.commands]
+win11 = ["python", "test.py"]
+`
+	decoded, err := Decode([]byte(cfg))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	project := decoded.Projects["vidl"]
+	if got := project.ResolveCommand("mac-local"); len(got) != 2 || got[0] != "python3" {
+		t.Fatalf("default command not returned: %v", got)
+	}
+	if got := project.ResolveCommand("win11"); len(got) != 2 || got[0] != "python" {
+		t.Fatalf("override command not returned: %v", got)
+	}
+}
+
+func TestValidateRejectsOverrideForUnattachedMachine(t *testing.T) {
+	cfg := `schema_version = 2
+
+[log_limits]
+stdout_bytes = 100
+stderr_bytes = 100
+
+[retention]
+max_bytes = 1000
+
+[machines.mac-local]
+
+[projects.vidl]
+machines = ["mac-local"]
+command = ["python3", "test.py"]
+[projects.vidl.commands]
+win11 = ["python", "test.py"]
+`
+	if _, err := Decode([]byte(cfg)); err == nil {
+		t.Fatalf("decode accepted override for unattached machine")
+	}
+}
+
+func TestValidateRejectsEmptyOverrideCommand(t *testing.T) {
+	cfg := `schema_version = 2
+
+[log_limits]
+stdout_bytes = 100
+stderr_bytes = 100
+
+[retention]
+max_bytes = 1000
+
+[machines.mac-local]
+
+[projects.vidl]
+machines = ["mac-local"]
+command = ["python3", "test.py"]
+[projects.vidl.commands]
+mac-local = []
+`
+	if _, err := Decode([]byte(cfg)); err == nil {
+		t.Fatalf("decode accepted empty override command")
+	}
+}
+
+func TestDecodeAcceptsLegacySchemaVersion1(t *testing.T) {
+	cfg := `schema_version = 1
+
+[log_limits]
+stdout_bytes = 100
+stderr_bytes = 100
+
+[retention]
+max_bytes = 1000
+
+[machines.mac-local]
+
+[projects.vidl]
+machines = ["mac-local"]
+command = ["python3", "test.py"]
+`
+	if _, err := Decode([]byte(cfg)); err != nil {
+		t.Fatalf("v1 config rejected: %v", err)
+	}
+}
