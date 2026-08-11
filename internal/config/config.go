@@ -58,6 +58,13 @@ type Machine struct {
 	Runtime       string `toml:"runtime" json:"runtime,omitempty"`
 	Image         string `toml:"image" json:"image,omitempty"`
 	Snapshot      string `toml:"snapshot" json:"snapshot,omitempty"`
+	// OS declares the worker's operating system so the coordinator can
+	// compose a shell command its OpenSSH login shell understands. Empty
+	// is the POSIX default (sh/bash); "windows" selects the cmd.exe
+	// shell wrapper. "linux" and "darwin" are accepted aliases for the
+	// POSIX default. The coordinator never infers the OS from the host;
+	// it is operator-declared.
+	OS string `toml:"os,omitempty" json:"os,omitempty"`
 	// SourcePaths maps a project name to a local source checkout that seeds
 	// builds on this machine. An absent or empty value means the project has
 	// no local seed on this machine.
@@ -105,15 +112,15 @@ func EffectiveCapacity(m Machine) int {
 }
 
 type Project struct {
-	Machines    []string          `toml:"machines" json:"machines"`
-	Command     []string          `toml:"command" json:"command"`
+	Machines []string `toml:"machines" json:"machines"`
+	Command  []string `toml:"command" json:"command"`
 	// Commands holds per-machine command overrides. A target machine's
 	// override wins over the project-wide Command when set; the runner
 	// resolves the command at staging time so each child carries the
 	// invocation it must actually run. The coordinator never infers the
 	// command from the host OS — every override is operator-declared.
-	Commands     map[string][]string `toml:"commands,omitempty" json:"commands,omitempty"`
-	Environment map[string]string `toml:"environment" json:"environment,omitempty"`
+	Commands    map[string][]string `toml:"commands,omitempty" json:"commands,omitempty"`
+	Environment map[string]string   `toml:"environment" json:"environment,omitempty"`
 	// Artifacts are optional workspace-relative glob patterns.
 	// Matching regular files are copied into run artifacts; symlinks, devices,
 	// `..`, `.git`, and `.vci` entries are rejected.
@@ -222,6 +229,20 @@ func ValidateMachineHost(host string) error {
 	return nil
 }
 
+// ValidateMachineOS accepts the OS a worker declares for its OpenSSH
+// login shell. Empty (the POSIX default), "windows", "linux", and
+// "darwin" are valid; the check is case-insensitive. "windows" selects
+// the cmd.exe shell wrapper the coordinator composes; every other
+// accepted value uses the POSIX (sh/bash) wrapper. The coordinator
+// never infers the OS from the host.
+func ValidateMachineOS(os string) error {
+	switch strings.ToLower(strings.TrimSpace(os)) {
+	case "", "windows", "linux", "darwin":
+		return nil
+	}
+	return fmt.Errorf("invalid os %q (want windows, linux, darwin, or empty)", os)
+}
+
 // ValidateOrchestrator validates an ssh destination string.
 func ValidateOrchestrator(value string) error {
 	if value == "" {
@@ -254,6 +275,9 @@ func validateCoordinator(cfg Config) error {
 		}
 		if err := ValidateMachineHost(machine.Host); err != nil {
 			return err
+		}
+		if err := ValidateMachineOS(machine.OS); err != nil {
+			return fmt.Errorf("machine %q: %w", name, err)
 		}
 		if err := ValidateMachineRuntime(name, machine); err != nil {
 			return err

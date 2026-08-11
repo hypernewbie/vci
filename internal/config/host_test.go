@@ -117,3 +117,54 @@ snapshot = "ghcr.io/org/vm:pin"
 		t.Errorf("vm-remote host: %q", cfg.Machines["vm-remote"].Host)
 	}
 }
+
+// TestMachineOSValidates pins the accepted OS set: empty (POSIX default),
+// windows, linux, and darwin are valid case-insensitively; anything else
+// is rejected so the coordinator never composes a shell for an unknown OS.
+func TestMachineOSValidates(t *testing.T) {
+	for _, valid := range []string{"", "windows", "Windows", "WINDOWS", "linux", "darwin", "  darwin  "} {
+		if err := ValidateMachineOS(valid); err != nil {
+			t.Errorf("ValidateMachineOS(%q) rejected: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{"bsd", "win", "mac", "unix", "os/2"} {
+		if err := ValidateMachineOS(invalid); err == nil {
+			t.Errorf("ValidateMachineOS(%q) accepted", invalid)
+		}
+	}
+}
+
+// TestMachineOSDecodes pins that a windows machine decodes through the
+// real Decode path and that the empty default stays empty, so the
+// coordinator knows which shell wrapper to compose without inferring
+// the OS from the host.
+func TestMachineOSDecodes(t *testing.T) {
+	body := `schema_version = 2
+
+[log_limits]
+stdout_bytes = 100
+stderr_bytes = 100
+
+[retention]
+max_bytes = 1000
+
+[machines.posix]
+
+[machines.win]
+os = "windows"
+
+[projects.vidl]
+machines = ["posix", "win"]
+command = ["true"]
+`
+	cfg, err := Decode([]byte(body))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cfg.Machines["posix"].OS != "" {
+		t.Errorf("posix OS not empty: %q", cfg.Machines["posix"].OS)
+	}
+	if cfg.Machines["win"].OS != "windows" {
+		t.Errorf("win OS: %q want windows", cfg.Machines["win"].OS)
+	}
+}

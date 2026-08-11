@@ -707,7 +707,7 @@ func TestCleanupRemoteInvokesSSHRm(t *testing.T) {
 	previous := os.Getenv("PATH")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+previous)
 
-	if err := CleanupRemote(context.Background(), "builder", "~/.vci/state/work/run_abc"); err != nil {
+	if err := CleanupRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", ""); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	log, err := os.ReadFile(logPath)
@@ -718,6 +718,46 @@ func TestCleanupRemoteInvokesSSHRm(t *testing.T) {
 	for _, want := range []string{"builder", "rm -rf --", "~/.vci/state/work/run_abc"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("ssh log missing %q: %s", want, s)
+		}
+	}
+}
+
+// TestCleanupRemoteWindowsUsesRmdir pins that a Windows worker is cleaned
+// with `rmdir /S /Q "<path>"` over a %USERPROFILE%-rooted path, because
+// cmd.exe has no rm and cannot expand ~. printf preserves the backslashes
+// the Windows path carries.
+func TestCleanupRemoteWindowsUsesRmdir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-specific")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + logPath + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+previous)
+
+	if err := CleanupRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", "windows"); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(log)
+	for _, want := range []string{
+		"builder",
+		`rmdir /S /Q "%USERPROFILE%\.vci\state\work\run_abc"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("ssh log missing %q: %s", want, s)
+		}
+	}
+	for _, banned := range []string{"rm -rf", "~"} {
+		if strings.Contains(s, banned) {
+			t.Errorf("windows cleanup leaked POSIX/tilde %q: %s", banned, s)
 		}
 	}
 }
@@ -740,7 +780,7 @@ func TestCleanupRemoteRejectsUnsafe(t *testing.T) {
 		{"builder", "/tmp/x"},
 		{"-flag", "~/.vci/state/work/run_abc"},
 	} {
-		if err := CleanupRemote(context.Background(), tc.host, tc.path); err == nil {
+		if err := CleanupRemote(context.Background(), tc.host, tc.path, ""); err == nil {
 			t.Errorf("host %q path %q accepted", tc.host, tc.path)
 		}
 	}

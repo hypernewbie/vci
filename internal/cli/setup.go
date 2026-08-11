@@ -46,7 +46,7 @@ func runSetup(args []string) (any, *model.VciError) {
 			return nil, errMsg
 		}
 		if len(args) < 3 {
-			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add|remove <name> [--capacity <positive-int>] [--host <ssh-destination>] [--runtime <docker|vm>] [--image <ref>] [--snapshot <ref>].", false)
+			return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add|remove <name> [--capacity <positive-int>] [--host <ssh-destination>] [--runtime <docker|vm>] [--image <ref>] [--snapshot <ref>] [--os <windows|linux|darwin>].", false)
 		}
 		switch args[1] {
 		case "add":
@@ -54,7 +54,7 @@ func runSetup(args []string) (any, *model.VciError) {
 			machine := config.Machine{}
 			i := 2
 			if i >= len(args) {
-				return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add <name> [--capacity <positive-int>] [--host <ssh-destination>] [--runtime <docker|vm>] [--image <ref>] [--snapshot <ref>].", false)
+				return nil, model.NewError("invalid_arguments", model.FailureUsage, "Usage: setup machine add <name> [--capacity <positive-int>] [--host <ssh-destination>] [--runtime <docker|vm>] [--image <ref>] [--snapshot <ref>] [--os <windows|linux|darwin>].", false)
 			}
 			name = args[i]
 			i++
@@ -97,6 +97,16 @@ func runSetup(args []string) (any, *model.VciError) {
 					}
 					machine.Snapshot = args[i+1]
 					i++
+				case "--os":
+					if i+1 >= len(args) {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, "--os requires a value (windows, linux, or darwin).", false)
+					}
+					osValue := strings.ToLower(strings.TrimSpace(args[i+1]))
+					if err := config.ValidateMachineOS(osValue); err != nil {
+						return nil, model.NewError("invalid_arguments", model.FailureUsage, err.Error(), false)
+					}
+					machine.OS = osValue
+					i++
 				default:
 					return nil, model.NewError("invalid_arguments", model.FailureUsage, fmt.Sprintf("Unknown machine option %q.", args[i]), false)
 				}
@@ -119,6 +129,9 @@ func runSetup(args []string) (any, *model.VciError) {
 			}
 			if machine.Snapshot != "" {
 				result["snapshot"] = machine.Snapshot
+			}
+			if machine.OS != "" {
+				result["os"] = machine.OS
 			}
 			return result, nil
 		case "remove":

@@ -411,7 +411,7 @@ func reapRemoteTurds(l model.Layout, now time.Time) int {
 			// Skip if worker lease is still active while terminalization finishes.
 			continue
 		}
-		hostName, ok := remoteHostFor(record)
+		hostName, osKind, ok := remoteHostFor(record)
 		if !ok {
 			continue
 		}
@@ -419,37 +419,41 @@ func reapRemoteTurds(l model.Layout, now time.Time) int {
 		if err != nil {
 			continue
 		}
-		if err := CleanupRemote(context.Background(), hostName, remoteWorkDir); err == nil {
+		if err := CleanupRemote(context.Background(), hostName, remoteWorkDir, osKind); err == nil {
 			cleaned++
 		}
 	}
 	return cleaned
 }
 
-// remoteHostFor reads the durable config snapshot and returns the reserved machine host.
-// Returns ok=false for missing/malformed snapshot, unknown machine, or empty host.
-func remoteHostFor(record store.RunRecord) (string, bool) {
+// remoteHostFor reads the durable config snapshot and returns the reserved
+// machine host and OS kind. Returns ok=false for missing/malformed snapshot,
+// unknown machine, or empty host.
+func remoteHostFor(record store.RunRecord) (host string, osKind string, ok bool) {
 	var snap struct {
 		Machine  string                    `json:"machine"`
 		Machines map[string]config.Machine `json:"machines"`
 	}
 	if err := json.Unmarshal(record.ConfigSnapshot, &snap); err != nil {
-		return "", false
+		return "", "", false
 	}
 	name := snap.Machine
 	if name == "" {
-		return "", false
+		return "", "", false
 	}
 	machine, ok := snap.Machines[name]
 	if !ok || machine.Host == "" {
-		return "", false
+		return "", "", false
 	}
-	return machine.Host, true
+	return machine.Host, machine.OS, true
 }
 
-// CleanupRemote validates host and path then runs `ssh <host> rm -rf -- <path>`.
+// CleanupRemote validates host and path then removes the remote workspace
+// tree. A POSIX worker is cleaned with `ssh <host> rm -rf -- <path>`; a
+// Windows worker (cmd.exe login shell) with `rmdir /S /Q "<path>"` over a
+// %USERPROFILE%-rooted path, because cmd.exe has no rm and cannot expand ~.
 // Inputs are validated and execution is bounded by a 30-second timeout.
-func CleanupRemote(ctx context.Context, hostName, remotePath string) error {
+func CleanupRemote(ctx context.Context, hostName, remotePath, osKind string) error {
 	if err := host.ValidateHost(hostName); err != nil {
 		return err
 	}
@@ -458,7 +462,13 @@ func CleanupRemote(ctx context.Context, hostName, remotePath string) error {
 	}
 	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cleanupCtx, "ssh", hostName, "rm -rf -- "+remotePath)
+	var remoteCmd string
+	if host.IsWindowsOS(osKind) {
+		remoteCmd = `rmdir /S /Q "` + host.WindowsRemotePath(remotePath) + `"`
+	} else {
+		remoteCmd = "rm -rf -- " + remotePath
+	}
+	cmd := exec.CommandContext(cleanupCtx, "ssh", hostName, remoteCmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

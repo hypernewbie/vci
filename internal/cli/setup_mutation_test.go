@@ -92,6 +92,63 @@ func TestSetupMachineAddAcceptsHost(t *testing.T) {
 	}
 }
 
+// TestSetupMachineAddAcceptsOS pins that `setup machine add --os windows`
+// persists the OS (lowercased) and the `machines` envelope carries it, so
+// the coordinator can compose a cmd.exe shell for the worker.
+func TestSetupMachineAddAcceptsOS(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "hammond", "--host", "hammond", "--os", "Windows"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup machine add --os: %d %s", code, out.String())
+	}
+	var resp Response
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("setup machine add failed: %+v", resp.Error)
+	}
+	if resp.Data.(map[string]any)["os"] != "windows" {
+		t.Errorf("add response os: %v want windows", resp.Data.(map[string]any)["os"])
+	}
+	out.Reset()
+	if code := Run([]string{"machines"}, &out, &errOut); code != 0 {
+		t.Fatalf("machines: %d %s", code, out.String())
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("machines failed: %+v", resp.Error)
+	}
+	entries, _ := resp.Data.([]any)
+	entry, _ := entries[0].(map[string]any)
+	machine, _ := entry["machine"].(map[string]any)
+	if machine["os"] != "windows" {
+		t.Errorf("machines envelope missing os: %v", machine)
+	}
+}
+
+// TestSetupMachineAddRejectsBadOS pins that an unknown OS value is rejected
+// with invalid_arguments and the coordinator config is not mutated.
+func TestSetupMachineAddRejectsBadOS(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VCI_ROOT", root)
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"setup", "init"}, &out, &errOut); code != 0 {
+		t.Fatalf("setup init: %d %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "machine", "add", "bad", "--os", "bsd"}, &out, &errOut); code == 0 {
+		t.Fatalf("setup machine add --os bsd accepted: %s", out.String())
+	}
+}
+
 // TestSetupMachineAddRejectsBadHost pins that flag-like, whitespace,
 // scheme, and `..` destinations are rejected with invalid_arguments
 // and the coordinator config is not mutated.

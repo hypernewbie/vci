@@ -588,7 +588,7 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 		// Best-effort remote workspace cleanup on the success path.
 		// The reaper does terminal sweeps of `~/.vci/state/work/<run>`;
 		// this removes the tree immediately.
-		_ = reaper.CleanupRemote(context.Background(), machine.Host, remoteWorkDir)
+		_ = reaper.CleanupRemote(context.Background(), machine.Host, remoteWorkDir, machine.OS)
 	}()
 
 	warning, err := stageOrReconstruct(ctx, process.Native{}, machine, project, projectName, lcPath, sourceRoot, workspace, submittedHead, remoteWorkDir)
@@ -600,7 +600,7 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 		return runtime.Result{}, nil, false, "", err
 	}
 	started := time.Now().UTC()
-	exitCode, runErr := host.RunRemote(ctx, machine.Host, remoteWorkDir, argv, project.Environment, pair.Stdout, pair.Stderr)
+	exitCode, runErr := host.RunRemote(ctx, machine.Host, remoteWorkDir, argv, project.Environment, machine.OS, pair.Stdout, pair.Stderr)
 	finished := time.Now().UTC()
 	result := runtime.Result{ExitCode: exitCode, ResolvedExecutable: argv[0], StartedAt: started, FinishedAt: finished, Duration: finished.Sub(started)}
 

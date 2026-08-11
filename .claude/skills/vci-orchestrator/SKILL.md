@@ -115,6 +115,31 @@ Do not remove a machine until `vci projects` confirms no project still uses it:
 VCI_ROOT=/absolute/vci-root vci setup machine remove <machine>
 ```
 
+### Windows workers
+
+A worker's OpenSSH login shell decides how the coordinator composes the
+build command. POSIX workers (sh/bash) get the historical script; a
+Windows worker's default login shell is `cmd.exe`, which cannot expand
+`~`, parse `export`/`$VAR`/`exec`, or run `mkdir -p`. Declare the OS so
+the coordinator composes a cmd.exe command instead:
+
+```sh
+VCI_ROOT=/absolute/vci-root vci setup machine add hammond \
+  --host hammond --os windows
+```
+
+`--os` accepts `windows`, `linux`, and `darwin`; empty is the POSIX
+default. The coordinator never infers the OS from the host — it is
+operator-declared. For a Windows worker the coordinator renders the
+remote workspace as `%USERPROFILE%\.vci\state\work\<run>`, isolates
+HOME/TMPDIR under `.home`/`.tmp` with `set "VAR=value"`, guards each
+`mkdir` with `if not exist`, and runs the project command directly
+(no `exec`). Cleanup uses `rmdir /S /Q` rather than `rm -rf`.
+
+Pair `--os windows` with a per-machine command override when the
+project's default command is not portable (for example `python3` on
+POSIX vs `python` on Windows); see "Per-machine command overrides".
+
 ### Source-path seed
 
 A machine's per-project source path is the local checkout Vci reconciles

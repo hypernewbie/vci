@@ -73,11 +73,13 @@ type Client struct {
 
 // RunRemote executes a remote command over SSH.
 // It returns the remote exit code; transport failures return an error.
-func (c Client) RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, stdout, stderr io.Writer) (int, error) {
+// osKind selects the remote shell wrapper ("windows" uses cmd.exe;
+// empty or anything else uses the POSIX sh/bash wrapper).
+func (c Client) RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, osKind string, stdout, stderr io.Writer) (int, error) {
 	if err := ValidateHost(host); err != nil {
 		return 0, err
 	}
-	shell, err := composeShell(workDir, argv, env)
+	shell, err := composeShell(workDir, argv, env, osKind)
 	if err != nil {
 		return 0, err
 	}
@@ -98,8 +100,8 @@ func (c Client) RunRemote(ctx context.Context, host, workDir string, argv []stri
 }
 
 // RunRemote executes a remote command over SSH with the native runner.
-func RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, stdout, stderr io.Writer) (int, error) {
-	return (Client{Runner: process.Native{}}).RunRemote(ctx, host, workDir, argv, env, stdout, stderr)
+func RunRemote(ctx context.Context, host, workDir string, argv []string, env map[string]string, osKind string, stdout, stderr io.Writer) (int, error) {
+	return (Client{Runner: process.Native{}}).RunRemote(ctx, host, workDir, argv, env, osKind, stdout, stderr)
 }
 
 // ProbeSeedHead asks a remote machine which commit is checked out at
@@ -620,15 +622,38 @@ func shellSeed(seed string) string {
 	return shellQuote(seed)
 }
 
-// composeShell builds a single remote shell command.
-// It validates the workDir, sets HOME/TMPDIR, applies env vars, and execs argv.
-// It preserves safe `~`-based expansion for staged-workspace paths.
-func composeShell(workDir string, argv []string, env map[string]string) (string, error) {
+// IsWindowsOS reports whether a machine OS declaration selects the
+// Windows (cmd.exe) login shell the coordinator must compose for. Any
+// case of "windows" is Windows; every other value — including empty —
+// is POSIX (sh/bash).
+func IsWindowsOS(osKind string) bool {
+	return strings.EqualFold(strings.TrimSpace(osKind), "windows")
+}
+
+// WindowsRemotePath renders the canonical ~/.vci/state/work/<run> path
+// for a Windows cmd.exe login shell: cmd.exe does not expand ~ or /
+// separators, so ~ becomes %USERPROFILE% and / becomes \. The
+// canonical POSIX form is preserved on the wire; only the shell
+// rendering changes.
+func WindowsRemotePath(workDir string) string {
+	return strings.Replace(strings.ReplaceAll(workDir, "/", "\\"), "~", "%USERPROFILE%", 1)
+}
+
+// composeShell builds a single remote shell command for the worker's
+// declared OS. It validates the workDir, sets HOME/TMPDIR, applies env
+// vars, and execs argv. A POSIX worker (sh/bash) gets the historical
+// script; a Windows worker (cmd.exe) gets set/if/mkdir syntax with
+// %USERPROFILE%-rooted paths, because cmd.exe cannot expand ~ or parse
+// export/$VAR/exec/mkdir -p.
+func composeShell(workDir string, argv []string, env map[string]string, osKind string) (string, error) {
 	if err := ValidateRemotePath(workDir); err != nil {
 		return "", err
 	}
 	if len(argv) == 0 {
 		return "", fmt.Errorf("remote argv is empty")
+	}
+	if IsWindowsOS(osKind) {
+		return composeShellWindows(workDir, argv, env), nil
 	}
 	var b strings.Builder
 	b.WriteString("cd ")
@@ -670,6 +695,75 @@ func composeShell(workDir string, argv []string, env map[string]string) (string,
 	return b.String(), nil
 }
 
+// composeShellWindows builds a cmd.exe-safe command string. cmd.exe
+// cannot expand ~, parse export/$VAR/exec, or run mkdir -p, so the
+// POSIX script is replaced with: cd /D into a %USERPROFILE%-rooted
+// path, set "HOME/TMPDIR=<workDir>/.home|.tmp", guard each mkdir with
+// `if not exist`, apply env vars as set "KEY=VALUE", then run argv. &&
+// chains the steps the same way the POSIX branch does. The operator
+// command itself is quoted only when it carries a metacharacter; bare
+// tokens like python.exe or test.py pass through unchanged.
+func composeShellWindows(workDir string, argv []string, env map[string]string) string {
+	win := WindowsRemotePath(workDir)
+	var b strings.Builder
+	b.WriteString(`cd /D "`)
+	b.WriteString(win)
+	b.WriteString(`" && set "HOME=`)
+	b.WriteString(win)
+	b.WriteString(`\.home" && set "TMPDIR=`)
+	b.WriteString(win)
+	b.WriteString(`\.tmp" && if not exist "`)
+	b.WriteString(win)
+	b.WriteString(`\.home" mkdir "`)
+	b.WriteString(win)
+	b.WriteString(`\.home" && if not exist "`)
+	b.WriteString(win)
+	b.WriteString(`\.tmp" mkdir "`)
+	b.WriteString(win)
+	b.WriteString(`\.tmp"`)
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		b.WriteString(` && set "`)
+		b.WriteString(key)
+		b.WriteString("=")
+		b.WriteString(env[key])
+		b.WriteString(`"`)
+	}
+	b.WriteString(" && ")
+	for i, arg := range argv {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(cmdWord(workDir, arg))
+	}
+	return b.String()
+}
+
+// cmdWord renders one argv element for cmd.exe. A token made of safe
+// characters passes through bare; anything else is double-quoted so a
+// space or metacharacter cannot break the command chain. A token that
+// carries the canonical workDir is rewritten to its %USERPROFILE% form
+// so cmd.exe can resolve it.
+func cmdWord(workDir, arg string) string {
+	if strings.Contains(arg, workDir) {
+		return WindowsRemotePath(arg)
+	}
+	if arg == "" {
+		return `""`
+	}
+	if cmdSafe(arg) {
+		return arg
+	}
+	return `"` + arg + `"`
+}
+
 // remoteWord rewrites `~`-prefixed argv words to use captured login home.
 func remoteWord(arg string) string {
 	if !strings.HasPrefix(arg, "~") {
@@ -680,6 +774,11 @@ func remoteWord(arg string) string {
 
 // shellSafe checks whether a token is safe to pass unquoted to the remote shell.
 var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_./:@~-]+$`).MatchString
+
+// cmdSafe checks whether a token is safe to pass unquoted to cmd.exe.
+// Backslash and colon are included so Windows paths like python.exe and
+// C:\Users\... pass through bare; everything else is double-quoted.
+var cmdSafe = regexp.MustCompile(`^[A-Za-z0-9_./:\\@~-]+$`).MatchString
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"

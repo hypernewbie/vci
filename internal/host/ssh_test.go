@@ -50,7 +50,7 @@ func TestRunRemoteRecordsShell(t *testing.T) {
 	argv := []string{"sh", "-c", "true"}
 	env := map[string]string{"CI": "1", "TOKEN": "semi;colon"}
 	var stdout, stderr bytes.Buffer
-	code, err := RunRemote(context.Background(), "builder", workDir, argv, env, &stdout, &stderr)
+	code, err := RunRemote(context.Background(), "builder", workDir, argv, env, "", &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -90,6 +90,123 @@ func TestRunRemoteRecordsShell(t *testing.T) {
 	}
 }
 
+// TestComposeShellWindows pins the cmd.exe command string the coordinator
+// composes for a Windows worker. cmd.exe cannot expand ~ or parse
+// export/$VAR/exec/mkdir -p, so every POSIX-ism must be absent and the
+// %USERPROFILE%-rooted cmd.exe form must be present.
+func TestComposeShellWindows(t *testing.T) {
+	workDir := "~/.vci/state/work/run_abc"
+	argv := []string{"python.exe", "test.py"}
+	env := map[string]string{"CI": "1", "TOKEN": "a b"}
+	shell, err := composeShell(workDir, argv, env, "windows")
+	if err != nil {
+		t.Fatalf("compose: %v", err)
+	}
+	win := `%USERPROFILE%\.vci\state\work\run_abc`
+	for _, want := range []string{
+		`cd /D "` + win + `"`,                                        // cd into %USERPROFILE% path
+		`set "HOME=` + win + `\.home"`,                               // HOME isolated under .home
+		`set "TMPDIR=` + win + `\.tmp"`,                              // TMPDIR isolated under .tmp
+		`if not exist "` + win + `\.home" mkdir "` + win + `\.home"`, // guarded mkdir, not mkdir -p
+		`if not exist "` + win + `\.tmp" mkdir "` + win + `\.tmp"`,
+		`set "CI=1"`,         // env as set "KEY=VALUE", sorted
+		`set "TOKEN=a b"`,    // value with a space stays inside the quotes
+		`python.exe test.py`, // bare operator tokens pass through
+	} {
+		if !strings.Contains(shell, want) {
+			t.Errorf("windows shell missing %q:\n%s", want, shell)
+		}
+	}
+	for _, banned := range []string{
+		"export ",  // no POSIX export
+		"$HOME",    // no $VAR expansion
+		"$__vci",   // no login-home capture
+		"exec ",    // cmd.exe has no exec
+		"mkdir -p", // no POSIX mkdir -p
+		"~",        // tilde never reaches cmd.exe
+		"'/",       // no single-quoted POSIX paths
+	} {
+		if strings.Contains(shell, banned) {
+			t.Errorf("windows shell leaked POSIX-ism %q:\n%s", banned, shell)
+		}
+	}
+}
+
+// TestComposeShellWindowsQuotesSpaces pins that an operator token with a
+// space is double-quoted for cmd.exe while a safe token stays bare.
+func TestComposeShellWindowsQuotesSpaces(t *testing.T) {
+	shell, err := composeShell("~/.vci/state/work/run_abc", []string{"C:\\Program Files\\app.exe", "arg"}, nil, "windows")
+	if err != nil {
+		t.Fatalf("compose: %v", err)
+	}
+	if !strings.Contains(shell, `"C:\Program Files\app.exe"`) {
+		t.Errorf("space-bearing token not double-quoted: %s", shell)
+	}
+	if !strings.HasSuffix(shell, ` arg`) {
+		t.Errorf("safe token not bare at tail: %s", shell)
+	}
+}
+
+// TestRunRemoteWindowsShell pins that osKind=windows threads through
+// RunRemote so the recorded ssh command carries the cmd.exe form.
+func TestRunRemoteWindowsShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix ssh")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	writeStub(t, dir, "ssh", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+logPath+"\nexit 0\n")
+	var stdout, stderr bytes.Buffer
+	_, err := RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"python.exe", "test.py"}, nil, "windows", &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ssh stub log missing: %v", err)
+	}
+	s := string(log)
+	if !strings.Contains(s, `%USERPROFILE%\.vci\state\work\run_abc`) {
+		t.Errorf("windows path not rendered: %s", s)
+	}
+	if strings.Contains(s, "export ") {
+		t.Errorf("POSIX export leaked into windows run: %s", s)
+	}
+}
+
+// TestWindowsRemotePath pins the canonical-to-cmd.exe path translation.
+func TestWindowsRemotePath(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"~/.vci/state/work/run_abc", `%USERPROFILE%\.vci\state\work\run_abc`},
+		{"~/.vci/state/work/run_1a2b3c", `%USERPROFILE%\.vci\state\work\run_1a2b3c`},
+	} {
+		if got := WindowsRemotePath(tc.in); got != tc.want {
+			t.Errorf("WindowsRemotePath(%q) = %q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestIsWindowsOS pins case-insensitive detection: any case of "windows"
+// is Windows; empty and everything else (including linux/darwin) is POSIX.
+func TestIsWindowsOS(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"windows", true},
+		{"Windows", true},
+		{"WINDOWS", true},
+		{" windows ", true},
+		{"", false},
+		{"linux", false},
+		{"darwin", false},
+	} {
+		if got := IsWindowsOS(tc.in); got != tc.want {
+			t.Errorf("IsWindowsOS(%q) = %v want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestRunRemoteRecordsDockerAndVM pins that the docker and vm runtime
 // argv reach the remote shell with the workspace as the only mount
 // source, and that the mount source's leading `~` is rewritten to the
@@ -120,7 +237,7 @@ func TestRunRemoteRecordsDockerAndVM(t *testing.T) {
 			logPath := filepath.Join(dir, "ssh.log")
 			writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 0\n")
 			var stdout, stderr bytes.Buffer
-			code, err := RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", tc.argv, nil, &stdout, &stderr)
+			code, err := RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", tc.argv, nil, "", &stdout, &stderr)
 			if err != nil {
 				t.Fatalf("run: %v", err)
 			}
@@ -181,14 +298,14 @@ func TestRemoteRuntimeMountUsesLoginHome(t *testing.T) {
 	writeStub(t, dir, "tart", "#!/bin/sh\necho \"HOME=$HOME TMPDIR=$TMPDIR $*\" >> "+tartLog+"\nexit 0\n")
 	t.Setenv("HOME", loginHome)
 
-	dockerShell, err := composeShell(workDir, []string{"docker", "run", "--rm", "-v", workDir + ":/vci/work:ro", "-w", "/vci/work", "ghcr.io/org/ci:pin", "true"}, nil)
+	dockerShell, err := composeShell(workDir, []string{"docker", "run", "--rm", "-v", workDir + ":/vci/work:ro", "-w", "/vci/work", "ghcr.io/org/ci:pin", "true"}, nil, "")
 	if err != nil {
 		t.Fatalf("compose docker shell: %v", err)
 	}
 	if err := exec.Command("sh", "-c", dockerShell).Run(); err != nil {
 		t.Fatalf("run docker shell: %v\nshell: %s", err, dockerShell)
 	}
-	tartShell, err := composeShell(workDir, []string{"tart", "run", "--no-gui", "--dir", workDir + ":/vci/work", "--workdir", "/vci/work", "ghcr.io/org/vm:pin", "--", "true"}, nil)
+	tartShell, err := composeShell(workDir, []string{"tart", "run", "--no-gui", "--dir", workDir + ":/vci/work", "--workdir", "/vci/work", "ghcr.io/org/vm:pin", "--", "true"}, nil, "")
 	if err != nil {
 		t.Fatalf("compose tart shell: %v", err)
 	}
@@ -241,7 +358,7 @@ func TestRunRemoteReturnsExitCode(t *testing.T) {
 	logPath := filepath.Join(dir, "ssh.log")
 	writeStub(t, dir, "ssh", "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 7\n")
 	var stdout, stderr bytes.Buffer
-	code, err := RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, &stdout, &stderr)
+	code, err := RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, "", &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -269,7 +386,7 @@ func TestRunRemoteRejectsBadInput(t *testing.T) {
 		{"builder", "~/.vci/state/work/.."},
 	} {
 		var stdout, stderr bytes.Buffer
-		if _, err := RunRemote(context.Background(), tc.host, tc.workDir, []string{"true"}, nil, &stdout, &stderr); err == nil {
+		if _, err := RunRemote(context.Background(), tc.host, tc.workDir, []string{"true"}, nil, "", &stdout, &stderr); err == nil {
 			t.Errorf("host %q workDir %q accepted", tc.host, tc.workDir)
 		}
 	}
@@ -375,7 +492,7 @@ func TestClientRunRemoteInvokesRunner(t *testing.T) {
 	argv := []string{"sh", "-c", "echo ok"}
 	env := map[string]string{"CI": "1"}
 	var stdout, stderr bytes.Buffer
-	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", workDir, argv, env, &stdout, &stderr)
+	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", workDir, argv, env, "", &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -408,7 +525,7 @@ func TestClientRunRemoteInvokesRunner(t *testing.T) {
 func TestClientRunRemoteNonzeroExit(t *testing.T) {
 	runner := &scriptRunner{result: process.Result{ExitCode: 9}, err: errors.New("exit status 9")}
 	var stdout, stderr bytes.Buffer
-	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, &stdout, &stderr)
+	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, "", &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -422,7 +539,7 @@ func TestClientRunRemoteNonzeroExit(t *testing.T) {
 func TestClientRunRemoteTransportError(t *testing.T) {
 	runner := &scriptRunner{err: errors.New("connection refused")}
 	var stdout, stderr bytes.Buffer
-	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, &stdout, &stderr)
+	code, err := (Client{Runner: runner}).RunRemote(context.Background(), "builder", "~/.vci/state/work/run_abc", []string{"true"}, nil, "", &stdout, &stderr)
 	if err == nil {
 		t.Fatal("transport error not reported")
 	}
