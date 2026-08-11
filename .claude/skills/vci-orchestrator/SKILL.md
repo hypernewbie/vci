@@ -167,6 +167,27 @@ A machine's bundle-cache policy (`bundle_cache.max_entries`,
 configuration the public setup CLI does not expose. Report a requested policy
 change as not exposed by this setup interface rather than editing TOML by hand.
 
+### Derive project configuration from repository CI definitions
+
+When configuring a repository that already has CI metadata, inspect the
+repository's CI definition first. Check `.github/workflows/*.{yml,yaml}`,
+`bitbucket-pipelines.yml`, `.gitlab-ci.yml`, `.circleci/config.yml`,
+`azure-pipelines.yml`, and `Jenkinsfile` when present.
+
+Use the job that actually builds or tests the project as the source of the
+candidate VCI command. Map explicit test/build commands to `command` and
+`--arg` values, retained output paths to `--artifact`, and genuinely required
+non-secret environment values to coordinator configuration. Map separate OS
+jobs to explicit machines and per-machine command overrides when needed.
+
+Treat the CI file as evidence, not as a VCI configuration format. Do not copy
+checkout, dependency installation, cache, publish, service, runner, or action
+steps unless VCI has an explicit equivalent. Never import secrets, tokens,
+credentials, or secret references. Runner labels do not set `Machine.OS`; the
+operator must declare the machine OS. If multiple jobs describe incompatible
+builds and the user has not selected one, report the alternatives and ask
+which job VCI should represent.
+
 ### Add projects
 
 A project names the checkout directory and the approved command Vci runs.
