@@ -38,6 +38,34 @@ repository. Treat every mutation as an administrator action.
 Vci accepts names matching `[A-Za-z0-9][A-Za-z0-9._-]*`. A project name must
 match its checkout directory basename (case-insensitive fallback exists).
 
+## Per-machine command overrides
+
+A project carries one `command` for every attached machine. When a
+project must run a different command on a specific machine (e.g. a
+Windows worker that needs `python` instead of `python3`), the operator
+declares the override in the config TOML under
+`[projects.<name>.commands.<machine>]`:
+
+```toml
+[projects.vidl]
+machines = ["Jupiter", "charon", "minerva", "hammond"]
+command  = ["python3", "test.py"]
+
+[projects.vidl.commands]
+hammond = ["python", "test.py"]
+```
+
+The coordinator resolves the command at admission time: a
+`commands[machine]` entry wins for that target, otherwise the
+project-wide `command` is the default. The coordinator never infers
+the command from the host OS — every override is operator-declared.
+
+The public setup CLI does not expose per-machine commands. When a
+user needs one, report the requested override and the TOML shape
+above rather than editing the file by hand without explicit approval.
+Validation rejects an override for a machine the project does not
+attach to, and rejects an empty override command.
+
 ## Coordinator root
 
 A coordinator root has `orchestrator = "self"` and owns all Vci state.
