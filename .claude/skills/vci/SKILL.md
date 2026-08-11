@@ -190,14 +190,6 @@ explicitly with `vci build .` and treat the new run ID as authoritative.
 local changes, rather than HEAD alone. The accepted snapshot is immutable;
 edits made after submission do not change the run.
 
-Each attached machine runs its own command. A project may declare a
-per-machine command override in `[projects.<name>.commands]` so a
-Windows worker can run `python test.py` while a POSIX worker runs
-`python3 test.py`. The coordinator never infers the command from the
-host OS — overrides are operator-declared. Agents do not configure
-this; if a build fails on one machine with a missing-binary error, the
-answer is a project config change, not a client-side retry.
-
 ## Operational result report
 
 After a run reaches a terminal state, report:
