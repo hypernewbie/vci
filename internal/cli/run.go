@@ -64,6 +64,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 func dispatch(command string, args []string) (Response, int) {
 	switch command {
+	case "version":
+		return runVersion(args)
 	case "":
 		return Failure(command, model.NewError("command_required", model.FailureUsage, "A command is required.", false)), 2
 	case "setup":
@@ -304,7 +306,7 @@ func decodeRemoteResponse(command string, raw []byte) (Response, int) {
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return Failure(command, model.NewError("remote_invalid_response", model.FailureInfrastructure, err.Error(), true)), 2
 	}
-	if response.SchemaVersion != model.SchemaVersion {
+	if response.SchemaVersion != model.EnvelopeSchemaVersion {
 		return Failure(command, model.NewError("remote_schema_mismatch", model.FailureInfrastructure, "remote response schema is unsupported", true)), 2
 	}
 	if response.Command != command || response.Data == nil || (!response.OK && response.Error == nil) || (response.OK && response.Error != nil) {

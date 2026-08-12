@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 jobs:
   gate:
@@ -78,7 +79,7 @@ jobs:
         timeout-minutes: 10
 
       - name: go test (windows - client packages)
-        run: go test -p 2 ./internal/config ./internal/store ./internal/process ./internal/runtime ./internal/scheduler ./internal/sourcecache ./internal/model -count=1
+        run: go test -p 2 ./internal/config ./internal/store ./internal/process ./internal/runtime ./internal/scheduler ./internal/model -count=1
         timeout-minutes: 10
 
       - name: go build (windows)

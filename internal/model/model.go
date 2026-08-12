@@ -18,7 +18,14 @@ import (
 // `not_found` envelope (configuration class, not retryable).
 var ErrRunNotFound = errors.New("run not found")
 
-const SchemaVersion = 1
+// The public JSON envelope and the durable run/execution records currently
+// share the same numeric version. Keep the names separate so a future change
+// to one compatibility surface does not silently change another.
+const (
+	EnvelopeSchemaVersion  = 1
+	RunSchemaVersion       = 1
+	ExecutionSchemaVersion = 1
+)
 
 type RunID string
 

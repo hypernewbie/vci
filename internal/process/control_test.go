@@ -11,7 +11,7 @@ import (
 
 func TestExecutionAtomicRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "execution.json")
-	e := Execution{SchemaVersion: model.SchemaVersion, RunID: model.RunID("run_test_1"), Owner: "worker-abcdefgh", PID: 12, PGID: 12, StartedAt: time.Now().UTC(), CancellationPhase: CancellationNone}
+	e := Execution{SchemaVersion: model.ExecutionSchemaVersion, RunID: model.RunID("run_test_1"), Owner: "worker-abcdefgh", PID: 12, PGID: 12, StartedAt: time.Now().UTC(), CancellationPhase: CancellationNone}
 	if err := WriteExecution(path, e); err != nil {
 		t.Fatal(err)
 	}

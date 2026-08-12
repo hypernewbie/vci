@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Introduce application semantic versioning starting at `0.1.0`. The
+  canonical version is `internal/version/VERSION`; `vci version` reports local
+  build identity and `vci version --coordinator` queries the configured
+  coordinator without changing protocol or state schema versions. Release
+  tags use the matching `v` prefix and are validated by the tag workflow.
+  See `docs/RELEASING.md` for compatibility and release rules.
 - Fan-out failure context now preserves bounded tails from both stdout and
   stderr when both streams contain output, with deterministic `[stdout]` and
   `[stderr]` labels. A warning on stderr no longer hides compiler diagnostics

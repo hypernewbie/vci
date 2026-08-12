@@ -24,6 +24,17 @@ const SchemaVersion = 2
 // accepts. A version not in this set is rejected as unsupported.
 var supportedSchemaVersions = map[int]bool{1: true, 2: true}
 
+// SupportedSchemaVersions returns the accepted config schema versions in
+// numeric order. The returned slice is independent of package state.
+func SupportedSchemaVersions() []int {
+	versions := make([]int, 0, len(supportedSchemaVersions))
+	for version := range supportedSchemaVersions {
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+	return versions
+}
+
 // OrchestratorSelf selects local coordination.
 // Non-empty values are SSH hosts for clients.
 const OrchestratorSelf = "self"

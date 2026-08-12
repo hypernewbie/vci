@@ -27,7 +27,7 @@ func Parse(args []string) (Command, *model.VciError) {
 	}
 	name := args[0]
 	switch name {
-	case "build", "check", "watch", "abort", "projects", "machines", "setup", "internal-run", "artifacts", "logs", "probe-seed", "wait-ready", "internal-stage", "internal-probe-cache", "internal-acquire-claim", "internal-release-claim", "internal-reap-cache", "internal-reconstruct":
+	case "version", "build", "check", "watch", "abort", "projects", "machines", "setup", "internal-run", "artifacts", "logs", "probe-seed", "wait-ready", "internal-stage", "internal-probe-cache", "internal-acquire-claim", "internal-release-claim", "internal-reap-cache", "internal-reconstruct":
 		return Command{Name: name, Args: append([]string(nil), args[1:]...)}, nil
 	default:
 		return Command{}, model.NewError("unknown_command", model.FailureUsage, fmt.Sprintf("Command %q is not recognized.", name), false)
@@ -46,11 +46,11 @@ func Success(command string, data any) Response {
 	if data == nil {
 		data = map[string]any{}
 	}
-	return Response{SchemaVersion: model.SchemaVersion, Command: command, OK: true, Data: data}
+	return Response{SchemaVersion: model.EnvelopeSchemaVersion, Command: command, OK: true, Data: data}
 }
 
 func Failure(command string, err *model.VciError) Response {
-	return Response{SchemaVersion: model.SchemaVersion, Command: command, OK: false, Data: map[string]any{}, Error: err}
+	return Response{SchemaVersion: model.EnvelopeSchemaVersion, Command: command, OK: false, Data: map[string]any{}, Error: err}
 }
 
 func Write(w io.Writer, response Response) error {

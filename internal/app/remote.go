@@ -236,7 +236,7 @@ func validEnvelope(data []byte) bool {
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return false
 	}
-	if envelope.SchemaVersion != model.SchemaVersion || envelope.Command == nil || *envelope.Command == "" || envelope.OK == nil || len(envelope.Data) == 0 {
+	if envelope.SchemaVersion != model.EnvelopeSchemaVersion || envelope.Command == nil || *envelope.Command == "" || envelope.OK == nil || len(envelope.Data) == 0 {
 		return false
 	}
 	if *envelope.OK {
@@ -579,7 +579,7 @@ func stageOrReconstruct(ctx context.Context, runner process.Runner, machine conf
 // The returned warning string reports non-fatal remote execution conditions
 // surfaced to the caller, such as a no-seed bundle transfer that exceeded the
 // machine's bundle-cache byte cap and was therefore streamed one-shot.
-func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir string, machine config.Machine, sourceRoot string, workspace string, project config.Project, projectName, lcPath, submittedHead string, pair process.Pair) (runtime.Result, []string, bool, string, error) {
+func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir string, machine config.Machine, machineName string, sourceRoot string, workspace string, project config.Project, projectName, lcPath, submittedHead string, pair process.Pair) (runtime.Result, []string, bool, string, error) {
 	remoteWorkDir, err := host.RemoteWorkDir(id)
 	if err != nil {
 		return runtime.Result{}, nil, false, "", err
@@ -595,7 +595,11 @@ func executeRemote(ctx context.Context, l model.Layout, id model.RunID, runDir s
 	if err != nil {
 		return runtime.Result{}, nil, false, "", unavailableError(err)
 	}
-	argv, err := remoteArgv(machine, remoteWorkDir, project.Command)
+	cmd := project.ResolveCommand(machineName)
+	if len(cmd) == 0 {
+		cmd = project.Command
+	}
+	argv, err := remoteArgv(machine, remoteWorkDir, cmd)
 	if err != nil {
 		return runtime.Result{}, nil, false, "", err
 	}

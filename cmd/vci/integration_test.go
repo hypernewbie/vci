@@ -214,7 +214,22 @@ func waitWorkerSettled(t *testing.T, root, id string) {
 		leaseGone := !pathExists(filepath.Join(root, "state", "runs", id, "lease.json"))
 		claimGone := !runClaimExists(root, id)
 		if workGone && leaseGone && claimGone {
-			return
+			childrenSettled := true
+			runsDir := filepath.Join(root, "state", "runs")
+			if entries, err := os.ReadDir(runsDir); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() {
+						childID := entry.Name()
+						if pathExists(filepath.Join(runsDir, childID, "lease.json")) || runClaimExists(root, childID) {
+							childrenSettled = false
+							break
+						}
+					}
+				}
+			}
+			if childrenSettled {
+				return
+			}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

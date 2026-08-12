@@ -208,7 +208,7 @@ func newRun(id model.RunID, project, machine string, command []string, sourceDig
 		return RunRecord{}, err
 	}
 	sum := sha256.Sum256(data)
-	return RunRecord{SchemaVersion: model.SchemaVersion, ID: id, Project: project, Machine: machine, State: state, SourceDigest: sourceDigest, ConfigDigest: hex.EncodeToString(sum[:]), ConfigSnapshot: data, Command: append([]string(nil), command...), QueuedAt: now.UTC(), UpdatedAt: now.UTC()}, nil
+	return RunRecord{SchemaVersion: model.RunSchemaVersion, ID: id, Project: project, Machine: machine, State: state, SourceDigest: sourceDigest, ConfigDigest: hex.EncodeToString(sum[:]), ConfigSnapshot: data, Command: append([]string(nil), command...), QueuedAt: now.UTC(), UpdatedAt: now.UTC()}, nil
 }
 
 func newID(now time.Time) (string, error) {
@@ -266,7 +266,7 @@ func (s Store) saveUnlocked(record RunRecord) error {
 }
 
 func validateRecord(record RunRecord) error {
-	if record.SchemaVersion != model.SchemaVersion {
+	if record.SchemaVersion != model.RunSchemaVersion {
 		return fmt.Errorf("unsupported run schema version %d", record.SchemaVersion)
 	}
 	if !model.ValidRunID(record.ID) || !record.State.Valid() {

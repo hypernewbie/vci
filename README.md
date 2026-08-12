@@ -27,6 +27,7 @@ Install Vci and add this repository:
 go install github.com/hypernewbie/vci/cmd/vci@main
 
 vci setup init
+vci version
 vci setup machine add local
 vci setup project add vci \
     --machine local \
@@ -103,11 +104,20 @@ Most commands write structured JSON to stdout and diagnostics to stderr. Log rea
 A client needs one SSH destination in `~/.vci/config.toml`:
 
 ```toml
-schema_version = 1
+schema_version = 2
 orchestrator = "builder"
 ```
 
-`builder` can be an SSH alias or `user@host`. Install `vci` in that host's remote shell path. The client sends source over system SSH and keeps no coordinator state.
+`builder` can be an SSH alias or `user@host`. Install `vci` in that host's remote shell path. The client sends source over system SSH and keeps no coordinator state. Configuration schema 1 remains accepted for existing roots; new configuration uses schema 2.
+
+## Inspect versions
+
+```sh
+vci version
+vci version --coordinator
+```
+
+`vci version` reports the local application version and build identity without reading configuration or state. `--coordinator` reports the configured coordinator, or the same local identity when `orchestrator = "self"`. Application versions are diagnostic; Vci does not reject a client only because its version differs from the coordinator. See [`docs/RELEASING.md`](docs/RELEASING.md) for the SemVer policy, compatibility boundaries, and release procedure.
 
 ## Development
 

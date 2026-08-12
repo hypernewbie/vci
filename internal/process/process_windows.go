@@ -167,7 +167,7 @@ func NewOwner() (string, error) {
 }
 
 func (e Execution) Validate(id model.RunID) error {
-	if e.SchemaVersion != model.SchemaVersion {
+	if e.SchemaVersion != model.ExecutionSchemaVersion {
 		return fmt.Errorf("unsupported execution schema version %d", e.SchemaVersion)
 	}
 	if e.RunID != id || !model.ValidRunID(id) {

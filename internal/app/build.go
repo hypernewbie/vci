@@ -563,10 +563,14 @@ func ExecutePrepared(ctx context.Context, l model.Layout, id model.RunID) (Build
 		// Leave an unresolvable submittedHead empty and proceed to
 		// executeRemote: stageOrReconstruct falls back to full workspace
 		// staging whenever reconstruction cannot proceed.
-		execResult, collectedArtifacts, artifactsTruncated, warning, execErr = executeRemote(workerCtx, l, id, runDir, machine, record.SourcePath, workspace, project, record.Project, lcPath, submittedHead, pair)
+		execResult, collectedArtifacts, artifactsTruncated, warning, execErr = executeRemote(workerCtx, l, id, runDir, machine, record.Machine, record.SourcePath, workspace, project, record.Project, lcPath, submittedHead, pair)
 	} else {
-		execResult, execErr = execRunner.ExecuteSupervised(workerCtx, runtime.Request{Executable: project.Command[0], Args: project.Command[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
-			execution := process.Execution{SchemaVersion: model.SchemaVersion, RunID: id, Owner: owner, PID: running.PID, PGID: running.PGID, StartedAt: running.StartedAt, CancellationPhase: process.CancellationNone}
+		cmd := project.ResolveCommand(record.Machine)
+		if len(cmd) == 0 {
+			cmd = record.Command
+		}
+		execResult, execErr = execRunner.ExecuteSupervised(workerCtx, runtime.Request{Executable: cmd[0], Args: cmd[1:], Workspace: workspace, Environment: project.Environment, Stdout: pair.Stdout, Stderr: pair.Stderr}, func(running process.Running) error {
+			execution := process.Execution{SchemaVersion: model.ExecutionSchemaVersion, RunID: id, Owner: owner, PID: running.PID, PGID: running.PGID, StartedAt: running.StartedAt, CancellationPhase: process.CancellationNone}
 			return process.WriteExecution(filepath.Join(runDir, "execution.json"), execution)
 		})
 		// Child is already reaped; only the Native retained-child supervisor can signal it.

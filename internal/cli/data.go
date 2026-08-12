@@ -83,7 +83,7 @@ func runArtifactsList(args []string) (any, *model.VciError) {
 		if err := json.Unmarshal(raw, &resp); err != nil {
 			return nil, model.NewError("remote_invalid_response", model.FailureInfrastructure, err.Error(), true)
 		}
-		if resp.SchemaVersion != model.SchemaVersion || resp.Command != "artifacts" || !resp.OK || resp.Error != nil {
+		if resp.SchemaVersion != model.EnvelopeSchemaVersion || resp.Command != "artifacts" || !resp.OK || resp.Error != nil {
 			return nil, model.NewError("remote_invalid_response", model.FailureInfrastructure, "remote artifacts ls response has an invalid envelope", true)
 		}
 		return resp.Data, nil
@@ -174,7 +174,7 @@ func errorEnvelope(raw []byte) (*model.VciError, bool) {
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, false
 	}
-	if resp.SchemaVersion != model.SchemaVersion || resp.OK || resp.Error == nil {
+	if resp.SchemaVersion != model.EnvelopeSchemaVersion || resp.OK || resp.Error == nil {
 		return nil, false
 	}
 	return resp.Error, true
