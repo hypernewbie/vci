@@ -180,11 +180,12 @@ func TestDockerNonZeroExitReturnsJobFailure(t *testing.T) {
 
 // TestDockerMissingBinaryIsUnavailable pins that the absence of
 // the `docker` binary is an ErrRuntimeUnavailable infrastructure
-// failure, not a job failure.
+// failure, not a job failure. PATH is restricted to an empty
+// directory so a real docker on the host or CI runner cannot be
+// found and the classification path is exercised deterministically.
 func TestDockerMissingBinaryIsUnavailable(t *testing.T) {
 	empty := t.TempDir()
-	previous := os.Getenv("PATH")
-	t.Setenv("PATH", empty+string(os.PathListSeparator)+previous)
+	t.Setenv("PATH", empty)
 
 	workspace := t.TempDir()
 	d := Docker{Image: "img:tag"}
@@ -445,11 +446,12 @@ func TestVMNonZeroExitReturnsJobFailure(t *testing.T) {
 
 // TestVMMissingBinaryIsUnavailable pins that the absence of the
 // configured VM binary is an ErrRuntimeUnavailable infrastructure
-// failure, not a job failure.
+// failure, not a job failure. PATH is restricted to an empty
+// directory so a real VM binary on the host or CI runner cannot be
+// found and the classification path is exercised deterministically.
 func TestVMMissingBinaryIsUnavailable(t *testing.T) {
 	empty := t.TempDir()
-	previous := os.Getenv("PATH")
-	t.Setenv("PATH", empty+string(os.PathListSeparator)+previous)
+	t.Setenv("PATH", empty)
 
 	workspace := t.TempDir()
 	v := VM{Snapshot: "snap:pin", Binary: "tart"}
