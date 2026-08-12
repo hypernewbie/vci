@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fan-out failure context now preserves bounded tails from both stdout and
+  stderr when both streams contain output, with deterministic `[stdout]` and
+  `[stderr]` labels. A warning on stderr no longer hides compiler diagnostics
+  on stdout; one-stream output remains unchanged.
 - Source transfer uses Git reconciliation instead of whole-tree snapshots.
   A remote build sends its Git identity and local changes plus a Git bundle of
   the objects the coordinator lacks; the coordinator reconstructs a workspace

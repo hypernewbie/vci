@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -507,4 +508,143 @@ func TestCheckSummaryCarriesFailedTargetErrorContext(t *testing.T) {
 	if !strings.Contains(target.ErrorContext, "expected fixture failure") {
 		t.Fatalf("error_context should contain the test failure message; got %q", target.ErrorContext)
 	}
+}
+
+func TestCheckSummaryCarriesBothTargetLogStreams(t *testing.T) {
+	l := model.Layout{Root: filepath.Join(t.TempDir(), ".vci")}
+	machines := []string{"alpha", "beta", "gamma"}
+	children := make([]model.RunID, 0, len(machines))
+	for _, machine := range machines {
+		children = append(children, writeFailedLogTarget(t, l, machine, "failure from "+machine, "shared warning"))
+	}
+
+	now := time.Now().UTC()
+	parentID, err := store.NewRunID(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := store.NewParentRun(parentID, "fanout", []string{"false"}, children, map[string]any{}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (store.Store{Layout: l}).Save(parent); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := BuildSummaryView(l, parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, ok := view.(BuildSummary)
+	if !ok {
+		t.Fatalf("view returned %T, want BuildSummary", view)
+	}
+	if summary.State != model.RunFailed || summary.Failed != len(machines) {
+		t.Fatalf("summary state/counts: %+v", summary)
+	}
+	if len(summary.Targets) != len(machines) {
+		t.Fatalf("target count: got %d, want %d", len(summary.Targets), len(machines))
+	}
+	for i, target := range summary.Targets {
+		if target.Machine != machines[i] {
+			t.Fatalf("target %d machine: got %q, want %q", i, target.Machine, machines[i])
+		}
+		want := "[stdout]\nfailure from " + machines[i] + "\n\n[stderr]\nshared warning"
+		if target.ErrorContext != want {
+			t.Fatalf("target %s context: got %q, want %q", target.Machine, target.ErrorContext, want)
+		}
+		for _, sibling := range machines {
+			if sibling != machines[i] && strings.Contains(target.ErrorContext, "failure from "+sibling) {
+				t.Fatalf("target %s contains sibling context %q", target.Machine, sibling)
+			}
+		}
+	}
+}
+
+func TestTailErrorContextPreservesSingleStreamOutput(t *testing.T) {
+	l := model.Layout{Root: filepath.Join(t.TempDir(), ".vci")}
+	tests := []struct {
+		name   string
+		stdout string
+		stderr string
+		want   string
+	}{
+		{name: "stdout", stdout: "stdout line 1\nstdout line 2\n", want: "stdout line 1\nstdout line 2"},
+		{name: "stderr", stderr: "stderr line 1\nstderr line 2\n", want: "stderr line 1\nstderr line 2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := writeFailedLogTarget(t, l, tt.name, tt.stdout, tt.stderr)
+			if got := tailErrorContext(l, id); got != tt.want {
+				t.Fatalf("context: got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTailErrorContextBoundsAndOrdersBothStreams(t *testing.T) {
+	l := model.Layout{Root: filepath.Join(t.TempDir(), ".vci")}
+	stdout := makeLogLines("stdout", 40)
+	stderr := makeLogLines("stderr", 40)
+	id := writeFailedLogTarget(t, l, "bounded", stdout, stderr)
+
+	got := tailErrorContext(l, id)
+	parts := strings.SplitN(got, "\n\n[stderr]\n", 2)
+	if len(parts) != 2 || !strings.HasPrefix(parts[0], "[stdout]\n") {
+		t.Fatalf("combined context has wrong labels/order: %q", got)
+	}
+	streams := map[string]string{
+		"stdout": strings.TrimPrefix(parts[0], "[stdout]\n"),
+		"stderr": parts[1],
+	}
+	for name, data := range streams {
+		if len([]byte(data)) > 4096 {
+			t.Errorf("%s context is %d bytes, want at most 4096", name, len([]byte(data)))
+		}
+		if lines := strings.Split(data, "\n"); len(lines) > 20 {
+			t.Errorf("%s context has %d lines, want at most 20", name, len(lines))
+		}
+		if !strings.Contains(data, name+"-39") {
+			t.Errorf("%s context lost the newest line: %q", name, data)
+		}
+		if strings.Contains(data, name+"-00-") {
+			t.Errorf("%s context retained the oldest line: %q", name, data)
+		}
+	}
+}
+
+func writeFailedLogTarget(t *testing.T, l model.Layout, machine, stdout, stderr string) model.RunID {
+	t.Helper()
+	now := time.Now().UTC()
+	id, err := store.NewRunID(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.NewRunFromID(id, "fanout", machine, []string{"false"}, "", map[string]any{}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.State = model.RunFailed
+	if err := (store.Store{Layout: l}).Save(record); err != nil {
+		t.Fatal(err)
+	}
+	runDir, err := l.RunDir(string(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "stdout.log"), []byte(stdout), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "stderr.log"), []byte(stderr), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func makeLogLines(prefix string, count int) string {
+	lines := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		lines = append(lines, fmt.Sprintf("%s-%02d-%s", prefix, i, strings.Repeat("x", 256)))
+	}
+	return strings.Join(lines, "\n") + "\n"
 }

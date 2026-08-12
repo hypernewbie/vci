@@ -227,9 +227,11 @@ below it:
 
 > `<first actionable line from error_context>`
 
-Use `data.targets[].error_context` before fetching logs; it already contains
-the last useful stderr lines, or stdout when stderr is empty. Fetch full logs
-only when that context is insufficient. Do not invent a root cause. Report
+Use `data.targets[].error_context` before fetching logs; it contains bounded
+log tails. When both streams have content, the value includes labeled
+`[stdout]` and `[stderr]` tails in that order. Neither stream is authoritative
+merely because it is non-empty. Fetch full logs only when that context is
+insufficient. Do not invent a root cause. Report
 `lost`, `unavailable`, and `aborted` as their actual states rather than calling
 them test failures.
 

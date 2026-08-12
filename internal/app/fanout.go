@@ -129,19 +129,23 @@ func parentSummary(l model.Layout, parent store.RunRecord) (BuildSummary, error)
 	return sum, nil
 }
 
-// tailErrorContext returns the last few lines of a failed run's log
-// for inline display in the public check summary. It reads stderr
-// first and falls back to stdout when stderr is empty, since some
-// failure shapes (compile errors, script aborts) live on stderr and
-// others (test failures from `go test`) live on stdout. The output is
-// capped so a runaway log cannot bloat the summary. Mirrors `gh run
-// view`'s inline failure context: enough to recognise the error
-// without a separate log fetch.
+// tailErrorContext returns bounded tails of a failed run's logs for inline
+// display in the public check summary. When both streams have content, it
+// keeps both because a warning on stderr must not hide a fatal diagnostic on
+// stdout. The output is capped per stream so a runaway log cannot bloat the
+// summary. Mirrors `gh run view`'s inline failure context: enough to
+// recognise the error without a separate log fetch.
 func tailErrorContext(l model.Layout, id model.RunID) string {
-	if data := tailLogStream(l, id, "stderr"); data != "" {
-		return data
+	stdout := tailLogStream(l, id, "stdout")
+	stderr := tailLogStream(l, id, "stderr")
+	switch {
+	case stdout == "":
+		return stderr
+	case stderr == "":
+		return stdout
+	default:
+		return "[stdout]\n" + stdout + "\n\n[stderr]\n" + stderr
 	}
-	return tailLogStream(l, id, "stdout")
 }
 
 func tailLogStream(l model.Layout, id model.RunID, stream string) string {
